@@ -1,0 +1,5 @@
+GitHub TinyGPSPlus -> https://github.com/mikalhart/TinyGPSPlus
+TinyGPSPlus detalhamento -> https://arduiniana.org/libraries/tinygpsplus/
+
+LoRa Modualtion Basics -> http://wiki.lahoud.fr/lib/exe/fetch.php?media=an1200.22.pdf
+LoRa technical documentation -> https://www.semtech.com/lora/lorawan-standard#technical-document
