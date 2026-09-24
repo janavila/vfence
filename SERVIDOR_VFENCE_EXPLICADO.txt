@@ -1,58 +1,86 @@
-VFENCE — EXPLICAÇÃO DO SERVIDOR LOCAL
-======================================
+VFENCE MONITOR — REFERÊNCIA TÉCNICA DO SERVIDOR
+================================================
 
-1. O QUE É ESTE SERVIDOR
-------------------------
+1. FINALIDADE
+-------------
 
-Este servidor é a parte do projeto VFence que roda no Raspberry Pi (ou, para
-testes, em um computador Windows). Ele não calcula a cerca virtual. Essa
-responsabilidade continua sendo da coleira/ESP32.
+O VFence Monitor é um serviço local para aquisição, persistência e exibição de
+telemetria de coleiras bovinas. A aplicação é projetada para Raspberry Pi 3 e
+opera sem dependência obrigatória de internet.
 
-O servidor recebe as mensagens que chegam do Gateway LoRa pela USB/Serial,
-interpreta os dados, armazena um histórico local e mostra tudo em um dashboard
-web acessível pela rede local.
-
-O objetivo é permitir o fluxo abaixo:
-
-    Coleira (GPS + geofencing)
-               |
-               | LoRa
-               v
-    Gateway LoRa (ESP32 Receiver)
-               |
-               | USB / Serial
-               v
-    Raspberry Pi (servidor VFence)
-               |
-               +--> SQLite: histórico local
-               +--> API: dados para outras aplicações
-               +--> Dashboard: visualização no navegador
+O geofencing não é executado pelo servidor. A coleira calcula a zona e transmite
+o resultado. O servidor trata esse resultado como telemetria.
 
 
-2. O QUE O SERVIDOR FAZ
------------------------
+2. FLUXO DE DADOS
+-----------------
 
-- Fica escutando uma porta Serial, como /dev/ttyUSB0 ou /dev/ttyACM0.
-- Aceita o formato de teste LoRa já existente no projeto.
-- Aceita o protocolo VFence V1 com posição, zona, satélites e HDOP.
-- Salva telemetria no arquivo local vfence.db.
-- Mantém o estado mais recente de cada coleira.
-- Registra eventos quando a zona de uma coleira muda.
-- Oferece endpoints HTTP/API.
-- Atualiza o dashboard instantaneamente por WebSocket.
-- Continua com o dashboard ativo quando o Gateway está desconectado.
-- Tenta reconectar ao Gateway automaticamente.
-- Possui modo mock para demonstrar tudo sem hardware.
+Coleira / GPS / Geofencing
+    -> LoRa 915 MHz
+    -> Gateway ESP32 / SX1276
+    -> USB / Serial
+    -> SerialReader
+    -> Parser VFence
+    -> SQLite
+    -> API FastAPI / WebSocket
+    -> VFence Monitor
 
 
-3. GEOfencing: O QUE FICA NA COLEIRA
--------------------------------------
+3. COMPONENTES
+--------------
 
-O servidor NÃO cria uma cerca virtual e NÃO decide se o animal está dentro ou
-fora dela.
+app/main.py
+    Inicialização do serviço, ciclo de vida FastAPI, rotas HTTP, WebSocket e
+    distribuição de arquivos estáticos.
 
-A coleira deve usar a solução de geofencing escolhida pelo grupo e enviar o
-resultado da análise em uma zona, por exemplo:
+app/config.py
+    Leitura das variáveis de ambiente e definição dos valores padrão.
+
+app/protocol.py
+    Validação dos formatos legado e VFence V1. Verifica comprimento, número de
+    campos, tipo, coordenadas, zona e valores numéricos.
+
+app/serial_reader.py
+    Aquisição Serial assíncrona, reconexão, modo mock, persistência e publicação
+    em tempo real.
+
+app/database.py
+    Inicialização e acesso transacional ao SQLite.
+
+app/models.py
+    Estado interno do gateway.
+
+app/realtime.py
+    Registro das conexões WebSocket e broadcast de telemetria.
+
+app/templates/index.html
+    Estrutura do painel VFence Monitor.
+
+app/static/css/style.css
+    Sistema visual e layout responsivo.
+
+app/static/js/app.js
+    Carregamento inicial da API, atualização WebSocket, métricas, tabela, mapa e
+    eventos.
+
+
+4. PROTOCOLO
+------------
+
+Legado:
+
+    Recebido: VFENCE_TESTE_630 | RSSI: -103 dBm | SNR: 6.50
+
+VFence V1:
+
+    V1|COL01|POS|-31.306119|-54.063935|SEGURO|12|0.90|630
+
+Campos V1:
+
+    version | collar_id | type | latitude | longitude | zone |
+    satellites | hdop | sequence
+
+Zonas aceitas:
 
     SEGURO
     ATENCAO
@@ -60,287 +88,148 @@ resultado da análise em uma zona, por exemplo:
     FORA
     GNSS_INVALIDO
 
-Assim, se no futuro a lógica de geofencing ou a biblioteca usada mudar, o
-Raspberry Pi e o dashboard não precisam ser reescritos. Eles apenas recebem e
-exibem a zona enviada pela coleira.
+O protocolo e os valores internos não são traduzidos. Rótulos diferentes são
+aplicados somente na interface.
 
 
-4. FORMATOS DE MENSAGEM ACEITOS
---------------------------------
-
-4.1. Formato de teste atual
-
-O Sender/Receiver LoRa atual produz mensagens semelhantes a:
-
-    Recebido: VFENCE_TESTE_630 | RSSI: -103 dBm | SNR: 6.50
-
-O servidor entende esse formato e extrai:
-
-    - sequência: 630
-    - RSSI: -103 dBm
-    - SNR: 6.50
-
-Como esse formato não possui GPS ou zona, ele aparece como uma coleira de
-teste chamada LEGACY no dashboard.
-
-4.2. Protocolo VFence V1
-
-O formato que a coleira deve enviar depois da integração é:
-
-    V1|COL01|POS|-31.306119|-54.063935|SEGURO|12|0.90|630
-
-Significado dos campos:
-
-    V1          Versão do protocolo
-    COL01       Identificador da coleira
-    POS         Tipo de pacote: posição
-    -31.306119  Latitude
-    -54.063935  Longitude
-    SEGURO      Zona calculada na coleira
-    12          Número de satélites
-    0.90        HDOP (qualidade do GPS)
-    630         Número sequencial do pacote
-
-O Receiver atual acrescenta RSSI e SNR ao imprimir a mensagem. O servidor
-também aceita esta variação:
-
-    Recebido: V1|COL01|POS|...|630 | RSSI: -103 dBm | SNR: 6.50
-
-
-5. ARQUIVOS DO SERVIDOR
------------------------
-
-app/main.py
-    É o ponto de entrada do FastAPI. Cria a API, serve o dashboard, inicia o
-    leitor Serial e disponibiliza o WebSocket.
-
-app/config.py
-    Lê as configurações do ambiente, como porta Serial, baud rate, banco de
-    dados e ativação do modo mock.
-
-app/protocol.py
-    Parser do protocolo. É responsável por validar mensagens recebidas. Ele
-    verifica campos, zona, latitude, longitude, HDOP e sequência. Uma mensagem
-    inválida é ignorada sem derrubar o servidor.
-
-app/serial_reader.py
-    Conecta ao Gateway pela Serial, lê linhas, chama o parser, salva pacotes
-    válidos, registra logs e reconecta caso o Gateway seja desconectado.
-
-app/database.py
-    Cuida do SQLite. Cria tabelas, salva telemetria e consulta coleiras e
-    eventos.
-
-app/models.py
-    Guarda a estrutura simples do estado do Gateway, por exemplo ONLINE,
-    OFFLINE, porta usada e última mensagem.
-
-app/realtime.py
-    Gerencia os navegadores conectados por WebSocket e envia atualizações novas
-    para todos eles.
-
-app/templates/index.html
-    Estrutura HTML da página principal do dashboard.
-
-app/static/css/style.css
-    Aparência visual do dashboard: cores, cartões, responsividade e estados de
-    zona.
-
-app/static/js/app.js
-    JavaScript do navegador. Busca os dados iniciais pela API, abre o WebSocket
-    e atualiza cartões, histórico e mapa sem recarregar a página.
-
-scripts/mock_gateway.py
-    Pequeno simulador que imprime pacotes V1. Útil para testes no terminal ou
-    com portas seriais virtuais.
-
-tests/test_protocol.py e tests/test_api.py
-    Testes automatizados do parser e dos endpoints principais.
-
-systemd/vfence.service
-    Modelo de serviço para iniciar o servidor automaticamente quando o
-    Raspberry Pi é ligado. Não é ativado automaticamente.
-
-.env.example
-    Modelo de configuração. Deve ser copiado para .env antes de executar.
-
-requirements.txt
-    Lista das bibliotecas Python necessárias: FastAPI, Uvicorn, pyserial,
-    pytest e httpx.
-
-
-6. BANCO DE DADOS SQLITE
-------------------------
-
-O arquivo vfence.db é criado localmente quando o servidor inicia. Ele contém:
+5. PERSISTÊNCIA
+---------------
 
 collars
-    Uma linha por coleira, com seu último estado conhecido: posição, zona,
-    qualidade do GPS, sinal LoRa, sequência e última atualização.
+    Último estado conhecido de cada coleira.
 
 telemetry
-    Histórico completo dos pacotes válidos recebidos.
+    Registro de todos os pacotes válidos recebidos.
 
 events
-    Eventos relevantes. Atualmente registra a mudança de zona para evitar
-    repetir eventos quando a coleira continua na mesma zona.
+    Registro de transições de zona. Um estado repetido não gera novo evento.
 
-O banco é local. Não depende de internet ou nuvem.
+Banco padrão:
+
+    sqlite:///./vfence.db
 
 
-7. API DISPONÍVEL
------------------
+6. CONTRATO HTTP
+----------------
 
 GET /api/health
-    Confirma que o servidor está ativo e informa o estado do Gateway.
-
 GET /api/gateway
-    Mostra porta Serial, última mensagem, status e eventual erro.
-
 GET /api/collars
-    Lista todas as coleiras conhecidas.
-
 GET /api/collars/{collar_id}
-    Mostra o estado atual de uma coleira específica.
+GET /api/collars/{collar_id}/telemetry
+GET /api/events
+WS  /ws
 
-GET /api/collars/{collar_id}/telemetry?limit=100
-    Mostra o histórico de telemetria dessa coleira.
+Todos os nomes de campos utilizam snake_case. Uma coleira inexistente retorna:
 
-GET /api/events?limit=100
-    Mostra as mudanças de zona mais recentes.
-
-WS /ws
-    WebSocket usado pelo dashboard para receber novos dados imediatamente.
-
-GET /docs
-    Página interativa com a documentação da API.
+    HTTP 404
+    {"detail":"collar_not_found"}
 
 
-8. DASHBOARD
+7. TEMPO REAL
+-------------
+
+O endpoint /ws envia dois tipos de mensagem:
+
+gateway
+    Estado da interface Serial.
+
+telemetry
+    Pacote validado, estado consolidado da coleira e evento opcional.
+
+O frontend reconecta o WebSocket automaticamente após perda da conexão.
+
+
+8. MODO MOCK
 ------------
 
-O dashboard mostra:
-
-- Gateway ONLINE ou OFFLINE.
-- Porta Serial utilizada.
-- Última mensagem recebida.
-- Quantidade de coleiras detectadas.
-- Para cada coleira: ID, zona, latitude, longitude, satélites, HDOP, RSSI,
-  SNR, último horário e sequência.
-- Mapa com as posições quando houver internet para carregar OpenStreetMap.
-- Histórico de mudanças de zona.
-
-As cores de zona são:
-
-    SEGURO        Verde
-    ATENCAO       Amarelo
-    CRITICO       Laranja
-    FORA          Vermelho
-    GNSS_INVALIDO Cinza
-
-Sem internet, o mapa pode não carregar, mas os cartões, banco, API e tempo
-real continuam funcionando normalmente.
-
-
-9. MODO MOCK
-------------
-
-O modo mock é uma demonstração sem Raspberry, GPS, LoRa ou Gateway físico.
-Ele cria pacotes V1 com a coleira COL01 e alterna entre as zonas:
-
-    SEGURO -> ATENCAO -> CRITICO -> FORA
-
-Para ativar, coloque no arquivo .env:
+Ativação:
 
     VFENCE_MOCK_SERIAL=true
 
-O teste demonstrado no Windows usou esse modo. Ele comprovou que o parser,
-SQLite, API, WebSocket, mapa, histórico e dashboard funcionam juntos.
+O gerador publica uma unidade COL01 e alterna as zonas em intervalo configurado
+por MOCK_INTERVAL_SECONDS. O modo usa o mesmo parser, banco, API e WebSocket da
+operação Serial.
 
 
-10. COMO EXECUTAR NO WINDOWS
-----------------------------
+9. OPERAÇÃO
+-----------
 
-No PowerShell, dentro da pasta do projeto:
+Inicialização:
 
-    & "C:\Users\leobo\AppData\Local\Programs\Python\Python312\python.exe" -m uvicorn app.main:app --env-file .env --host 127.0.0.1 --port 8000
+    uvicorn app.main:app --env-file .env --host 0.0.0.0 --port 8000
 
-Abra no navegador:
+Painel:
 
-    http://127.0.0.1:8000
+    http://IP_DO_RASPBERRY:8000
 
-Para parar o servidor, pressione Ctrl+C no PowerShell que está executando o
-Uvicorn.
+OpenAPI:
+
+    http://IP_DO_RASPBERRY:8000/docs
+
+Parada manual:
+
+    Ctrl+C
 
 
-11. COMO EXECUTAR NO RASPBERRY PI
----------------------------------
+10. LOGS
+--------
 
-Instale os pré-requisitos:
+Formato:
 
-    sudo apt update
-    sudo apt install python3 python3-venv python3-pip
+    YYYY-MM-DD HH:MM:SS [LEVEL] module: message
 
-Na pasta do projeto:
+Exemplo:
 
-    python3 -m venv .venv
-    source .venv/bin/activate
-    pip install -r requirements.txt
-    cp .env.example .env
+    2026-09-24 14:32:01 [INFO] serial_reader: gateway connected (/dev/ttyUSB0)
 
-Para modo mock:
+Eventos registrados incluem inicialização, tentativa de conexão, conexão,
+desconexão, pacote recebido, pacote rejeitado e transição de zona.
 
-    VFENCE_MOCK_SERIAL=true
 
-Para Gateway real, configure por exemplo:
+11. OPERAÇÃO SERIAL NO RASPBERRY PI
+-----------------------------------
+
+Detecção:
+
+    ls /dev/ttyUSB*
+    ls /dev/ttyACM*
+
+Permissão:
+
+    sudo usermod -a -G dialout $USER
+
+Configuração típica:
 
     VFENCE_MOCK_SERIAL=false
     SERIAL_PORT=/dev/ttyUSB0
     SERIAL_BAUD=115200
 
-Inicie:
 
-    uvicorn app.main:app --env-file .env --host 0.0.0.0 --port 8000
+12. VALIDAÇÃO
+-------------
 
-Descubra o IP do Raspberry:
+Execução da suíte:
 
-    hostname -I
+    pytest tests/test_protocol.py tests/test_api.py -q
 
-Abra de outro dispositivo da mesma rede:
+Cobertura atual:
 
-    http://IP_DO_RASPBERRY:8000
-
-
-12. INTEGRAÇÃO COM O GATEWAY REAL
----------------------------------
-
-1. Conecte o ESP32 Receiver/Gateway ao Raspberry pela USB.
-2. Identifique a porta com:
-
-       ls /dev/ttyUSB*
-       ls /dev/ttyACM*
-
-3. Coloque a porta encontrada em SERIAL_PORT no .env.
-4. Garanta acesso Serial ao usuário:
-
-       sudo usermod -a -G dialout $USER
-
-5. Saia e entre na sessão novamente, ou reinicie o Raspberry.
-6. Desative VFENCE_MOCK_SERIAL.
-7. Inicie o servidor.
-
-Se o Gateway estiver desconectado, o dashboard mostrará OFFLINE e o servidor
-tentará reconectar a cada poucos segundos.
+    - Parser legado
+    - Parser V1
+    - Mensagens inválidas
+    - Limites de latitude e longitude
+    - Zonas válidas
+    - Sequência
+    - Health check
+    - Consulta de coleiras
 
 
-13. PRÓXIMA ETAPA RECOMENDADA
------------------------------
+13. LIMITES DA VERSÃO
+---------------------
 
-1. Estudar o código novo de geofencing em geofence/vfence.ino.
-2. Confirmar qual solução/biblioteca de geofencing será usada na coleira.
-3. Fazer a coleira montar o pacote V1 com GPS e zona calculada.
-4. Transmitir esse pacote pela LoRa.
-5. Usar o Receiver atual para repassá-lo ao Raspberry por USB.
-6. Desativar o modo mock e demonstrar dados reais no dashboard.
-
-O servidor já está pronto para as etapas 4, 5 e 6.
+    - Sem envio de comandos ou cercas para coleiras
+    - Sem autenticação
+    - Sem mapa offline
+    - Um gateway por instância
+    - Sem expiração automática do estado da coleira

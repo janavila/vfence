@@ -1,18 +1,39 @@
-# VFence — servidor local IP2
+# VFence Monitor
 
-Servidor leve para receber telemetria do gateway LoRa por USB/Serial, persistir o histórico em SQLite e exibir as coleiras em tempo real na rede local. O geofencing permanece na coleira; o Raspberry Pi monitora, registra e apresenta os dados.
+Servidor local de telemetria para o sistema VFence. Recebe pacotes do gateway LoRa por USB/Serial, valida o protocolo, persiste dados em SQLite e disponibiliza API HTTP, WebSocket e painel operacional na rede local.
 
 ## Arquitetura
 
 ```text
-Coleira (GPS + geofencing) → LoRa 915 MHz → Gateway ESP32/SX1276
-                                             ↓ USB/Serial
-Navegador local ← HTTP/WebSocket ← Raspberry Pi (FastAPI + SQLite)
+Coleira / GPS / Geofencing
+          │ LoRa 915 MHz
+          ▼
+Gateway ESP32 + SX1276
+          │ USB / Serial
+          ▼
+Raspberry Pi
+├── Serial reader
+├── Protocol parser
+├── SQLite
+├── FastAPI / WebSocket
+└── VFence Monitor
+          │ HTTP — rede local
+          ▼
+Navegador
 ```
 
-O leitor serial roda em uma tarefa assíncrona independente da API. Pacotes válidos passam pelo parser, são gravados em transação e publicados por WebSocket. Se o gateway desconectar, API e dashboard continuam disponíveis e o leitor tenta reconectar.
+O geofencing é executado na coleira. O servidor recebe a posição e a zona já calculada; nenhuma decisão de cerca virtual é realizada no Raspberry Pi.
 
-## Instalação e execução
+## Requisitos
+
+- Python 3.10 ou superior
+- Porta USB/Serial disponível para operação com hardware
+- Navegador moderno
+- Acesso à internet opcional, utilizado somente pelos tiles do OpenStreetMap
+
+## Instalação
+
+### Raspberry Pi OS / Linux
 
 ```bash
 sudo apt update
@@ -21,75 +42,150 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-uvicorn app.main:app --env-file .env --host 0.0.0.0 --port 8000 --reload
 ```
 
-Acesse `http://IP_DO_RASPBERRY:8000` ou, com mDNS, `http://raspberrypi.local:8000`.
+### Windows PowerShell
 
-## Serial
-
-Defina `SERIAL_PORT` como `/dev/ttyUSB0` ou `/dev/ttyACM0` e confira:
-
-```bash
-ls /dev/ttyUSB*
-ls /dev/ttyACM*
-sudo usermod -a -G dialout $USER
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+Copy-Item .env.example .env
 ```
 
-Pode ser necessário sair da sessão e entrar novamente, ou reiniciar, após adicionar o usuário ao grupo `dialout`. Ajuste `SERIAL_BAUD` se o firmware não estiver em 115200 baud.
+## Configuração
 
-## Teste sem hardware
+Variáveis disponíveis em `.env`:
 
-Altere `VFENCE_MOCK_SERIAL=true` no `.env` e execute o servidor. Ele gera continuamente `SEGURO → ATENCAO → CRITICO → FORA`.
+| Variável | Padrão | Função |
+|---|---:|---|
+| `VFENCE_HOST` | `0.0.0.0` | Interface HTTP |
+| `VFENCE_PORT` | `8000` | Porta HTTP |
+| `SERIAL_PORT` | `/dev/ttyUSB0` | Dispositivo Serial |
+| `SERIAL_BAUD` | `115200` | Baud rate |
+| `DATABASE_URL` | `sqlite:///./vfence.db` | Banco SQLite |
+| `VFENCE_MOCK_SERIAL` | `false` | Gerador interno de telemetria |
+| `SERIAL_RECONNECT_SECONDS` | `3` | Intervalo de reconexão |
+| `COLLAR_OFFLINE_SECONDS` | `30` | Limite reservado para estado offline |
+| `MAX_LINE_LENGTH` | `512` | Comprimento máximo de pacote |
+| `MOCK_INTERVAL_SECONDS` | `3` | Intervalo do gerador mock |
+
+## Execução
 
 ```bash
 uvicorn app.main:app --env-file .env --host 0.0.0.0 --port 8000
 ```
 
-O comando `python scripts/mock_gateway.py --interval 2` também imprime os pacotes, útil para terminal ou porta serial virtual.
+Endereços:
+
+- Painel: `http://IP_DO_RASPBERRY:8000`
+- Painel via mDNS: `http://raspberrypi.local:8000`
+- OpenAPI: `http://IP_DO_RASPBERRY:8000/docs`
+
+## Operação Serial
+
+Dispositivos esperados no Linux:
+
+```bash
+ls /dev/ttyUSB*
+ls /dev/ttyACM*
+```
+
+Permissão de acesso:
+
+```bash
+sudo usermod -a -G dialout $USER
+```
+
+A alteração do grupo requer nova sessão ou reinicialização do sistema.
 
 ## Protocolo
 
-Legado:
+### Legado
 
 ```text
 Recebido: VFENCE_TESTE_630 | RSSI: -103 dBm | SNR: 6.50
 ```
 
-VFence v1 POS:
+### VFence V1 / POS
 
 ```text
 V1|COL01|POS|-31.306119|-54.063935|SEGURO|12|0.90|630
 ```
 
-O parser também aceita esse V1 envolvido pela saída do Receiver atual, preservando RSSI e SNR: `Recebido: V1|... | RSSI: -103 dBm | SNR: 6.50`.
+| Posição | Campo | Exemplo |
+|---:|---|---|
+| 1 | Versão | `V1` |
+| 2 | Identificador | `COL01` |
+| 3 | Tipo | `POS` |
+| 4 | Latitude | `-31.306119` |
+| 5 | Longitude | `-54.063935` |
+| 6 | Zona | `SEGURO` |
+| 7 | Satélites | `12` |
+| 8 | HDOP | `0.90` |
+| 9 | Sequência | `630` |
 
-Campos: versão, ID, tipo, latitude, longitude, zona, satélites, HDOP e sequência. Zonas: `SEGURO`, `ATENCAO`, `CRITICO`, `FORA` e `GNSS_INVALIDO`. Linhas vazias são ignoradas; mensagens longas, campos inválidos e coordenadas fora do intervalo são rejeitados sem interromper o serviço. A separação entre parser e transporte deixa espaço para tipos futuros como `FENCE`.
+Zonas válidas: `SEGURO`, `ATENCAO`, `CRITICO`, `FORA`, `GNSS_INVALIDO`.
+
+O parser também aceita V1 encapsulado pela saída do receptor:
+
+```text
+Recebido: V1|COL01|POS|...|630 | RSSI: -103 dBm | SNR: 6.50
+```
+
+## Persistência
+
+Banco padrão: `vfence.db`.
+
+| Tabela | Conteúdo |
+|---|---|
+| `collars` | Último estado conhecido por coleira |
+| `telemetry` | Histórico de pacotes válidos |
+| `events` | Transições de zona |
+
+O schema é inicializado automaticamente. Eventos de zona são registrados somente quando o valor muda.
 
 ## API
 
-- `GET /api/health` — saúde e estado resumido do gateway
-- `GET /api/gateway` — porta, última mensagem e erro
-- `GET /api/collars` — todas as coleiras
-- `GET /api/collars/{collar_id}` — uma coleira
-- `GET /api/collars/{collar_id}/telemetry?limit=100` — histórico
-- `GET /api/events?limit=100` — mudanças de zona
-- `WS /ws` — atualizações em tempo real
-- `GET /docs` — OpenAPI interativa
+| Método | Rota | Resultado |
+|---|---|---|
+| `GET` | `/api/health` | Estado do serviço e gateway |
+| `GET` | `/api/gateway` | Estado detalhado da interface Serial |
+| `GET` | `/api/collars` | Estado atual das coleiras |
+| `GET` | `/api/collars/{collar_id}` | Estado de uma coleira |
+| `GET` | `/api/collars/{collar_id}/telemetry` | Histórico por coleira |
+| `GET` | `/api/events` | Histórico de eventos |
+| `WS` | `/ws` | Atualizações em tempo real |
 
-O mapa usa Leaflet/OpenStreetMap quando há internet. Sem internet, coordenadas, cartões, histórico e tempo real continuam funcionando.
+Parâmetro `limit`: mínimo `1`, máximo `1000`, padrão `100`.
+
+Coleiras inexistentes retornam HTTP 404:
+
+```json
+{"detail":"collar_not_found"}
+```
+
+## Modo mock
+
+Configuração:
+
+```env
+VFENCE_MOCK_SERIAL=true
+```
+
+O gerador interno publica uma sequência cíclica de estados `SEGURO`, `ATENCAO`, `CRITICO` e `FORA`. O script independente está disponível em `scripts/mock_gateway.py`.
 
 ## Testes
 
 ```bash
-pytest -q
+pytest tests/test_protocol.py tests/test_api.py -q
 ```
 
-Cobertura: parser legado e V1, mensagens/campos/coordenadas inválidos, zona, sequência, saúde da API e coleiras.
+Escopo atual: protocolo legado, protocolo V1, validação numérica e geográfica, zonas, sequências e endpoints principais.
 
-## systemd
+## Serviço systemd
 
-Edite usuário e caminhos em `systemd/vfence.service` se o projeto não estiver em `/home/pi/vfence`, depois:
+O arquivo `systemd/vfence.service` assume instalação em `/home/pi/vfence` e usuário `pi`. Ajustar antes da instalação quando necessário.
 
 ```bash
 sudo cp systemd/vfence.service /etc/systemd/system/
@@ -99,16 +195,21 @@ sudo systemctl start vfence
 sudo systemctl status vfence
 ```
 
-Nenhuma unidade é ativada automaticamente pelo projeto.
+## Diagnóstico
 
-## Solução de problemas
+| Condição | Verificação |
+|---|---|
+| Gateway offline | Cabo USB, `SERIAL_PORT`, baud rate e logs do serviço |
+| Acesso Serial negado | Grupo `dialout` e nova sessão do usuário |
+| Porta inexistente | `/dev/ttyUSB*` e `/dev/ttyACM*` |
+| Mapa indisponível | Conectividade com OpenStreetMap; telemetria local permanece ativa |
+| Ausência de pacotes | Ativar `VFENCE_MOCK_SERIAL=true` para isolar hardware e aplicação |
+| Serviço systemd | `journalctl -u vfence -f` |
 
-- **Gateway OFFLINE:** confira cabo, porta, baud rate, grupo `dialout` e `journalctl -u vfence -f`.
-- **Permissão negada:** confirme `groups` e reinicie a sessão após `usermod`.
-- **Porta mudou:** liste `/dev/ttyUSB*` e `/dev/ttyACM*` e atualize `.env`.
-- **Dashboard sem mapa:** o Raspberry está sem internet; a telemetria local segue funcional.
-- **Nenhum dado:** ative o modo mock para separar servidor e hardware.
+## Limites da versão 1.0
 
-## Limitações atuais
-
-Não há envio de comandos para coleiras, autenticação, mapa offline ou múltiplos gateways. O estado salvo reflete o último pacote; expiração visual automática de coleiras pode ser adicionada depois.
+- Sem transmissão de comandos para coleiras
+- Sem autenticação
+- Sem mapa offline
+- Um gateway por instância
+- Estado offline de coleiras ainda não aplicado automaticamente
