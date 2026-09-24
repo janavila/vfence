@@ -1,9 +1,57 @@
 <!doctype html>
-<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#08110d"><title>VFence — Monitoramento</title><link rel="stylesheet" href="/static/css/style.css"><link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""></head>
-<body><main class="shell">
-<header class="topbar"><div class="brand"><div class="brand-mark" aria-hidden="true"><span></span></div><div><p class="eyebrow">MONITORAMENTO LOCAL</p><h1>VFence</h1></div></div><div id="connection" class="connection"><span></span> Conectando…</div></header>
-<section class="gateway-strip" aria-label="Estado do gateway"><div><span class="label">Gateway</span><strong id="gateway-status" class="status-pill offline">OFFLINE</strong></div><div><span class="label">Porta serial</span><strong id="serial-port">—</strong></div><div><span class="label">Última mensagem</span><strong id="last-message">Nenhuma mensagem recebida</strong></div><div><span class="label">Coleiras</span><strong id="collar-count" class="count">0</strong></div></section>
-<section class="section-head"><div><p class="eyebrow">REBANHO</p><h2>Coleiras ativas</h2></div><p id="updated-at">Aguardando telemetria</p></section>
-<section id="collars" class="collar-grid" aria-live="polite"><div class="empty-state"><div class="radar"></div><h3>Nenhuma coleira detectada</h3><p>Os dados aparecerão aqui assim que o gateway receber um pacote.</p></div></section>
-<section class="lower-grid"><article class="panel"><div class="panel-head"><div><p class="eyebrow">LOCALIZAÇÃO</p><h2>Mapa do rebanho</h2></div><span id="map-state">Mapa online</span></div><div id="map"><div class="map-fallback"><strong>Mapa indisponível</strong><span>As coordenadas continuam visíveis nos cartões.</span></div></div></article><article class="panel"><div class="panel-head"><div><p class="eyebrow">HISTÓRICO</p><h2>Eventos recentes</h2></div><span>mudanças de zona</span></div><ol id="events" class="event-list"><li class="empty-row">Nenhum evento registrado.</li></ol></article></section>
-</main><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script><script src="/static/js/app.js"></script></body></html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#f4f5f6">
+  <title>VFence Monitor v1.0</title>
+  <link rel="stylesheet" href="/static/css/style.css?v=4">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
+</head>
+<body>
+  <header class="app-header">
+    <div class="header-inner">
+      <div class="brand"><span class="brand-symbol">VF</span><div><h1>VFence Monitor</h1><span>v1.0</span></div></div>
+      <span id="connection" class="connection"><i></i> Conectando</span>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <div class="page-heading">
+      <div><p>VISÃO OPERACIONAL</p><h2>Monitoramento do rebanho</h2></div>
+      <time id="updated-at">Sem atualização</time>
+    </div>
+
+    <section class="metrics-grid" aria-label="Resumo operacional">
+      <article class="metric-card"><span>Gateway</span><strong id="gateway-status" class="status-pill offline">Offline</strong><small>Conexão com o receptor</small></article>
+      <article class="metric-card"><span>Unidades monitoradas</span><strong id="collar-count" class="metric-value mono">00</strong><small>Coleiras com telemetria</small></article>
+      <article class="metric-card"><span>Em atenção</span><strong id="alert-count" class="metric-value mono">00</strong><small>Atenção ou estado crítico</small></article>
+      <article class="metric-card"><span>Fora da área</span><strong id="outside-count" class="metric-value mono">00</strong><small>Ocorrências atuais</small></article>
+    </section>
+
+    <section class="system-line" aria-label="Dados técnicos do gateway">
+      <div><span>Interface</span><strong id="serial-port" class="mono">—</strong></div>
+      <div><span>Último pacote</span><strong id="last-message" class="mono">Sem dados</strong></div>
+    </section>
+
+    <section class="monitor-grid">
+      <article class="panel map-panel">
+        <div class="panel-heading"><div><h3>Posicionamento</h3><p>Última localização recebida por unidade</p></div><span id="map-state">Base online</span></div>
+        <div id="map"><div class="map-fallback"><strong>Mapa indisponível</strong><span>Coordenadas disponíveis na tabela</span></div></div>
+      </article>
+      <article class="panel events-panel">
+        <div class="panel-heading"><div><h3>Eventos recentes</h3><p>Transições de zona registradas</p></div></div>
+        <div class="events-table-wrap"><table class="events-table"><thead><tr><th>Horário</th><th>Unidade</th><th>Transição</th></tr></thead><tbody id="events"><tr class="empty-row"><td colspan="3">Sem eventos registrados</td></tr></tbody></table></div>
+      </article>
+    </section>
+
+    <section class="panel units-panel">
+      <div class="panel-heading"><div><h3>Unidades</h3><p>Estado atual e qualidade da telemetria</p></div></div>
+      <div class="table-scroll"><table class="units-table"><thead><tr><th>ID</th><th>Estado</th><th>Latitude</th><th>Longitude</th><th>Sat.</th><th>HDOP</th><th>RSSI</th><th>SNR</th><th>Sequência</th><th>Atualização</th></tr></thead><tbody id="collars" aria-live="polite"><tr class="empty-row"><td colspan="10">Sem telemetria disponível</td></tr></tbody></table></div>
+    </section>
+  </main>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+  <script src="/static/js/app.js?v=4"></script>
+</body>
+</html>

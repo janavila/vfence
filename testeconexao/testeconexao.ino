@@ -1,42 +1,65 @@
-#define GPS_TX_ENTRADA 23
+#include <TinyGPSPlus.h>
 
-unsigned long ultimoTeste = 0;
-unsigned long transicoes = 0;
-int estadoAnterior;
+TinyGPSPlus gps;
+HardwareSerial GPSserial(1);
+
+#define GPS_RX 23
+
+unsigned long ultimoPrint = 0;
+const unsigned long intervalo = 10000;
 
 void setup() {
   Serial.begin(115200);
   delay(1500);
 
-  pinMode(GPS_TX_ENTRADA, INPUT);
-
-  estadoAnterior = digitalRead(GPS_TX_ENTRADA);
+  // Descobrimos que o seu GPS está transmitindo em 115200
+  GPSserial.begin(115200, SERIAL_8N1, GPS_RX, -1);
 
   Serial.println();
-  Serial.println("=== TESTE TXD NEO #2 - JUMPER NOVO ===");
+  Serial.println("================================");
+  Serial.println("      VFENCE - TESTE GPS");
+  Serial.println("================================");
+  Serial.println("Aguardando localizacao...");
 }
 
 void loop() {
 
-  int estadoAtual = digitalRead(GPS_TX_ENTRADA);
-
-  if (estadoAtual != estadoAnterior) {
-    transicoes++;
-    estadoAnterior = estadoAtual;
+  // Lê continuamente o GPS
+  while (GPSserial.available() > 0) {
+    gps.encode(GPSserial.read());
   }
 
-  if (millis() - ultimoTeste >= 5000) {
+  // Mostra informações a cada 10 segundos
+  if (millis() - ultimoPrint >= intervalo) {
 
-    ultimoTeste = millis();
+    ultimoPrint = millis();
 
-    Serial.print("Transicoes: ");
-    Serial.println(transicoes);
+    Serial.println();
+    Serial.println("------------------------------");
 
-    Serial.print("Estado TXD: ");
-    Serial.println(estadoAtual ? "HIGH" : "LOW");
+    if (gps.location.isValid()) {
 
-    Serial.println("------------------");
+      Serial.println("LOCALIZACAO VALIDA!");
 
-    transicoes = 0;
+      Serial.print("Latitude:  ");
+      Serial.println(gps.location.lat(), 6);
+
+      Serial.print("Longitude: ");
+      Serial.println(gps.location.lng(), 6);
+
+    } else {
+
+      Serial.println("Aguardando fix do GPS...");
+    }
+
+    Serial.print("Satelites: ");
+    Serial.println(gps.satellites.value());
+
+    if (gps.hdop.isValid()) {
+      Serial.print("HDOP: ");
+      Serial.println(gps.hdop.hdop());
+    }
+
+    Serial.println("------------------------------");
   }
 }
