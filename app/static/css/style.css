@@ -29,6 +29,11 @@ body { margin: 0; min-width: 320px; background: var(--page); color: var(--text);
 .brand > div { display: flex; align-items: baseline; gap: 8px; }
 .brand h1 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: -.01em; }
 .brand > div > span { color: var(--subtle); font-size: 12px; }
+.primary-nav { display: flex; align-self: stretch; margin-left: 34px; gap: 4px; }
+.primary-nav a { position: relative; display: flex; align-items: center; padding: 0 13px; color: var(--muted); text-decoration: none; font-size: 13px; font-weight: 500; }
+.primary-nav a:hover { color: var(--text); }
+.primary-nav a.active { color: var(--text); }
+.primary-nav a.active::after { content: ""; position: absolute; left: 13px; right: 13px; bottom: -1px; height: 2px; background: var(--primary); }
 .connection { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
 .connection i { width: 7px; height: 7px; border-radius: 50%; background: var(--warning); }
 .connection.live { color: var(--success); }
@@ -110,6 +115,9 @@ body { margin: 0; min-width: 320px; background: var(--page); color: var(--text);
   .metric-card { min-height: 112px; padding: 18px; }
   .system-line { grid-template-columns: 1fr; gap: 9px; padding: 13px 16px; }
   .brand > div > span { display: none; }
+  .primary-nav { margin-left: auto; }
+  .primary-nav a { padding: 0 8px; font-size: 12px; }
+  .primary-nav a.active::after { left: 8px; right: 8px; }
   .connection { font-size: 0; }
   .panel-heading { padding: 15px 16px; }
   #map { height: 320px; }

@@ -10,6 +10,12 @@ def test_health_and_empty_collars():
         assert client.get('/api/health').json()['status']=='ok'
         assert isinstance(client.get('/api/collars').json(),list)
 
+def test_fence_editor_page():
+    with TestClient(app) as client:
+        response=client.get('/fences')
+        assert response.status_code==200
+        assert 'Editor de cerca' in response.text
+
 def test_collar_after_packet():
     with TestClient(app) as client:
         database.save_packet(parse_message("V1|COL99|POS|-31|-54|ATENCAO|8|1.2|7"))

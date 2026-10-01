@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#f8faf9">
+  <title>Editor de Cercas — VFence Monitor</title>
+  <link rel="stylesheet" href="/static/css/style.css?v=7">
+  <link rel="stylesheet" href="/static/css/fence.css?v=1">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
+</head>
+<body>
+  <header class="app-header">
+    <div class="header-inner">
+      <div class="brand"><span class="brand-symbol">VF</span><div><h1>VFence Monitor</h1><span>v1.0</span></div></div>
+      <nav class="primary-nav" aria-label="Navegação principal"><a href="/">Monitoramento</a><a href="/fences" class="active">Cercas</a></nav>
+      <span class="draft-status"><i></i> Rascunho local</span>
+    </div>
+  </header>
+
+  <main class="workspace fence-workspace">
+    <div class="page-heading fence-heading">
+      <div><p>CONFIGURAÇÃO</p><h2>Editor de cerca</h2><span>Selecione os vértices no mapa para formar o perímetro.</span></div>
+      <div class="heading-actions"><button id="undo-point" class="button secondary" type="button" disabled>Desfazer</button><button id="clear-fence" class="button secondary" type="button" disabled>Limpar</button></div>
+    </div>
+
+    <section class="editor-grid">
+      <article class="panel editor-map-panel">
+        <div class="panel-heading compact"><div><h3>Área de desenho</h3><p>Clique no mapa para adicionar pontos em sequência.</p></div><span id="map-coordinate" class="mono">—</span></div>
+        <div id="fence-map"><div class="map-fallback"><strong>Mapa indisponível</strong><span>A base cartográfica requer conexão com a internet.</span></div></div>
+        <div class="map-footer"><span><i class="legend-dot vertex-dot"></i> Vértice</span><span><i class="legend-line"></i> Perímetro</span><span>Máximo: 32 pontos</span></div>
+      </article>
+
+      <aside class="editor-side">
+        <article class="panel summary-panel">
+          <div class="panel-heading compact"><div><h3>Vetor da cerca</h3><p>Coordenadas na ordem de desenho</p></div><strong id="vertex-count" class="count-badge">0 / 32</strong></div>
+          <div id="fence-state" class="fence-state pending"><i></i><div><strong>Aguardando pontos</strong><span>Adicione pelo menos três vértices.</span></div></div>
+          <div class="vertices-scroll">
+            <table class="vertices-table">
+              <thead><tr><th>#</th><th>Latitude</th><th>Longitude</th><th></th></tr></thead>
+              <tbody id="vertices"><tr class="empty-row"><td colspan="4">Nenhum vértice definido</td></tr></tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="panel vector-panel">
+          <div class="panel-heading compact"><div><h3>Representação do vetor</h3><p>Valores E7 preparados para transmissão</p></div><button id="copy-vector" class="text-button" type="button" disabled>Copiar</button></div>
+          <pre id="vector-output">[]</pre>
+        </article>
+      </aside>
+    </section>
+  </main>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+  <script src="/static/js/fence.js?v=1"></script>
+</body>
+</html>

@@ -51,6 +51,11 @@ async def dashboard():
     return FileResponse(BASE_DIR / "templates" / "index.html")
 
 
+@app.get("/fences", include_in_schema=False)
+async def fence_editor():
+    return FileResponse(BASE_DIR / "templates" / "fence.html")
+
+
 @app.get("/api/health")
 async def health():
     return {
