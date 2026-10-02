@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f8faf9">
+  <title>Histórico de cercas — VFence</title>
+  <link rel="icon" href="/static/VFence.png" type="image/png">
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+
+<header class="app-header">
+  <div class="header-inner">
+    <a class="brand" href="/">
+      <img src="/static/VFence.png" alt="VFence">
+      <strong aria-hidden="true">VFence</strong>
+    </a>
+    <nav class="primary-nav" aria-label="Navegação principal">
+      <a href="/">Início</a>
+      <a href="/editor">Editor de cerca</a>
+      <a href="/historico" aria-current="page">Histórico</a>
+      <a href="/rebanho">Rebanho</a>
+      <a href="/eventos">Eventos</a>
+    </nav>
+    <span class="base-indicator" id="base-indicator" data-state="unknown" aria-live="polite">
+      <i aria-hidden="true"></i>
+      <span id="base-indicator-text">Verificando…</span>
+    </span>
+    <button class="logout-button" type="button" id="logout-button">Sair</button>
+  </div>
+</header>
+
+<main class="workspace">
+
+  <div class="page-heading">
+    <p class="eyebrow">Histórico</p>
+    <h1>Cercas já criadas</h1>
+    <p class="lead">
+      Cada alteração cria uma cerca nova, e a antiga fica guardada. Você pode
+      baixar o relatório de qualquer uma, ver no mapa, ou usar o desenho de
+      novo.
+    </p>
+  </div>
+
+  <section class="panel" aria-labelledby="history-title">
+    <div class="panel-heading">
+      <div>
+        <h2 id="history-title">Da mais recente para a mais antiga</h2>
+        <p>"Usar de novo" cria uma cerca nova com o mesmo desenho</p>
+      </div>
+      <span class="muted-text small" id="realtime-state" data-live="false">conectando</span>
+    </div>
+    <div class="table-scroll">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th scope="col">Cerca</th>
+            <th scope="col">Nome</th>
+            <th scope="col">Criada em</th>
+            <th scope="col">Pontos</th>
+            <th scope="col">Área</th>
+            <th scope="col">Conferência</th>
+            <th scope="col"><span class="sr-only">Ações</span></th>
+          </tr>
+        </thead>
+        <tbody id="history-body">
+          <tr class="empty-row"><td colspan="7">Carregando…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<div class="offline-banner" id="offline-banner" role="status" data-visible="false">
+  <span>Sem conexão com o servidor — tentando de novo</span>
+</div>
+
+<script type="module" src="/js/ui.js"></script>
+<script type="module">
+  import { iniciarPainel } from "/js/paineis.js";
+  iniciarPainel("historico");
+</script>
+</body>
+</html>

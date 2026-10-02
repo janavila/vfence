@@ -1,0 +1,679 @@
+/* ==========================================================================
+   VFence Central — folha de estilo única (seção 11.1 pede um arquivo só).
+
+   Paleta igual à do VFence Monitor, para quem usa os dois na bancada
+   reconhecer a mesma família. Nenhuma fonte externa: a pilha de fontes
+   do sistema já está instalada e não depende de internet.
+
+   Seções: 1 variáveis · 2 base e acessibilidade · 3 cabeçalho ·
+   4 estrutura · 5 blocos reutilizáveis · 6 aviso de conexão · 7 mapa ·
+   8 responsividade · 9 editor e telas de dados · 10 login
+   ========================================================================== */
+
+/* ===== 1. Variáveis ====================================================== */
+
+:root {
+  color-scheme: light;
+
+  /* Superfícies e texto */
+  --page: #f8faf9;
+  --surface: #ffffff;
+  --surface-soft: #fbfcfb;
+  --border: #e2e7e4;
+  --border-strong: #d5dcd8;
+  --text: #18201d;
+  --muted: #5d6965;
+  --subtle: #828d88;
+
+  /* Identidade */
+  --primary: #245c4f;
+  --primary-soft: #edf5f2;
+  --primary-strong: #1b473d;
+
+  /* Situação */
+  --success: #35745c;
+  --warning: #8a6410;
+  --danger: #a34f4f;
+  --neutral: #69736f;
+
+  /* Zonas do animal — PROVISÓRIO: a seção 11.1 marca as cores como "a
+     confirmar com o mapeamento do circuito de bancada da IP1". Até lá,
+     as cinco do Monitor. Ficam aqui para a troca ser uma linha por cor. */
+  --zone-seguro: #35745c;
+  --zone-atencao: #8a6410;
+  --zone-critico: #a0643f;
+  --zone-fora: #a34f4f;
+  --zone-gnss-invalido: #69736f;
+
+  /* Espaçamento e raios */
+  --gap: 14px;
+  --radius: 12px;
+  --radius-sm: 8px;
+
+  /* Alvo mínimo de toque exigido pela seção 11.1 */
+  --touch: 44px;
+
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --mono: ui-monospace, "SFMono-Regular", "Cascadia Mono", Consolas, monospace;
+
+  --shadow: 0 1px 3px rgba(24, 32, 29, .04);
+}
+
+/* ===== 2. Base e acessibilidade ========================================== */
+
+* { box-sizing: border-box; }
+
+html { background: var(--page); }
+
+body {
+  margin: 0;
+  min-width: 320px;
+  background: var(--page);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+.mono { font-family: var(--mono); }
+
+/* Foco visível para quem navega por teclado. :focus-visible evita o
+   contorno no clique de mouse. */
+:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Texto só para leitor de tela. */
+.sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* Quem configurou o sistema para reduzir animação não recebe animação. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}
+
+/* ===== 3. Cabeçalho e navegação ========================================== */
+/* Seção 11.2: logotipo, navegação e indicador da Base. */
+
+.app-header {
+  position: sticky;
+  top: 0;
+  z-index: 500; /* acima dos painéis do Leaflet, que chegam a 400 */
+  background: rgba(255, 255, 255, .97);
+  border-bottom: 1px solid var(--border);
+  backdrop-filter: saturate(1.4) blur(6px);
+}
+
+.header-inner {
+  width: min(1440px, calc(100% - 48px));
+  min-height: 64px;
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 20px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: inherit;
+  text-decoration: none;
+  flex: 0 0 auto;
+}
+
+.brand img { width: 32px; height: 32px; object-fit: contain; display: block; }
+.brand strong { font-size: 16px; font-weight: 600; letter-spacing: -.01em; }
+.brand span { color: var(--subtle); font-size: 12px; }
+
+.primary-nav { display: flex; align-items: center; gap: 2px; flex: 1 1 auto; flex-wrap: wrap; }
+
+.primary-nav a {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-height: 40px;
+  padding: 0 12px;
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  text-decoration: none;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.primary-nav a:hover { color: var(--text); background: var(--primary-soft); }
+.primary-nav a[aria-current="page"] { color: var(--primary); background: var(--primary-soft); font-weight: 600; }
+
+/* Link desligado: visível, mas sem levar a endereço quebrado. */
+.primary-nav a[aria-disabled="true"] {
+  color: var(--subtle);
+  cursor: not-allowed;
+  pointer-events: none;
+}
+.primary-nav a[aria-disabled="true"]::after {
+  content: "em breve";
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--surface-soft);
+  border: 1px solid var(--border);
+  font-size: 10px;
+  font-weight: 500;
+}
+
+/* Indicador da Base no canto direito do cabeçalho. */
+.base-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 13px;
+}
+.base-indicator i {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--neutral);
+  flex: 0 0 auto;
+}
+.base-indicator[data-state="online"] { color: var(--success); border-color: #cfe0d8; }
+.base-indicator[data-state="online"] i { background: var(--success); }
+.base-indicator[data-state="offline"] { color: var(--danger); border-color: #e7d4d4; }
+.base-indicator[data-state="offline"] i { background: var(--danger); }
+
+/* ===== 4. Estrutura da página ============================================ */
+
+.workspace {
+  width: min(1440px, calc(100% - 48px));
+  margin: 0 auto;
+  padding: 28px 0 56px;
+}
+
+.page-heading { margin-bottom: 22px; }
+.page-heading .eyebrow {
+  margin: 0 0 6px;
+  color: var(--primary);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .09em;
+  text-transform: uppercase;
+}
+.page-heading h1 { margin: 0; font-size: 26px; line-height: 1.2; font-weight: 600; letter-spacing: -.02em; }
+.page-heading p.lead { margin: 8px 0 0; max-width: 70ch; color: var(--muted); font-size: 14px; }
+
+/* Grade de cartões de resumo. */
+.card-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--gap); }
+.card-grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+/* Mapa à esquerda, painel lateral de ~360 px à direita (seção 11.1).
+   Abaixo de 1024 px vira uma coluna só — ver bloco 8. */
+.layout-map-side {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  gap: var(--gap);
+  align-items: start;
+}
+
+.stack { display: flex; flex-direction: column; gap: var(--gap); }
+
+/* ===== 5. Blocos reutilizáveis =========================================== */
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.panel-heading {
+  padding: 16px 18px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.panel-heading h2 { margin: 0; font-size: 15px; font-weight: 600; }
+.panel-heading p { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+
+.panel-body { padding: 18px; }
+.panel-body > :first-child { margin-top: 0; }
+.panel-body > :last-child { margin-bottom: 0; }
+
+/* Cartão de número grande (ex.: quantos animais em atenção). */
+.card {
+  min-height: 120px;
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+.card > .card-label { color: var(--muted); font-size: 13px; font-weight: 500; }
+.card > .card-value { font-size: 28px; line-height: 1.1; font-weight: 600; letter-spacing: -.03em; }
+.card > .card-note { margin-top: auto; color: var(--subtle); font-size: 12px; }
+
+/* Sem dado = travessão, nunca zero: "0 animais fora" e "ainda não sei"
+   são informações diferentes. */
+.empty-value { color: var(--subtle); font-weight: 400; }
+
+/* Botões. Sempre com texto, nunca só ícone (seção 11.1). */
+.button {
+  min-height: var(--touch);
+  padding: 0 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font: 500 14px var(--sans);
+  text-decoration: none;
+  cursor: pointer;
+}
+.button:hover:not(:disabled) { background: #f2f5f3; border-color: #c6d0ca; }
+.button:disabled { color: #a9b1ad; background: #f5f6f5; cursor: not-allowed; }
+.button.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
+.button.primary:hover:not(:disabled) { background: var(--primary-strong); border-color: var(--primary-strong); }
+
+/* Etiqueta de situação com bolinha colorida. */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.pill::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; flex: 0 0 auto; }
+.pill.ok { color: var(--success); }
+.pill.warn { color: var(--warning); }
+.pill.bad { color: var(--danger); }
+.pill.idle { color: var(--neutral); }
+
+/* Zona do animal: a cor vem de --zone, definida pelo JavaScript. */
+.zone-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--zone, var(--neutral));
+  font-size: 12px;
+  font-weight: 600;
+}
+.zone-badge::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+
+/* Tabelas de dados. */
+.data-table { width: 100%; border-collapse: collapse; text-align: left; }
+.data-table th {
+  padding: 10px 16px;
+  background: var(--surface-soft);
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .03em;
+  text-transform: uppercase;
+}
+.data-table td { padding: 12px 16px; border-bottom: 1px solid #edf0ee; font-size: 13px; }
+.data-table tbody tr:last-child td { border-bottom: 0; }
+.data-table .empty-row td { height: 88px; text-align: center; color: var(--subtle); }
+.table-scroll { overflow-x: auto; }
+
+/* Aviso dentro de um painel (informação, atenção, erro). */
+.notice {
+  padding: 13px 15px;
+  display: flex;
+  gap: 11px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--neutral);
+  border-radius: var(--radius-sm);
+  background: var(--surface-soft);
+  font-size: 13px;
+}
+.notice strong { display: block; margin-bottom: 2px; }
+.notice.info { border-left-color: var(--primary); background: var(--primary-soft); }
+.notice.warn { border-left-color: var(--warning); background: #fdf8ec; }
+.notice.error { border-left-color: var(--danger); background: #fcf2f2; }
+
+/* ===== 6. Aviso de sem conexão =========================================== */
+/* Seção 11.1: "conexão ruim é normal". Aparece por cima, sem empurrar o
+   conteúdo, e some quando o servidor responde. */
+
+.offline-banner {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  z-index: 900;
+  max-width: calc(100% - 32px);
+  padding: 11px 18px;
+  display: none;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid #e7d4d4;
+  border-radius: 999px;
+  background: #fcf2f2;
+  color: #7d3b3b;
+  box-shadow: 0 4px 14px rgba(24, 32, 29, .12);
+  font-size: 13px;
+  font-weight: 500;
+}
+.offline-banner[data-visible="true"] { display: flex; }
+
+/* ===== 7. Mapa (Leaflet) ================================================= */
+/* O Leaflet traz o próprio CSS; aqui só encaixamos no visual do sistema. */
+
+.map-surface { height: 560px; background: #eef1ef; }
+.leaflet-container { font-family: var(--sans); background: #eef1ef; }
+.leaflet-bar {
+  border: 1px solid var(--border-strong) !important;
+  border-radius: var(--radius-sm) !important;
+  box-shadow: 0 2px 6px rgba(24, 32, 29, .08) !important;
+  overflow: hidden;
+}
+.leaflet-bar a { color: var(--text) !important; border-color: var(--border) !important; }
+.leaflet-control-attribution { font-size: 10px !important; }
+
+/* Mostrado quando o Leaflet ou os tiles não carregam (sem internet). */
+.map-fallback {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 24px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+}
+.map-fallback strong { color: var(--text); }
+
+/* ===== 8. Responsividade ================================================= */
+/* Alvos de teste da especificação: 1366x768 (notebook) e 390x844 (celular). */
+
+/* Abaixo de 1024 px o painel lateral passa para baixo do mapa. */
+@media (max-width: 1023px) {
+  .layout-map-side { grid-template-columns: 1fr; }
+  .card-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .map-surface { height: 440px; }
+}
+
+/* Celular: uma coluna, botões em largura total. */
+@media (max-width: 767px) {
+  .header-inner, .workspace { width: calc(100% - 28px); }
+  .header-inner { flex-wrap: wrap; gap: 10px; padding: 10px 0; }
+  .brand span { display: none; }
+  .primary-nav { order: 3; width: 100%; gap: 0; overflow-x: auto; }
+  .primary-nav a { padding: 0 10px; font-size: 13px; white-space: nowrap; }
+  .primary-nav a[aria-disabled="true"]::after { display: none; }
+  .base-indicator { margin-left: auto; }
+
+  .workspace { padding: 20px 0 44px; }
+  .page-heading h1 { font-size: 22px; }
+  .card-grid, .card-grid.two { grid-template-columns: 1fr; gap: 10px; }
+  .card { min-height: 0; }
+  .button { width: 100%; }
+  .panel-heading { flex-direction: column; align-items: flex-start; }
+  .map-surface { height: 60vh; min-height: 320px; }
+  .offline-banner { left: 14px; right: 14px; bottom: 14px; transform: none; max-width: none; border-radius: var(--radius-sm); }
+}
+
+/* Impressão: o arquivo de log e o resumo da cerca podem ir para o papel. */
+@media print {
+  .app-header, .offline-banner, .button { display: none !important; }
+  body { background: #fff; }
+  .panel { box-shadow: none; break-inside: avoid; }
+}
+
+/* ===== 9. Editor de cerca e telas de dados =============================== */
+
+/* Numeração dos passos do editor (seção 11.3). */
+.step-number {
+  display: inline-grid;
+  place-items: center;
+  width: 22px; height: 22px;
+  margin-right: 8px;
+  border-radius: 50%;
+  background: var(--primary);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.count-badge {
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--primary-soft);
+  color: var(--primary);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.stack-sm { display: flex; flex-direction: column; gap: 12px; }
+
+/* Área e perímetro ao vivo. */
+.measure-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.measure-row > div {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-soft);
+}
+.measure-row span { display: block; color: var(--muted); font-size: 12px; }
+.measure-row strong { font-size: 18px; font-weight: 600; letter-spacing: -.02em; }
+
+.button-row { display: flex; flex-wrap: wrap; gap: 8px; }
+.button-row .button { flex: 1 1 auto; min-width: 120px; padding: 0 12px; font-size: 13px; }
+
+/* Aviso de sucesso (o `notice` só tinha info/warn/error). */
+.notice.ok-notice { border-left-color: var(--success); background: #f3f8f5; }
+
+/* Campos de formulário. */
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field label { font-size: 13px; font-weight: 600; }
+.field input[type="text"], .field input[type="number"], .field input[type="password"] {
+  min-height: var(--touch);
+  padding: 0 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font: 15px var(--sans);
+}
+.field input:focus-visible { border-color: var(--primary); }
+.field small { color: var(--muted); font-size: 12px; }
+
+.checkbox-row { display: flex; align-items: flex-start; gap: 10px; cursor: pointer; }
+.checkbox-row input { width: 20px; height: 20px; margin: 0; flex: 0 0 auto; cursor: pointer; }
+
+/* Resumo da revisão. */
+.summary { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 0; }
+.summary > div {
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-soft);
+}
+.summary dt { color: var(--muted); font-size: 12px; }
+.summary dd { margin: 2px 0 0; font-size: 14px; font-weight: 600; }
+
+.impact-note {
+  margin: 0;
+  padding: 10px 12px;
+  border-left: 3px solid var(--primary);
+  background: var(--primary-soft);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+/* Lista de pontos rolável: 32 pontos não devem esticar a página. */
+.points-scroll { max-height: 300px; overflow-y: auto; }
+
+.icon-button {
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--muted);
+  font: 500 12px var(--sans);
+  cursor: pointer;
+}
+.icon-button:hover:not(:disabled) { border-color: #e0cccc; background: #fcf6f6; color: var(--danger); }
+.icon-button:disabled { opacity: .5; cursor: not-allowed; }
+
+/* Marcador numerado da cerca, no mapa. */
+.fence-marker {
+  width: 26px !important; height: 26px !important;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  background: var(--primary);
+  box-shadow: 0 1px 4px rgba(20, 40, 32, .3);
+  color: #fff;
+  font: 700 11px/22px var(--mono);
+  text-align: center;
+  cursor: grab;
+}
+.fence-marker.problem { background: var(--danger); }
+
+.map-legend {
+  min-height: 44px;
+  padding: 10px 16px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 12px;
+}
+.map-legend span { display: inline-flex; align-items: center; gap: 7px; }
+.legend-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.legend-dash {
+  width: 20px; height: 0;
+  display: inline-block;
+  border-top: 2px dashed currentColor;
+}
+
+/* Entrega: Salva → Na Base → Transmitindo → Confirmada. */
+.delivery-track { display: inline-flex; align-items: center; gap: 6px; }
+.step-dot {
+  width: 11px; height: 11px;
+  border-radius: 50%;
+  border: 2px solid var(--border-strong);
+  background: var(--surface);
+  display: inline-block;
+}
+.step-dot.done { border-color: var(--success); background: var(--success); }
+
+.text-ok { color: var(--success); font-weight: 600; }
+.text-bad { color: var(--danger); font-weight: 600; }
+.muted-text { color: var(--muted); }
+.small { font-size: 12px; }
+
+/* Depois de enviar, os passos ficam só de leitura. */
+#editor-steps.sent { opacity: .55; pointer-events: none; }
+.sent-panel { border-color: #cfe0d8; }
+
+/* Etiqueta de coleira desatualizada (seção 11.4). */
+.tag-outdated {
+  padding: 2px 8px;
+  border: 1px solid #e8dcc0;
+  border-radius: 999px;
+  background: #fdf8ec;
+  color: var(--warning);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* Histórico: a linha da cerca que está valendo. */
+tr.is-active td { background: var(--primary-soft); }
+.row-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.row-actions .button { min-height: 34px; padding: 0 10px; font-size: 12px; }
+
+@media (max-width: 767px) {
+  .measure-row, .summary { grid-template-columns: 1fr; }
+  .button-row .button { min-width: 0; }
+  .points-scroll { max-height: 260px; }
+}
+
+/* Seletor do filtro de eventos. */
+.select-input {
+  min-height: var(--touch);
+  padding: 0 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font: 14px var(--sans);
+}
+
+/* ===== 10. Tela de login (fase F8) ====================================== */
+
+.login-body {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px 16px;
+  background: var(--page);
+}
+
+.login-card {
+  width: min(420px, 100%);
+  padding: 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 2px 10px rgba(24, 32, 29, .06);
+}
+
+.login-brand { display: flex; align-items: center; gap: 12px; }
+.login-brand img { width: 44px; height: 44px; object-fit: contain; }
+.login-brand > div { display: flex; flex-direction: column; }
+.login-brand strong { font-size: 18px; font-weight: 600; }
+.login-brand span { color: var(--muted); font-size: 13px; }
+
+.login-card h1 { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: -.02em; }
+.login-card p { margin: 0; font-size: 14px; }
+.login-card form { display: flex; flex-direction: column; gap: 16px; }
+.login-card .button { width: 100%; }
+.login-footnote { border-top: 1px solid var(--border); padding-top: 16px; }
+
+/* Botão "Sair" no cabeçalho. */
+.logout-button {
+  min-height: 36px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--muted);
+  font: 500 13px var(--sans);
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.logout-button:hover { color: var(--text); border-color: var(--border-strong); }

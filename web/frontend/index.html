@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f8faf9">
+  <meta name="description" content="VFence — cerca virtual para pecuária. Painel do produtor.">
+  <title>Início — VFence</title>
+
+  <!-- O mesmo PNG serve de logotipo e de ícone da aba (seção 11.2). -->
+  <link rel="icon" href="/static/VFence.png" type="image/png">
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+
+<!-- ======================================================================
+     Cabeçalho comum a todas as telas (seção 11.2).
+     Nas próximas fases este bloco se repete nas outras páginas. Mantemos
+     HTML repetido de propósito: a alternativa seria um sistema de
+     templates, que exigiria etapa de compilação — justamente o que a
+     especificação proíbe.
+     ====================================================================== -->
+<header class="app-header">
+  <div class="header-inner">
+    <a class="brand" href="/">
+      <img src="/static/VFence.png" alt="VFence">
+      <strong aria-hidden="true">VFence</strong>
+    </a>
+
+    <nav class="primary-nav" aria-label="Navegação principal">
+      <a href="/" aria-current="page">Início</a>
+      <a href="/editor">Editor de cerca</a>
+      <a href="/historico">Histórico</a>
+      <a href="/rebanho">Rebanho</a>
+      <a href="/eventos">Eventos</a>
+    </nav>
+
+    <!-- Situação da Base. O texto é preenchido pelo ui.js. -->
+    <span class="base-indicator" id="base-indicator" data-state="unknown" aria-live="polite">
+      <i aria-hidden="true"></i>
+      <span id="base-indicator-text">Verificando…</span>
+    </span>
+    <button class="logout-button" type="button" id="logout-button">Sair</button>
+  </div>
+</header>
+
+<main class="workspace">
+
+  <div class="page-heading">
+    <p class="eyebrow">Painel</p>
+    <h1>Situação da propriedade</h1>
+    <p class="lead">
+      Aqui aparece a cerca que está valendo, quantas coleiras já a confirmaram
+      e o que aconteceu com o rebanho nas últimas horas.
+    </p>
+  </div>
+
+  <!-- ====================================================================
+       Resumo em cartões (seção 11.4).
+       Nesta fase os valores ainda não têm de onde vir: a API de cercas
+       chega na fase F3 e a da Base na F4. Mostramos travessão em vez de
+       zero porque "nenhum animal fora" e "ainda não sei" são informações
+       diferentes, e trocar uma pela outra engana o produtor.
+       ==================================================================== -->
+  <section class="card-grid" aria-label="Resumo da propriedade">
+    <article class="card">
+      <span class="card-label">Cerca valendo agora</span>
+      <strong class="card-value empty-value" id="active-fence-name">—</strong>
+      <small class="card-note" id="active-fence-note">Nenhuma cerca enviada ainda</small>
+    </article>
+
+    <article class="card">
+      <span class="card-label">Coleiras que confirmaram</span>
+      <strong class="card-value empty-value" id="confirmed-count">—</strong>
+      <small class="card-note">De quantas coleiras cadastradas</small>
+    </article>
+
+    <article class="card">
+      <span class="card-label">Animais em atenção</span>
+      <strong class="card-value empty-value" id="attention-count">—</strong>
+      <small class="card-note">Perto da cerca ou em estado crítico</small>
+    </article>
+
+    <article class="card">
+      <span class="card-label">Animais fora da área</span>
+      <strong class="card-value empty-value" id="outside-count">—</strong>
+      <small class="card-note">Passaram da cerca</small>
+    </article>
+  </section>
+
+  <!-- ====================================================================
+       Estado do serviço: é o único bloco desta tela que já funciona de
+       verdade na fase F1. Ele consulta GET /api/health e prova, de ponta
+       a ponta, que o navegador conversa com o servidor.
+       ==================================================================== -->
+  <section class="panel" style="margin-top: var(--gap);" aria-labelledby="service-title">
+    <div class="panel-heading">
+      <div>
+        <h2 id="service-title">Servidor VFence</h2>
+        <p>Programa que guarda as cercas e conversa com a Base</p>
+      </div>
+      <span class="pill idle" id="service-pill">Verificando…</span>
+    </div>
+    <div class="panel-body">
+      <table class="data-table">
+        <tbody>
+          <tr>
+            <th scope="row" style="width: 220px;">Situação</th>
+            <td id="service-status">—</td>
+          </tr>
+          <tr>
+            <th scope="row">Versão do programa</th>
+            <td class="mono" id="service-version">—</td>
+          </tr>
+          <tr>
+            <th scope="row">Hora do servidor</th>
+            <td id="service-time">—</td>
+          </tr>
+          <tr>
+            <th scope="row">Última verificação</th>
+            <td id="service-checked">—</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ====================================================================
+       Últimos eventos (seção 11.4). Estrutura pronta; os dados chegam na
+       fase F6, junto com o WebSocket.
+       ==================================================================== -->
+  <section class="panel" style="margin-top: var(--gap);" aria-labelledby="events-title">
+    <div class="panel-heading">
+      <div>
+        <h2 id="events-title">Últimos acontecimentos</h2>
+        <p>O que as coleiras relataram</p>
+      </div>
+    </div>
+    <div class="table-scroll">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th scope="col">Hora</th>
+            <th scope="col">Coleira</th>
+            <th scope="col">O que aconteceu</th>
+          </tr>
+        </thead>
+        <tbody id="events-body">
+          <tr class="empty-row"><td colspan="3">Nenhum acontecimento registrado</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel" style="margin-top: var(--gap);">
+    <div class="panel-body">
+      <div class="notice info">
+        <div>
+          <strong>Primeira vez por aqui?</strong>
+          Comece pelo <a href="/editor">Editor de cerca</a>: clique no mapa para
+          marcar os pontos da divisa e envie. O acompanhamento de cada coleira
+          aparece na mesma tela.
+        </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<!-- Aviso de conexão, fora do fluxo da página para não empurrar nada. -->
+<div class="offline-banner" id="offline-banner" role="status" data-visible="false">
+  <span>Sem conexão com o servidor — tentando de novo</span>
+</div>
+
+<!-- type="module" porque o projeto usa módulos ES nativos do navegador,
+     sem empacotador e sem etapa de compilação (seção 3). -->
+<script type="module" src="/js/ui.js"></script>
+<script type="module">
+  import { iniciarPainel } from "/js/paineis.js";
+  iniciarPainel("inicio");
+</script>
+</body>
+</html>

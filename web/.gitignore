@@ -1,0 +1,17 @@
+# Nada de segredo, banco, log ou ambiente no Git.
+.env
+.venv/
+
+# Dados em tempo de execução: banco e logs ficam todos sob data/.
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Artefatos do Python e do pytest.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# macOS
+.DS_Store

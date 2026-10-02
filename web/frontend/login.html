@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f8faf9">
+  <title>Entrar — VFence</title>
+  <link rel="icon" href="/static/VFence.png" type="image/png">
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body class="login-body">
+
+<main class="login-card">
+  <div class="login-brand">
+    <img src="/static/VFence.png" alt="VFence">
+    <div>
+      <strong>VFence</strong>
+      <span>Cerca virtual</span>
+    </div>
+  </div>
+
+  <h1>Entrar</h1>
+  <p class="muted-text">Use o usuário e a senha combinados para esta propriedade.</p>
+
+  <form id="login-form" novalidate>
+    <div class="field">
+      <label for="user">Usuário</label>
+      <input type="text" id="user" name="user" autocomplete="username"
+             autocapitalize="none" spellcheck="false" required autofocus>
+    </div>
+
+    <div class="field">
+      <label for="password">Senha</label>
+      <input type="password" id="password" name="password"
+             autocomplete="current-password" required>
+    </div>
+
+    <div class="notice error" id="login-error" role="alert" hidden></div>
+
+    <button class="button primary" type="submit" id="login-button">Entrar</button>
+  </form>
+
+  <p class="muted-text small login-footnote">
+    O VFence funciona na rede da propriedade. Não é preciso internet para
+    desenhar e enviar a cerca — só as imagens do mapa dependem dela.
+  </p>
+</main>
+
+<script type="module">
+  /* A tela de login é pequena o bastante para o seu JavaScript morar
+     aqui: ela não compartilha nada com o resto do sistema, e um arquivo
+     separado seria mais um pedido de rede antes de alguém entrar. */
+
+  const formulario = document.getElementById('login-form');
+  const erro = document.getElementById('login-error');
+  const botao = document.getElementById('login-button');
+
+  function mostrarErro(texto) {
+    erro.innerHTML = `<div>${texto}</div>`;
+    erro.hidden = false;
+  }
+
+  formulario.addEventListener('submit', async (evento) => {
+    evento.preventDefault();
+    erro.hidden = true;
+    botao.disabled = true;
+    botao.textContent = 'Entrando…';
+
+    try {
+      const resposta = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user: document.getElementById('user').value,
+          password: document.getElementById('password').value,
+        }),
+      });
+
+      if (resposta.ok) {
+        /* `replace` em vez de `href`: o botão Voltar do navegador não
+           deve trazer o produtor de volta para a tela de login depois
+           de ele já ter entrado. */
+        window.location.replace('/');
+        return;
+      }
+      /* A mesma mensagem para usuário errado e senha errada: dizer qual
+         dos dois está certo ajudaria quem está tentando adivinhar. */
+      mostrarErro(resposta.status === 401
+        ? 'Usuário ou senha incorretos. Confira e tente de novo.'
+        : 'Não foi possível entrar agora. Tente de novo em instantes.');
+    } catch {
+      mostrarErro('Sem conexão com o servidor. Confira se o VFence está ligado.');
+    } finally {
+      botao.disabled = false;
+      botao.textContent = 'Entrar';
+    }
+  });
+</script>
+</body>
+</html>

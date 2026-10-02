@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f8faf9">
+  <title>Rebanho — VFence</title>
+  <link rel="icon" href="/static/VFence.png" type="image/png">
+  <link rel="stylesheet" href="/vendor/leaflet/leaflet.css">
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+
+<header class="app-header">
+  <div class="header-inner">
+    <a class="brand" href="/">
+      <img src="/static/VFence.png" alt="VFence">
+      <strong aria-hidden="true">VFence</strong>
+    </a>
+    <nav class="primary-nav" aria-label="Navegação principal">
+      <a href="/">Início</a>
+      <a href="/editor">Editor de cerca</a>
+      <a href="/historico">Histórico</a>
+      <a href="/rebanho" aria-current="page">Rebanho</a>
+      <a href="/eventos">Eventos</a>
+    </nav>
+    <span class="base-indicator" id="base-indicator" data-state="unknown" aria-live="polite">
+      <i aria-hidden="true"></i>
+      <span id="base-indicator-text">Verificando…</span>
+    </span>
+    <button class="logout-button" type="button" id="logout-button">Sair</button>
+  </div>
+</header>
+
+<main class="workspace">
+
+  <div class="page-heading">
+    <p class="eyebrow">Rebanho</p>
+    <h1>Onde estão os animais</h1>
+    <p class="lead">
+      A cor de cada animal mostra a situação dele em relação à cerca. Quem
+      decide essa situação é a própria coleira, não o servidor.
+    </p>
+  </div>
+
+  <section class="layout-map-side">
+    <article class="panel">
+      <div class="panel-heading">
+        <div><h2>Mapa do rebanho</h2><p>Última posição recebida de cada coleira</p></div>
+        <span class="muted-text small" id="realtime-state" data-live="false">conectando</span>
+      </div>
+      <div class="map-surface" id="herd-map">
+        <div class="map-fallback">
+          <strong>Carregando o mapa…</strong>
+          <span>As imagens do mapa precisam de internet.</span>
+        </div>
+      </div>
+      <div class="map-legend">
+        <span><i class="legend-dot" style="background: var(--zone-seguro)"></i> tranquilo</span>
+        <span><i class="legend-dot" style="background: var(--zone-atencao)"></i> perto da cerca</span>
+        <span><i class="legend-dot" style="background: var(--zone-critico)"></i> muito perto</span>
+        <span><i class="legend-dot" style="background: var(--zone-fora)"></i> fora da área</span>
+        <span><i class="legend-dot" style="background: var(--zone-gnss-invalido)"></i> sem GPS</span>
+      </div>
+    </article>
+
+    <article class="panel">
+      <div class="panel-heading">
+        <div><h2>Coleiras</h2><p>Estado e qualidade do sinal</p></div>
+      </div>
+      <div class="notice info" style="margin: 14px;">
+        <div>
+          <strong>"Desatualizada"</strong>
+          significa que aquela coleira ainda está usando uma cerca anterior.
+          O sistema reenvia sozinho.
+        </div>
+      </div>
+      <div class="table-scroll">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th scope="col">Coleira</th>
+              <th scope="col">Animal</th>
+              <th scope="col">Situação</th>
+              <th scope="col">Bateria</th>
+              <th scope="col">Sinal</th>
+              <th scope="col">Cerca em uso</th>
+              <th scope="col">Último contato</th>
+            </tr>
+          </thead>
+          <tbody id="herd-body">
+            <tr class="empty-row"><td colspan="7">Carregando…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </article>
+  </section>
+</main>
+
+<div class="offline-banner" id="offline-banner" role="status" data-visible="false">
+  <span>Sem conexão com o servidor — tentando de novo</span>
+</div>
+
+<script src="/vendor/leaflet/leaflet.js"></script>
+<script type="module" src="/js/ui.js"></script>
+<script type="module">
+  import { iniciarPainel } from "/js/paineis.js";
+  iniciarPainel("rebanho");
+</script>
+</body>
+</html>

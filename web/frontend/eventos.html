@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f8faf9">
+  <title>Acontecimentos — VFence</title>
+  <link rel="icon" href="/static/VFence.png" type="image/png">
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+
+<header class="app-header">
+  <div class="header-inner">
+    <a class="brand" href="/">
+      <img src="/static/VFence.png" alt="VFence">
+      <strong aria-hidden="true">VFence</strong>
+    </a>
+    <nav class="primary-nav" aria-label="Navegação principal">
+      <a href="/">Início</a>
+      <a href="/editor">Editor de cerca</a>
+      <a href="/historico">Histórico</a>
+      <a href="/rebanho">Rebanho</a>
+      <a href="/eventos" aria-current="page">Eventos</a>
+    </nav>
+    <span class="base-indicator" id="base-indicator" data-state="unknown" aria-live="polite">
+      <i aria-hidden="true"></i>
+      <span id="base-indicator-text">Verificando…</span>
+    </span>
+    <button class="logout-button" type="button" id="logout-button">Sair</button>
+  </div>
+</header>
+
+<main class="workspace">
+
+  <div class="page-heading">
+    <p class="eyebrow">Acontecimentos</p>
+    <h1>O que aconteceu com o rebanho</h1>
+    <p class="lead">
+      Cada linha é algo que uma coleira relatou — por exemplo, quando um
+      animal chegou perto da cerca ou passou dela.
+    </p>
+  </div>
+
+  <section class="panel" aria-labelledby="timeline-title">
+    <div class="panel-heading">
+      <div>
+        <h2 id="timeline-title">Do mais recente para o mais antigo</h2>
+        <p>Até 200 acontecimentos</p>
+      </div>
+      <div class="field" style="min-width: 220px;">
+        <label for="event-filter" class="sr-only">Filtrar por coleira</label>
+        <select id="event-filter" class="select-input">
+          <option value="">Todas as coleiras</option>
+        </select>
+      </div>
+    </div>
+    <div class="table-scroll">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th scope="col">Quando</th>
+            <th scope="col">Coleira</th>
+            <th scope="col">O que aconteceu</th>
+            <th scope="col">Situação</th>
+            <th scope="col">Detalhe</th>
+          </tr>
+        </thead>
+        <tbody id="timeline-body">
+          <tr class="empty-row"><td colspan="5">Carregando…</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="panel-body">
+      <span class="muted-text small" id="realtime-state" data-live="false">conectando</span>
+    </div>
+  </section>
+</main>
+
+<div class="offline-banner" id="offline-banner" role="status" data-visible="false">
+  <span>Sem conexão com o servidor — tentando de novo</span>
+</div>
+
+<script type="module" src="/js/ui.js"></script>
+<script type="module">
+  import { iniciarPainel } from "/js/paineis.js";
+  iniciarPainel("eventos");
+</script>
+</body>
+</html>

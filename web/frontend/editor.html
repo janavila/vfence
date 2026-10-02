@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f8faf9">
+  <meta name="description" content="Desenhe a cerca virtual no mapa e envie para as coleiras.">
+  <title>Editor de cerca — VFence</title>
+
+  <link rel="icon" href="/static/VFence.png" type="image/png">
+  <!-- Leaflet servido pelo próprio Central: nada de CDN (seção 3). -->
+  <link rel="stylesheet" href="/vendor/leaflet/leaflet.css">
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+
+<header class="app-header">
+  <div class="header-inner">
+    <a class="brand" href="/">
+      <img src="/static/VFence.png" alt="VFence">
+      <strong aria-hidden="true">VFence</strong>
+    </a>
+    <nav class="primary-nav" aria-label="Navegação principal">
+      <a href="/">Início</a>
+      <a href="/editor" aria-current="page">Editor de cerca</a>
+      <a href="/historico">Histórico</a>
+      <a href="/rebanho">Rebanho</a>
+      <a href="/eventos">Eventos</a>
+    </nav>
+    <span class="base-indicator" id="base-indicator" data-state="unknown" aria-live="polite">
+      <i aria-hidden="true"></i>
+      <span id="base-indicator-text">Verificando…</span>
+    </span>
+    <button class="logout-button" type="button" id="logout-button">Sair</button>
+  </div>
+</header>
+
+<main class="workspace">
+
+  <div class="page-heading">
+    <p class="eyebrow">Cerca virtual</p>
+    <h1>Desenhar a cerca</h1>
+    <p class="lead">
+      Clique no mapa para marcar os pontos da cerca, seguindo o sentido dos
+      ponteiros do relógio. O sistema confere os problemas na hora.
+    </p>
+  </div>
+
+  <div class="notice info" id="editor-announce" role="status" hidden></div>
+
+  <!-- ===================================================================
+       Mapa à esquerda, passos à direita (seção 11.1).
+       Abaixo de 1024 px o painel passa para baixo do mapa.
+       =================================================================== -->
+  <section class="layout-map-side">
+
+    <article class="panel">
+      <div class="panel-heading">
+        <div>
+          <h2>Mapa da propriedade</h2>
+          <p>Base <span id="base-label" class="mono">—</span> ·
+             <span id="base-state">verificando</span> ·
+             <span id="realtime-state" data-live="false">conectando</span></p>
+        </div>
+        <span class="mono muted-text" id="cursor-position">—</span>
+      </div>
+      <div class="map-surface" id="editor-map">
+        <div class="map-fallback">
+          <strong>Carregando o mapa…</strong>
+          <span>As imagens do mapa precisam de internet. O resto funciona sem ela.</span>
+        </div>
+      </div>
+      <div class="map-legend">
+        <span><i class="legend-dot" style="background: var(--primary)"></i> pontos da cerca</span>
+        <span><i class="legend-dash" style="border-color: var(--neutral)"></i> cerca que está valendo</span>
+        <span><i class="legend-dash" style="border-color: var(--warning)"></i> alcance do rádio</span>
+        <span class="muted-text" id="band-note"></span>
+      </div>
+    </article>
+
+    <!-- =================================================================
+         Os cinco passos da seção 11.3
+         ================================================================= -->
+    <div class="stack" id="editor-steps">
+
+      <!-- Passo 1 -->
+      <article class="panel">
+        <div class="panel-heading">
+          <div><h2><span class="step-number">1</span> Marcar os pontos</h2></div>
+          <strong class="count-badge" id="point-count">0 de 32</strong>
+        </div>
+        <div class="panel-body stack-sm">
+          <div class="measure-row">
+            <div><span>Área</span><strong id="area-value">—</strong></div>
+            <div><span>Perímetro</span><strong id="perimeter-value">—</strong></div>
+          </div>
+
+          <div class="button-row">
+            <button class="button" type="button" id="undo-point" disabled>Desfazer último</button>
+            <button class="button" type="button" id="clear-points" disabled>Limpar tudo</button>
+            <button class="button" type="button" id="invert-order" disabled>Inverter ordem</button>
+          </div>
+
+          <div id="orientation-state" class="notice">
+            <div>Marque pelo menos 3 pontos para fechar a cerca.</div>
+          </div>
+        </div>
+
+        <div class="table-scroll points-scroll">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th scope="col">#</th>
+                <th scope="col">Latitude</th>
+                <th scope="col">Longitude</th>
+                <th scope="col"><span class="sr-only">Ações</span></th>
+              </tr>
+            </thead>
+            <tbody id="points-body">
+              <tr class="empty-row"><td colspan="4">Clique no mapa para marcar o primeiro ponto</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+
+      <!-- Passo 2 -->
+      <article class="panel">
+        <div class="panel-heading">
+          <div><h2><span class="step-number">2</span> Conferir os problemas</h2></div>
+        </div>
+        <div class="panel-body stack-sm">
+          <div id="problems">
+            <p class="muted-text">Os problemas aparecem aqui conforme você marca os pontos.</p>
+          </div>
+          <p class="muted-text small" id="server-check"></p>
+        </div>
+      </article>
+
+      <!-- Passo 3 -->
+      <article class="panel">
+        <div class="panel-heading">
+          <div><h2><span class="step-number">3</span> Margens de aviso</h2></div>
+        </div>
+        <div class="panel-body stack-sm">
+          <div class="field">
+            <label for="margin-attention">Aviso ao animal a (metros da cerca)</label>
+            <input type="number" id="margin-attention" min="0.5" max="100" step="0.5" value="5">
+            <small id="attention-explain">A coleira começa a avisar o animal a 5 m da cerca.</small>
+          </div>
+          <div class="field">
+            <label for="margin-critical">Aviso forte a (metros da cerca)</label>
+            <input type="number" id="margin-critical" min="0.1" max="100" step="0.5" value="2">
+            <small>Mais perto da cerca, o aviso fica mais forte. Precisa ser menor que o de cima.</small>
+          </div>
+        </div>
+      </article>
+
+      <!-- Passo 4 -->
+      <article class="panel">
+        <div class="panel-heading">
+          <div><h2><span class="step-number">4</span> Revisar</h2></div>
+        </div>
+        <div class="panel-body stack-sm">
+          <div class="field">
+            <label for="fence-name">Nome da cerca</label>
+            <input type="text" id="fence-name" maxlength="80" placeholder="Piquete do açude" value="">
+            <small>Para você reconhecer esta cerca depois, no histórico.</small>
+          </div>
+
+          <div id="review-summary">
+            <p class="muted-text">O resumo aparece quando a cerca estiver fechada.</p>
+          </div>
+
+          <div class="notice warn" id="accept-warnings-box" hidden>
+            <div>
+              <label class="checkbox-row">
+                <input type="checkbox" id="accept-warnings">
+                <span>Estou ciente dos avisos acima e quero enviar assim mesmo.</span>
+              </label>
+            </div>
+          </div>
+
+          <p class="impact-note" id="impact-note"></p>
+        </div>
+      </article>
+
+      <!-- Passo 5 -->
+      <article class="panel">
+        <div class="panel-heading">
+          <div><h2><span class="step-number">5</span> Enviar</h2></div>
+        </div>
+        <div class="panel-body">
+          <button class="button primary" type="button" id="send-fence" disabled>
+            Enviar a cerca para as coleiras
+          </button>
+        </div>
+      </article>
+
+    </div>
+  </section>
+
+  <!-- ===================================================================
+       Acompanhamento da entrega. Aparece depois de enviar.
+       =================================================================== -->
+  <section class="panel sent-panel" id="sent-panel" hidden style="margin-top: var(--gap);">
+    <div class="panel-heading">
+      <div>
+        <h2>Cerca <span id="sent-version">—</span> enviada</h2>
+        <p>Conferência <span class="mono" id="sent-crc">—</span> ·
+           criada em <span id="sent-created">—</span></p>
+      </div>
+      <a class="button" id="log-link" href="#" download>Baixar o relatório</a>
+    </div>
+    <div class="table-scroll">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th scope="col">Coleira</th>
+            <th scope="col">Salva → Na Base → Transmitindo → Confirmada</th>
+            <th scope="col">Situação</th>
+          </tr>
+        </thead>
+        <tbody id="deliveries-body">
+          <tr class="empty-row"><td colspan="3">Aguardando a Base buscar a cerca…</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="panel-body">
+      <div class="notice info">
+        <div>
+          <strong>O que acontece agora</strong>
+          A Base busca a cerca sozinha, confere a conferência de integridade e
+          transmite pelo rádio. Cada coleira responde quando guardou a cerca.
+          Esta tela se atualiza por conta própria.
+        </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<div class="offline-banner" id="offline-banner" role="status" data-visible="false">
+  <span>Sem conexão com o servidor — tentando de novo</span>
+</div>
+
+<script src="/vendor/leaflet/leaflet.js"></script>
+<script type="module" src="/js/ui.js"></script>
+<script type="module" src="/js/editor.js"></script>
+</body>
+</html>

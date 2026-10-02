@@ -1,0 +1,14 @@
+# Dependências do Central (VFence Web) — Projeto Integrador V, UNIPAMPA.
+#
+# Versões fixadas de propósito: todo o grupo instala exatamente o conjunto
+# que foi testado, sem surpresa de atualização no meio da IP2.
+#
+# Nenhuma dependência nova em relação ao que o repositório já usava: as
+# cinco abaixo já estavam instaladas no ambiente do Monitor. A única que
+# ainda não aparecia em um requirements.txt é a python-dotenv.
+
+fastapi==0.141.1            # framework web; já traz Pydantic v2 e o /docs automático
+uvicorn[standard]==0.54.0   # servidor que executa o FastAPI
+python-dotenv==1.2.3        # lê o .env de dentro da aplicação (decisão B2 da fase F0)
+httpx==0.28.1               # cliente HTTP: usado pelo TestClient e pelo simulador da Base (F4)
+pytest==8.4.2               # testes

@@ -1,0 +1,453 @@
+{
+  "_sobre": [
+    "Casos geométricos compartilhados do VFence (seção 5.6 da especificação).",
+    "",
+    "Este arquivo é propositalmente JSON puro, sem nada de Python: ele é a",
+    "referência comum para TRÊS implementações — a validação em Python do",
+    "Central, o espelho em JavaScript do editor (frontend/js/geometry.js) e o",
+    "geofencing em C++ da coleira. Se as três concordarem nos mesmos casos, a",
+    "geometria está consistente nas três pontas.",
+    "",
+    "Cada caso traz:",
+    "  points                 pontos em graus, na ordem de desenho",
+    "  margin_attention_m     dA",
+    "  margin_critical_m      dC",
+    "  expected.valid         se a cerca pode ser salva",
+    "  expected.errors        regras de severidade 'error' esperadas",
+    "  expected.warnings      regras de severidade 'warning' esperadas",
+    "  expected.orientation   'clockwise', 'counterclockwise' ou null",
+    "  expected.area_ha       área em hectares (comparar com tolerância)",
+    "  expected.perimeter_m   perímetro em metros (comparar com tolerância)",
+    "  expected.crc32         CRC da forma canônica, só quando a cerca é válida",
+    "",
+    "TOLERÂNCIA: o firmware da coleira usa o elipsoide WGS84 e o Central usa",
+    "esfera de raio 6371008,8 m. A diferença chega a ~0,5% em distância, então",
+    "comparar área e perímetro com tolerância relativa de 1%, nunca igualdade."
+  ],
+  "_base_de_referencia": {
+    "_nota": "As regras VAL-03 e VAL-10 medem distância até a Base. Os casos abaixo assumem esta posição.",
+    "base_lat": -31.3062,
+    "base_lon": -54.06395,
+    "base_raio_max_km": 5,
+    "lora_alcance_m": 200,
+    "gnss_erro_esperado_m": 3.0,
+    "gnss_fator_seguranca": 1.5
+  },
+  "casos": [
+    {
+      "nome": "quadrado_de_conferencia",
+      "descricao": "Conferência obrigatória da seção 5.3: o quadrado (0,0)→(0,1)→(1,1)→(1,0) no plano x,y é horário e dá área com sinal A = -1. Aqui está em coordenadas de PLANO (metros), não em graus: serve para testar a fórmula do laço isoladamente, antes de qualquer projeção.",
+      "plane_points": [
+        [
+          0,
+          0
+        ],
+        [
+          0,
+          1
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          0
+        ]
+      ],
+      "expected": {
+        "signed_area": -1.0,
+        "orientation": "clockwise",
+        "perimeter_m": 4.0
+      }
+    },
+    {
+      "nome": "cerca_de_exemplo",
+      "descricao": "A cerca de exemplo da seção 5.5, com o CRC do contrato v0. Única violação esperada: VAL-12, porque a margem crítica padrão (2 m) é menor que a folga recomendada (4,5 m). Pode ser salva se o produtor marcar que está ciente.",
+      "points": [
+        {
+          "lat": -31.306,
+          "lon": -54.0642
+        },
+        {
+          "lat": -31.306,
+          "lon": -54.0637
+        },
+        {
+          "lat": -31.3064,
+          "lon": -54.0637
+        },
+        {
+          "lat": -31.3064,
+          "lon": -54.0642
+        }
+      ],
+      "margin_attention_m": 5.0,
+      "margin_critical_m": 2.0,
+      "expected": {
+        "valid": true,
+        "errors": [],
+        "warnings": [
+          "VAL-12"
+        ],
+        "orientation": "clockwise",
+        "area_ha": 0.2113,
+        "perimeter_m": 183.96,
+        "version": 1,
+        "crc32": "DA29321E",
+        "canonical_hex": "01000000f401c80004f04e22feb80bc7fcf04e22feac0dc7fc604d22feac0dc7fc604d22feb80bc7fc",
+        "points_e6": [
+          [
+            -31306000,
+            -54064200
+          ],
+          [
+            -31306000,
+            -54063700
+          ],
+          [
+            -31306400,
+            -54063700
+          ],
+          [
+            -31306400,
+            -54064200
+          ]
+        ]
+      }
+    },
+    {
+      "nome": "cerca_de_exemplo_invertida",
+      "descricao": "A mesma cerca em ordem anti-horária. Precisa falhar em VAL-06, sem normalização automática (DEC-15). Área e perímetro continuam os mesmos: só o SINAL da área muda.",
+      "points": [
+        {
+          "lat": -31.3064,
+          "lon": -54.0642
+        },
+        {
+          "lat": -31.3064,
+          "lon": -54.0637
+        },
+        {
+          "lat": -31.306,
+          "lon": -54.0637
+        },
+        {
+          "lat": -31.306,
+          "lon": -54.0642
+        }
+      ],
+      "margin_attention_m": 5.0,
+      "margin_critical_m": 2.0,
+      "expected": {
+        "valid": false,
+        "errors": [
+          "VAL-06"
+        ],
+        "warnings": [
+          "VAL-12"
+        ],
+        "orientation": "counterclockwise",
+        "area_ha": 0.2113,
+        "perimeter_m": 183.96
+      }
+    },
+    {
+      "nome": "gravata_borboleta",
+      "descricao": "Os lados 1-2 e 3-4 se cruzam: a cerca não tem dentro e fora bem definidos. Precisa falhar em VAL-05. O par de lados cruzados vai em expected.edges para a tela destacar no mapa. VAL-06 NÃO entra na lista de propósito: o sentido de giro de uma cerca com lados cruzados é indefinido (os dois laços dão área com sinal zero), então o Central dá um erro só, e o certo. VAL-09 aparece como aviso porque a área com sinal zero cai na heurística de 'área pequena para a margem'.",
+      "points": [
+        {
+          "lat": -31.306,
+          "lon": -54.0642
+        },
+        {
+          "lat": -31.3064,
+          "lon": -54.0637
+        },
+        {
+          "lat": -31.306,
+          "lon": -54.0637
+        },
+        {
+          "lat": -31.3064,
+          "lon": -54.0642
+        }
+      ],
+      "margin_attention_m": 5.0,
+      "margin_critical_m": 2.0,
+      "expected": {
+        "valid": false,
+        "errors": [
+          "VAL-05"
+        ],
+        "edges": [
+          [
+            1,
+            3
+          ]
+        ],
+        "warnings": [
+          "VAL-09",
+          "VAL-12"
+        ]
+      }
+    },
+    {
+      "nome": "pontos_repetidos",
+      "descricao": "O ponto 2 está a cerca de 0,29 m do ponto 1 (0,000002 grau em cada eixo). Precisa falhar em VAL-04. Um par de pontos assim não acrescenta nada à cerca e só gasta bytes no rádio. O deslocamento é nos DOIS eixos de propósito: com a mesma longitude do ponto 1, o ponto 2 ficaria deitado sobre o lado oeste da cerca e dispararia VAL-05 também, deixando o caso menos isolado.",
+      "points": [
+        {
+          "lat": -31.306,
+          "lon": -54.0642
+        },
+        {
+          "lat": -31.306002,
+          "lon": -54.064198
+        },
+        {
+          "lat": -31.306,
+          "lon": -54.0637
+        },
+        {
+          "lat": -31.3064,
+          "lon": -54.0637
+        },
+        {
+          "lat": -31.3064,
+          "lon": -54.0642
+        }
+      ],
+      "margin_attention_m": 5.0,
+      "margin_critical_m": 2.0,
+      "expected": {
+        "valid": false,
+        "errors": [
+          "VAL-04"
+        ],
+        "edges": [
+          [
+            1,
+            2
+          ]
+        ],
+        "warnings": [
+          "VAL-12"
+        ]
+      }
+    },
+    {
+      "nome": "lat_lon_trocados",
+      "descricao": "Alguém digitou a longitude no campo da latitude. O ponto vai para o oceano Índico, a milhares de quilômetros da Base. Precisa falhar em VAL-03 — a regra existe exatamente para pegar esta troca, que é o erro mais comum de quem digita coordenadas. A ordem dos pontos foi escolhida para continuar horária depois da troca, de modo que o caso isole VAL-03 sem arrastar VAL-06. VAL-10 aparece como aviso pela razão óbvia: 2.500 km está bem além do alcance do rádio.",
+      "points": [
+        {
+          "lat": -54.0642,
+          "lon": -31.306
+        },
+        {
+          "lat": -54.0642,
+          "lon": -31.3064
+        },
+        {
+          "lat": -54.0637,
+          "lon": -31.3064
+        },
+        {
+          "lat": -54.0637,
+          "lon": -31.306
+        }
+      ],
+      "margin_attention_m": 5.0,
+      "margin_critical_m": 2.0,
+      "expected": {
+        "valid": false,
+        "errors": [
+          "VAL-03"
+        ],
+        "warnings": [
+          "VAL-10",
+          "VAL-12"
+        ]
+      }
+    },
+    {
+      "nome": "triangulo_muito_pequeno",
+      "descricao": "Triângulo de cerca de 2,2 m de lado. Cabe na cerca, mas é menor que o erro do GPS e muito menor que a margem de atenção: o animal receberia aviso em toda a área. Três avisos esperados (VAL-07, VAL-09, VAL-12) e nenhum erro — ou seja, PODE ser salvo se o produtor marcar que está ciente.",
+      "points": [
+        {
+          "lat": -31.3062,
+          "lon": -54.06395
+        },
+        {
+          "lat": -31.3062,
+          "lon": -54.063927
+        },
+        {
+          "lat": -31.30622,
+          "lon": -54.063939
+        }
+      ],
+      "margin_attention_m": 5.0,
+      "margin_critical_m": 2.0,
+      "expected": {
+        "valid": true,
+        "errors": [],
+        "warnings": [
+          "VAL-07",
+          "VAL-09",
+          "VAL-12"
+        ],
+        "orientation": "clockwise"
+      }
+    },
+    {
+      "nome": "margens_invertidas",
+      "descricao": "Margem crítica maior que a de atenção. Precisa falhar em VAL-08: a ordem dos avisos ao animal se inverteria, e ele receberia o alerta forte antes do fraco. Não há aviso VAL-12 aqui: a margem crítica de 5 m é maior que a folga recomendada de 4,5 m.",
+      "points": [
+        {
+          "lat": -31.306,
+          "lon": -54.0642
+        },
+        {
+          "lat": -31.306,
+          "lon": -54.0637
+        },
+        {
+          "lat": -31.3064,
+          "lon": -54.0637
+        },
+        {
+          "lat": -31.3064,
+          "lon": -54.0642
+        }
+      ],
+      "margin_attention_m": 2.0,
+      "margin_critical_m": 5.0,
+      "expected": {
+        "valid": false,
+        "errors": [
+          "VAL-08"
+        ],
+        "warnings": []
+      }
+    },
+    {
+      "nome": "poucos_pontos",
+      "descricao": "Dois pontos não formam área. Precisa falhar em VAL-01, e só em VAL-01: sem quantidade válida de pontos não há como projetar nem medir, então o Central não despeja erros derivados que confundiriam o produtor.",
+      "points": [
+        {
+          "lat": -31.306,
+          "lon": -54.0642
+        },
+        {
+          "lat": -31.306,
+          "lon": -54.0637
+        }
+      ],
+      "margin_attention_m": 5.0,
+      "margin_critical_m": 2.0,
+      "expected": {
+        "valid": false,
+        "errors": [
+          "VAL-01"
+        ],
+        "orientation": null,
+        "area_ha": 0.0,
+        "perimeter_m": 0.0,
+        "warnings": []
+      }
+    },
+    {
+      "nome": "coordenada_impossivel",
+      "descricao": "Latitude 91 não existe. Precisa falhar em VAL-02 e parar ali, antes de qualquer cálculo de geometria.",
+      "points": [
+        {
+          "lat": 91.0,
+          "lon": -54.0642
+        },
+        {
+          "lat": -31.306,
+          "lon": -54.0637
+        },
+        {
+          "lat": -31.3064,
+          "lon": -54.0637
+        }
+      ],
+      "margin_attention_m": 5.0,
+      "margin_critical_m": 2.0,
+      "expected": {
+        "valid": false,
+        "errors": [
+          "VAL-02"
+        ],
+        "points": [
+          1
+        ],
+        "warnings": []
+      }
+    },
+    {
+      "nome": "ponto_fora_do_alcance_lora",
+      "descricao": "Cerca grande e legítima, com pontos a mais de 200 m da Base. Precisa avisar VAL-10 sem bloquear: o geofencing funciona sem rádio, porque a coleira já tem a cerca gravada. O que fica instável é a atualização e a telemetria naquela região.",
+      "points": [
+        {
+          "lat": -31.304,
+          "lon": -54.066
+        },
+        {
+          "lat": -31.304,
+          "lon": -54.062
+        },
+        {
+          "lat": -31.308,
+          "lon": -54.062
+        },
+        {
+          "lat": -31.308,
+          "lon": -54.066
+        }
+      ],
+      "margin_attention_m": 5.0,
+      "margin_critical_m": 2.0,
+      "expected": {
+        "valid": true,
+        "errors": [],
+        "warnings": [
+          "VAL-10",
+          "VAL-12"
+        ],
+        "orientation": "clockwise"
+      }
+    },
+    {
+      "nome": "cerca_boa_sem_nenhum_aviso",
+      "descricao": "Cerca de piquete com margens folgadas (dA = 8 m, dC = 5 m, acima da folga recomendada de 4,5 m). Nenhum erro e nenhum aviso: é o caminho feliz do editor, o caso que precisa poder ser salvo sem o produtor marcar nada.",
+      "points": [
+        {
+          "lat": -31.3058,
+          "lon": -54.0646
+        },
+        {
+          "lat": -31.3058,
+          "lon": -54.0633
+        },
+        {
+          "lat": -31.3066,
+          "lon": -54.0633
+        },
+        {
+          "lat": -31.3066,
+          "lon": -54.0646
+        }
+      ],
+      "margin_attention_m": 8.0,
+      "margin_critical_m": 5.0,
+      "expected": {
+        "valid": true,
+        "errors": [],
+        "warnings": [],
+        "orientation": "clockwise"
+      }
+    }
+  ]
+}
