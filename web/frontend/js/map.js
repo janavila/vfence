@@ -35,6 +35,8 @@ export const CAMADAS = {
 /**
  * Cria o mapa centralizado na Base. Zoom 17 é o padrão da seção 11.3:
  * dá para ver um piquete inteiro. Devolve null se o Leaflet não carregou.
+ * A Base é só o ponto de partida: `mostrarLocalizacao` leva o mapa até
+ * onde o produtor está.
  */
 export function criarMapa(elementoId, config, zoom = 17) {
   const elemento = document.getElementById(elementoId);
@@ -107,6 +109,51 @@ export function desenharAlcanceDoRadio(mapa, config) {
   }).addTo(mapa);
 }
 
+/* Os movimentos automáticos (enquadrar, ir até o produtor) não animam:
+   durante uma animação de zoom o Leaflet ignora o próximo `setView`, e
+   aí a localização e o enquadramento disputariam quem chega primeiro. */
+const SEM_ANIMACAO = { animate: false };
+
+/**
+ * Mostra onde o produtor está (ponto azul e a precisão do GPS em volta)
+ * e centraliza o mapa ali na primeira posição — em vez de deixá-lo
+ * sempre no ponto fixo da Base.
+ *
+ * `watch` segue a pessoa: quem caminha pela divisa com o celular se vê
+ * andar no mapa. Só centraliza se `podeCentralizar()` deixar: mover o
+ * mapa no meio do desenho faria o produtor errar o clique. Os círculos
+ * não recebem clique, para marcar um ponto bem onde se está.
+ *
+ * O navegador só dá a posição com permissão e em HTTPS ou `localhost`;
+ * pelo IP da rede local, sem HTTPS, ela é recusada e o mapa fica na Base.
+ */
+export function mostrarLocalizacao(mapa, podeCentralizar) {
+  if (!mapa) return;
+  const nota = (texto) => {
+    const elemento = document.getElementById('location-note');
+    if (elemento) elemento.textContent = texto;
+  };
+  let ponto = null;
+  let precisao = null;
+
+  mapa.on('locationfound', ({ latlng, accuracy }) => {
+    nota('');
+    if (!ponto) {
+      precisao = L.circle(latlng, {
+        color: '#2f6db5', weight: 1, fillOpacity: 0.1, interactive: false,
+      }).addTo(mapa);
+      ponto = L.circleMarker(latlng, {
+        radius: 8, color: '#fff', weight: 3, fillColor: '#2f6db5', fillOpacity: 1, interactive: false,
+      }).addTo(mapa);
+      if (podeCentralizar()) mapa.setView(latlng, 17, SEM_ANIMACAO);
+    }
+    ponto.setLatLng(latlng);
+    precisao.setLatLng(latlng).setRadius(accuracy);
+  });
+  mapa.on('locationerror', () => nota('Sem acesso à sua localização: o mapa mostra a Base.'));
+  mapa.locate({ watch: true, enableHighAccuracy: true });
+}
+
 /** Converte os pontos do nosso formato `{lat, lon}` para o do Leaflet. */
 export function paraLeaflet(pontos) {
   return pontos.map((p) => [p.lat, p.lon]);
@@ -116,8 +163,8 @@ export function paraLeaflet(pontos) {
 export function enquadrar(mapa, pontos, zoomMaximo = 18) {
   if (!mapa || pontos.length === 0) return;
   if (pontos.length === 1) {
-    mapa.setView([pontos[0].lat, pontos[0].lon], zoomMaximo);
+    mapa.setView([pontos[0].lat, pontos[0].lon], zoomMaximo, SEM_ANIMACAO);
     return;
   }
-  mapa.fitBounds(paraLeaflet(pontos), { padding: [40, 40], maxZoom: zoomMaximo });
+  mapa.fitBounds(paraLeaflet(pontos), { ...SEM_ANIMACAO, padding: [40, 40], maxZoom: zoomMaximo });
 }

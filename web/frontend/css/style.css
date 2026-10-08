@@ -15,8 +15,8 @@
 :root {
   color-scheme: light;
 
-  /* Superfícies e texto */
-  --page: #f8faf9;
+  /* Superfícies e texto. Fundo verde-escuro; todo texto fica em bloco branco. */
+  --page: #1b473d;
   --surface: #ffffff;
   --surface-soft: #fbfcfb;
   --border: #e2e7e4;
@@ -53,6 +53,9 @@
   /* Alvo mínimo de toque exigido pela seção 11.1 */
   --touch: 44px;
 
+  /* Altura da faixa do logotipo e do título, acima da barra de navegação */
+  --brand-h: 140px;
+
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --mono: ui-monospace, "SFMono-Regular", "Cascadia Mono", Consolas, monospace;
 
@@ -76,6 +79,9 @@ body {
 }
 
 .mono { font-family: var(--mono); }
+
+/* `hidden` precisa vencer o `display` das classes (`.notice` é flex). */
+[hidden] { display: none !important; }
 
 /* Foco visível para quem navega por teclado. :focus-visible evita o
    contorno no clique de mouse. */
@@ -101,16 +107,22 @@ body {
 }
 
 /* ===== 3. Cabeçalho e navegação ========================================== */
-/* Seção 11.2: logotipo, navegação e indicador da Base. */
+/* Logotipo grande e centralizado; abaixo, a barra com o modo, a
+   navegação e o indicador da Base. O `top` negativo deixa o logotipo
+   rolar junto com a página e prende só a barra no alto da tela. */
 
 .app-header {
   position: sticky;
-  top: 0;
-  z-index: 500; /* acima dos painéis do Leaflet, que chegam a 400 */
-  background: rgba(255, 255, 255, .97);
+  top: calc(-1 * var(--brand-h));
+  z-index: 500; /* acima do mapa (ver .leaflet-container) */
+  background: var(--surface);
   border-bottom: 1px solid var(--border);
-  backdrop-filter: saturate(1.4) blur(6px);
 }
+
+.brand { height: var(--brand-h); padding-top: 12px; text-align: center; }
+.brand a { display: block; width: fit-content; margin: 0 auto 4px; }
+.brand img { height: calc(var(--brand-h) - 46px); display: block; }
+.brand strong { color: var(--primary-strong); font-size: 15px; font-weight: 600; letter-spacing: .01em; }
 
 .header-inner {
   width: min(1440px, calc(100% - 48px));
@@ -121,18 +133,30 @@ body {
   gap: 20px;
 }
 
-.brand {
+/* Modo Produtor (editor e rebanho) ou Gestão (painel, histórico
+   e eventos). Cada página já vem com o seu modo marcado no HTML. */
+.mode-switch {
   display: flex;
-  align-items: center;
-  gap: 10px;
-  color: inherit;
-  text-decoration: none;
   flex: 0 0 auto;
+  padding: 3px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface-soft);
 }
-
-.brand img { width: 32px; height: 32px; object-fit: contain; display: block; }
-.brand strong { font-size: 16px; font-weight: 600; letter-spacing: -.01em; }
-.brand span { color: var(--subtle); font-size: 12px; }
+.mode-switch a {
+  min-height: 38px;
+  padding: 0 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 600;
+  text-decoration: none;
+}
+.mode-switch a:hover { color: var(--text); }
+.mode-switch a[aria-current] { background: var(--primary); color: #fff; }
 
 .primary-nav { display: flex; align-items: center; gap: 2px; flex: 1 1 auto; flex-wrap: wrap; }
 
@@ -151,23 +175,6 @@ body {
 
 .primary-nav a:hover { color: var(--text); background: var(--primary-soft); }
 .primary-nav a[aria-current="page"] { color: var(--primary); background: var(--primary-soft); font-weight: 600; }
-
-/* Link desligado: visível, mas sem levar a endereço quebrado. */
-.primary-nav a[aria-disabled="true"] {
-  color: var(--subtle);
-  cursor: not-allowed;
-  pointer-events: none;
-}
-.primary-nav a[aria-disabled="true"]::after {
-  content: "em breve";
-  margin-left: 6px;
-  padding: 1px 6px;
-  border-radius: 999px;
-  background: var(--surface-soft);
-  border: 1px solid var(--border);
-  font-size: 10px;
-  font-weight: 500;
-}
 
 /* Indicador da Base no canto direito do cabeçalho. */
 .base-indicator {
@@ -201,7 +208,7 @@ body {
   padding: 28px 0 56px;
 }
 
-.page-heading { margin-bottom: 22px; }
+.page-heading { margin-bottom: var(--gap); padding: 20px 22px; background: var(--surface); border-radius: var(--radius); }
 .page-heading .eyebrow {
   margin: 0 0 6px;
   color: var(--primary);
@@ -212,20 +219,14 @@ body {
 }
 .page-heading h1 { margin: 0; font-size: 26px; line-height: 1.2; font-weight: 600; letter-spacing: -.02em; }
 .page-heading p.lead { margin: 8px 0 0; max-width: 70ch; color: var(--muted); font-size: 14px; }
+/* Requisitos da cerca, no editor: duas colunas quando cabem. */
+.requirements { margin: 4px 0 0; padding-left: 20px; max-width: 900px; columns: 2 300px; column-gap: 32px; color: var(--muted); font-size: 14px; }
 
 /* Grade de cartões de resumo. */
 .card-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--gap); }
-.card-grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 
-/* Mapa à esquerda, painel lateral de ~360 px à direita (seção 11.1).
-   Abaixo de 1024 px vira uma coluna só — ver bloco 8. */
-.layout-map-side {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 360px;
-  gap: var(--gap);
-  align-items: start;
-}
-
+/* Coluna única do editor e do rebanho: o mapa em cima, o resto embaixo.
+   (A seção 11.1 previa painel lateral; a coluna única é mais fácil de seguir.) */
 .stack { display: flex; flex-direction: column; gap: var(--gap); }
 
 /* ===== 5. Blocos reutilizáveis =========================================== */
@@ -381,7 +382,8 @@ body {
 /* O Leaflet traz o próprio CSS; aqui só encaixamos no visual do sistema. */
 
 .map-surface { height: 560px; background: #eef1ef; }
-.leaflet-container { font-family: var(--sans); background: #eef1ef; }
+/* z-index 0: os botões do Leaflet (1000) não passam sobre o cabeçalho. */
+.leaflet-container { font-family: var(--sans); background: #eef1ef; z-index: 0; }
 .leaflet-bar {
   border: 1px solid var(--border-strong) !important;
   border-radius: var(--radius-sm) !important;
@@ -409,26 +411,29 @@ body {
 /* ===== 8. Responsividade ================================================= */
 /* Alvos de teste da especificação: 1366x768 (notebook) e 390x844 (celular). */
 
-/* Abaixo de 1024 px o painel lateral passa para baixo do mapa. */
+/* Abaixo de 1024 px: cartões em duas colunas e mapa mais baixo. */
 @media (max-width: 1023px) {
-  .layout-map-side { grid-template-columns: 1fr; }
   .card-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .map-surface { height: 440px; }
 }
 
 /* Celular: uma coluna, botões em largura total. */
 @media (max-width: 767px) {
+  /* Aqui a barra vira três linhas (modo, navegação, Base): presa no
+     alto, tomaria a tela do celular. */
+  :root { --brand-h: 112px; }
+  .app-header { position: static; }
   .header-inner, .workspace { width: calc(100% - 28px); }
   .header-inner { flex-wrap: wrap; gap: 10px; padding: 10px 0; }
-  .brand span { display: none; }
-  .primary-nav { order: 3; width: 100%; gap: 0; overflow-x: auto; }
+  .mode-switch { width: 100%; }
+  .mode-switch a { flex: 1; }
+  .primary-nav { width: 100%; gap: 0; overflow-x: auto; }
   .primary-nav a { padding: 0 10px; font-size: 13px; white-space: nowrap; }
-  .primary-nav a[aria-disabled="true"]::after { display: none; }
-  .base-indicator { margin-left: auto; }
+  .base-indicator { margin-right: auto; }
 
   .workspace { padding: 20px 0 44px; }
   .page-heading h1 { font-size: 22px; }
-  .card-grid, .card-grid.two { grid-template-columns: 1fr; gap: 10px; }
+  .card-grid { grid-template-columns: 1fr; gap: 10px; }
   .card { min-height: 0; }
   .button { width: 100%; }
   .panel-heading { flex-direction: column; align-items: flex-start; }
@@ -487,6 +492,10 @@ body {
 
 /* Aviso de sucesso (o `notice` só tinha info/warn/error). */
 .notice.ok-notice { border-left-color: var(--success); background: #f3f8f5; }
+
+/* Faixa acima do mapa do editor: o que fazer agora. Está sempre lá
+   (muda só o texto e a cor), para o mapa não pular quando surge um erro. */
+.map-guide { min-height: 64px; align-items: center; border-width: 0 0 1px 4px; border-radius: 0; font-size: 14px; }
 
 /* Campos de formulário. */
 .field { display: flex; flex-direction: column; gap: 5px; }
@@ -594,6 +603,8 @@ body {
 
 /* Depois de enviar, os passos ficam só de leitura. */
 #editor-steps.sent { opacity: .55; pointer-events: none; }
+/* Na coluna única, um campo de "5 m" não precisa da largura toda. */
+#editor-steps .field { max-width: 480px; }
 .sent-panel { border-color: #cfe0d8; }
 
 /* Etiqueta de coleira desatualizada (seção 11.4). */

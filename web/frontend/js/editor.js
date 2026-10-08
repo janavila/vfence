@@ -4,10 +4,12 @@
    Os cinco passos, que são a estrutura deste arquivo
    --------------------------------------------------
    1. Marcar pontos    clique a clique, sempre em sentido horário
-   2. Conferir problemas  validação ao vivo, e confirmação no servidor
+   2. Conferir problemas  validação ao vivo, e confirmação no servidor;
+                       na tela, são os avisos acima do mapa
    3. Margens          dA e dC, com as faixas desenhadas no mapa
    4. Revisar          nome, resumo, aviso de impacto
    5. Enviar e acompanhar  linha do tempo por coleira
+   Na tela, os passos 1, 3, 4 e 5 ficam abaixo do mapa, numerados de 1 a 4.
 
    Duas decisões que explicam o resto
    ----------------------------------
@@ -35,7 +37,9 @@ import {
 import {
   MAX_POINTS, MIN_POINTS, faixaParaDentro, numero, validarCerca,
 } from './geometry.js';
-import { criarMapa, desenharAlcanceDoRadio, enquadrar, marcarBase, paraLeaflet } from './map.js';
+import {
+  criarMapa, desenharAlcanceDoRadio, enquadrar, marcarBase, mostrarLocalizacao, paraLeaflet,
+} from './map.js';
 import { conectarTempoReal } from './realtime.js';
 import { escapeHtml, formatClock } from './ui.js';
 
@@ -44,9 +48,7 @@ import { escapeHtml, formatClock } from './ui.js';
    disparar uma requisição por clique durante o desenho. */
 const ESPERA_ANTES_DE_CONFIRMAR_MS = 500;
 
-/* ----------------------------------------------------------------------
-   Estado da tela
-   ---------------------------------------------------------------------- */
+/* ---- Estado da tela ---- */
 
 const estado = {
   config: null,
@@ -75,9 +77,7 @@ const camadas = {
 
 const elemento = (id) => document.getElementById(id);
 
-/* ----------------------------------------------------------------------
-   Passo 1 — marcar pontos
-   ---------------------------------------------------------------------- */
+/* ---- Passo 1 — marcar pontos ---- */
 
 function acrescentarPonto(lat, lon) {
   if (estado.pontos.length >= MAX_POINTS) {
@@ -123,9 +123,7 @@ function moverPonto(indice, lat, lon) {
   mudou();
 }
 
-/* ----------------------------------------------------------------------
-   Desenho no mapa
-   ---------------------------------------------------------------------- */
+/* ---- Desenho no mapa ---- */
 
 function limparCamadas() {
   camadas.marcadores.forEach((m) => m.remove());
@@ -253,9 +251,7 @@ function desenharCercaAtiva() {
   );
 }
 
-/* ----------------------------------------------------------------------
-   Passo 2 — conferir problemas
-   ---------------------------------------------------------------------- */
+/* ---- Passo 2 — conferir problemas ---- */
 
 function lerMargem(id) {
   const campo = elemento(id);
@@ -295,9 +291,7 @@ async function confirmarNoServidor() {
   }
 }
 
-/* ----------------------------------------------------------------------
-   Montagem do corpo da requisição
-   ---------------------------------------------------------------------- */
+/* ---- Montagem do corpo da requisição ---- */
 
 function montarCorpo() {
   return {
@@ -309,14 +303,15 @@ function montarCorpo() {
   };
 }
 
-/* ----------------------------------------------------------------------
-   Desenho do painel lateral
-   ---------------------------------------------------------------------- */
+/* ---- Desenho dos avisos e dos passos ---- */
 
 function renderizar() {
   const resultado = estado.resultadoServidor ?? estado.resultadoLocal;
   const quantidade = estado.pontos.length;
-  const erros = (resultado?.violations ?? []).filter((v) => v.severity === 'error');
+  // Com menos de 3 pontos, a falta de pontos (VAL-01) não conta como erro:
+  // o produtor ainda está desenhando, e vermelho ali só assustaria.
+  const erros = (resultado?.violations ?? []).filter((v) => v.severity === 'error'
+    && (v.rule !== 'VAL-01' || quantidade >= MIN_POINTS));
   const avisos = (resultado?.violations ?? []).filter((v) => v.severity === 'warning');
 
   // --- contador, área e perímetro ao vivo ---------------------------
@@ -360,26 +355,20 @@ function renderizar() {
         </tr>`).join('')
     : '<tr class="empty-row"><td colspan="4">Clique no mapa para marcar o primeiro ponto</td></tr>';
 
-  // --- problemas -------------------------------------------------------
+  // --- problemas: avisos acima do mapa, só quando existem ------------
   const problemas = elemento('problems');
-  if (!resultado || quantidade === 0) {
-    problemas.innerHTML = '<p class="muted-text">Os problemas aparecem aqui conforme você marca os pontos.</p>';
-  } else if (!erros.length && !avisos.length) {
-    problemas.innerHTML = '<div class="notice ok-notice"><div><strong>Nenhum problema</strong>'
-      + 'A cerca está pronta para enviar.</div></div>';
-  } else {
-    problemas.innerHTML = [...erros, ...avisos].map((v) => `
-      <div class="notice ${v.severity === 'error' ? 'error' : 'warn'}">
-        <div><strong>${v.severity === 'error' ? 'Precisa corrigir' : 'Atenção'}</strong>
-        ${escapeHtml(v.message)}</div>
-      </div>`).join('');
-  }
+  problemas.hidden = !erros.length && !avisos.length;
+  problemas.innerHTML = [...erros, ...avisos].map((v) => `
+    <div class="notice ${v.severity === 'error' ? 'error' : 'warn'}">
+      <div><strong>${v.severity === 'error' ? 'Precisa corrigir' : 'Atenção'}</strong>
+      ${escapeHtml(v.message)}</div>
+    </div>`).join('');
 
   elemento('server-check').textContent = estado.resultadoServidor
     ? 'Conferido pelo servidor.'
     : (quantidade >= MIN_POINTS ? 'Conferindo com o servidor…' : '');
 
-  // --- passo 4: revisão ------------------------------------------------
+  // --- revisão --------------------------------------------------------
   const caixaDeAvisos = elemento('accept-warnings-box');
   caixaDeAvisos.hidden = avisos.length === 0;
   elemento('accept-warnings').checked = estado.avisosAceitos;
@@ -398,12 +387,37 @@ function renderizar() {
   elemento('impact-note').textContent = montarAvisoDeImpacto();
 
   // --- botão enviar ----------------------------------------------------
+  const temNome = (elemento('fence-name')?.value || '').trim().length > 0;
   const podeEnviar = Boolean(
     resultado && resultado.valid && quantidade >= MIN_POINTS && !estado.enviando
-    && !travado && (avisos.length === 0 || estado.avisosAceitos)
-    && (elemento('fence-name')?.value || '').trim().length > 0,
+    && !travado && (avisos.length === 0 || estado.avisosAceitos) && temNome,
   );
   elemento('send-fence').disabled = !podeEnviar;
+
+  orientar(quantidade, erros, avisos, temNome);
+}
+
+/* Cor de cada situação da faixa acima do mapa; as outras ficam `info`. */
+const COR_DA_FAIXA = { erro: 'error', aviso: 'warn', pronta: 'ok-notice', enviada: 'ok-notice' };
+
+/**
+ * Faixa acima do mapa: o que o produtor deve fazer agora. Os textos
+ * ficam no editor.html; aqui só se escolhe qual mostrar e a cor. Com
+ * erro, ela fica vermelha e diz que o envio está bloqueado; o que está
+ * errado aparece nos avisos logo abaixo dela.
+ */
+function orientar(quantidade, erros, avisos, temNome) {
+  let situacao = temNome ? 'pronta' : 'nome';
+  if (estado.versaoEnviada) situacao = 'enviada';
+  else if (erros.length) situacao = 'erro';
+  else if (quantidade < MIN_POINTS) situacao = quantidade ? 'continuar' : 'comecar';
+  else if (avisos.length && !estado.avisosAceitos) situacao = 'aviso';
+
+  const faixa = elemento('map-guide');
+  faixa.className = `notice map-guide ${COR_DA_FAIXA[situacao] ?? 'info'}`;
+  faixa.querySelectorAll('[data-when]').forEach((frase) => {
+    frase.hidden = frase.dataset.when !== situacao;
+  });
 }
 
 /**
@@ -421,9 +435,7 @@ function montarAvisoDeImpacto() {
   return `Vai substituir a cerca nº ${estado.cercaAtiva.version} em ${coleiras} ${plural}.`;
 }
 
-/* ----------------------------------------------------------------------
-   Passo 5 — enviar e acompanhar
-   ---------------------------------------------------------------------- */
+/* ---- Passo 5 — enviar e acompanhar ---- */
 
 async function enviar() {
   if (estado.enviando) return;
@@ -507,9 +519,7 @@ function desenharEntregas(entregas) {
   }).join('');
 }
 
-/* ----------------------------------------------------------------------
-   Avisos ao produtor
-   ---------------------------------------------------------------------- */
+/* ---- Avisos ao produtor ---- */
 
 function anunciar(texto, tipo = 'info') {
   const faixa = elemento('editor-announce');
@@ -519,9 +529,7 @@ function anunciar(texto, tipo = 'info') {
   faixa.hidden = false;
 }
 
-/* ----------------------------------------------------------------------
-   Ligação dos controles
-   ---------------------------------------------------------------------- */
+/* ---- Ligação dos controles ---- */
 
 function ligarControles() {
   elemento('undo-point').addEventListener('click', desfazerUltimo);
@@ -554,9 +562,7 @@ function ligarControles() {
   });
 }
 
-/* ----------------------------------------------------------------------
-   Início
-   ---------------------------------------------------------------------- */
+/* ---- Início ---- */
 
 async function iniciar() {
   try {
@@ -572,6 +578,7 @@ async function iniciar() {
   elemento('attention-explain').textContent =
     `A coleira começa a avisar o animal a ${numero(estado.config.margin_attention_default_m)} m da cerca.`;
   elemento('base-label').textContent = estado.config.base_id;
+  elemento('max-radius').textContent = numero(estado.config.base_max_radius_km);
 
   estado.mapa = criarMapa('editor-map', estado.config, 17);
   if (estado.mapa) {
@@ -595,6 +602,11 @@ async function iniciar() {
   } catch {
     estado.cercaAtiva = null;  // 404: ainda não há cerca. Normal.
   }
+
+  // Depois da cerca ativa, de propósito: quando a posição do produtor
+  // chega, ela vence o enquadramento — desde que ele não tenha começado
+  // a marcar pontos.
+  mostrarLocalizacao(estado.mapa, () => estado.pontos.length === 0);
 
   ligarControles();
   renderizar();

@@ -1,5 +1,5 @@
 /* ==========================================================================
-   paineis.js — Início, Histórico, Rebanho e Eventos.
+   paineis.js — Situação da propriedade, Histórico, Rebanho e Eventos.
 
    Um módulo para quatro telas porque as quatro fazem a mesma coisa:
    buscar dados, desenhar uma tabela, atualizar ao vivo. Em quatro
@@ -10,11 +10,10 @@
    ========================================================================== */
 
 import {
-  enderecoDoGeojson, enderecoDoLog, explicarErro, lerBases, lerCercaAtiva,
-  lerColeiras, lerConfiguracao, lerEntregas, lerEventos, lerHistorico,
-  reativarCerca,
+  enderecoDoGeojson, enderecoDoLog, explicarErro, lerCercaAtiva, lerColeiras,
+  lerConfiguracao, lerEntregas, lerEventos, lerHistorico, reativarCerca,
 } from './api.js';
-import { criarMapa, enquadrar, marcarBase, paraLeaflet } from './map.js';
+import { criarMapa, enquadrar, marcarBase, mostrarLocalizacao, paraLeaflet } from './map.js';
 import { conectarTempoReal } from './realtime.js';
 import { escapeHtml, formatClock } from './ui.js';
 
@@ -50,42 +49,9 @@ function numeroOu(valor, sufixo = '', casas = 0) {
   return `${Number(valor).toFixed(casas).replace('.', ',')}${sufixo}`;
 }
 
-/* ----------------------------------------------------------------------
-   Cabeçalho: situação da Base, comum a todas as telas
-   ---------------------------------------------------------------------- */
+/* ---- Situação da propriedade (modo Gestão) ---- */
 
-async function atualizarIndicadorDaBase() {
-  const indicador = elemento('base-indicator');
-  if (!indicador) return null;
-  try {
-    const bases = await lerBases();
-    const base = bases[0];
-    if (!base) {
-      indicador.dataset.state = 'unknown';
-      elemento('base-indicator-text').textContent = 'Nenhuma Base cadastrada';
-      return null;
-    }
-    indicador.dataset.state = base.online ? 'online' : 'offline';
-    elemento('base-indicator-text').textContent = base.online
-      ? `Base ligada · ${formatClock(base.last_heartbeat)}`
-      : base.last_heartbeat
-        ? `Base sem contato desde ${formatClock(base.last_heartbeat)}`
-        : 'Base nunca se conectou';
-    return base;
-  } catch {
-    indicador.dataset.state = 'offline';
-    elemento('base-indicator-text').textContent = 'Sem conexão';
-    return null;
-  }
-}
-
-/* ----------------------------------------------------------------------
-   Início
-   ---------------------------------------------------------------------- */
-
-async function desenharInicio() {
-  const base = await atualizarIndicadorDaBase();
-
+async function desenharPainel() {
   // Cerca que está valendo e quantas coleiras confirmaram.
   try {
     const cerca = await lerCercaAtiva();
@@ -99,9 +65,7 @@ async function desenharInicio() {
     elemento('confirmed-count').textContent = `${confirmadas} de ${entregas.length}`;
     elemento('confirmed-count').classList.remove('empty-value');
   } catch {
-    elemento('active-fence-note').textContent = base
-      ? 'Nenhuma cerca enviada ainda. Use o Editor de cerca.'
-      : 'Nenhuma cerca enviada ainda';
+    elemento('active-fence-note').textContent = 'Nenhuma cerca enviada ainda. Use o Editor de cerca.';
   }
 
   // Contagem por zona.
@@ -118,27 +82,11 @@ async function desenharInicio() {
     definir('attention-count', emAtencao);
     definir('outside-count', foraDaArea);
   } catch { /* o aviso de conexão já apareceu */ }
-
-  // Últimos acontecimentos.
-  try {
-    const eventos = await lerEventos(12);
-    elemento('events-body').innerHTML = eventos.length
-      ? eventos.map((e) => `
-          <tr>
-            <td class="mono small">${formatClock(e.ts)}</td>
-            <td class="mono">${escapeHtml(e.collar_id)}</td>
-            <td>${escapeHtml(EVENTOS[e.kind] ?? e.kind)}${e.zone ? ': ' : ''}${e.zone ? etiquetaDeZona(e.zone) : ''}</td>
-          </tr>`).join('')
-      : vazio(3, 'Nenhum acontecimento registrado');
-  } catch { /* idem */ }
 }
 
-/* ----------------------------------------------------------------------
-   Histórico
-   ---------------------------------------------------------------------- */
+/* ---- Histórico ---- */
 
 async function desenharHistorico() {
-  await atualizarIndicadorDaBase();
   const corpo = elemento('history-body');
   try {
     const cercas = await lerHistorico();
@@ -188,19 +136,17 @@ async function tratarReativacao(evento) {
   }
 }
 
-/* ----------------------------------------------------------------------
-   Rebanho
-   ---------------------------------------------------------------------- */
+/* ---- Rebanho ---- */
 
 const rebanho = { mapa: null, marcadores: new Map(), cerca: null };
 
 async function desenharRebanho() {
-  await atualizarIndicadorDaBase();
+  await desenharUltimosAcontecimentos();
   let coleiras = [];
   try {
     coleiras = await lerColeiras();
   } catch (erro) {
-    elemento('herd-body').innerHTML = vazio(8, explicarErro(erro));
+    elemento('herd-body').innerHTML = vazio(7, explicarErro(erro));
     return;
   }
 
@@ -250,12 +196,27 @@ function desenharColeirasNoMapa(coleiras) {
   }
 }
 
-/* ----------------------------------------------------------------------
-   Eventos
-   ---------------------------------------------------------------------- */
+/** Últimos acontecimentos, abaixo do mapa do rebanho. */
+async function desenharUltimosAcontecimentos() {
+  const corpo = elemento('events-body');
+  try {
+    const eventos = await lerEventos(12);
+    corpo.innerHTML = eventos.length
+      ? eventos.map((e) => `
+          <tr>
+            <td class="mono small">${formatClock(e.ts)}</td>
+            <td class="mono">${escapeHtml(e.collar_id)}</td>
+            <td>${escapeHtml(EVENTOS[e.kind] ?? e.kind)}${e.zone ? `: ${etiquetaDeZona(e.zone)}` : ''}</td>
+          </tr>`).join('')
+      : vazio(3, 'Nenhum acontecimento registrado');
+  } catch (erro) {
+    corpo.innerHTML = vazio(3, explicarErro(erro));
+  }
+}
+
+/* ---- Eventos ---- */
 
 async function desenharEventos() {
-  await atualizarIndicadorDaBase();
   const filtro = elemento('event-filter')?.value || '';
   const corpo = elemento('timeline-body');
   try {
@@ -286,12 +247,10 @@ async function preencherFiltroDeColeiras() {
   } catch { /* o filtro fica só com "todas" */ }
 }
 
-/* ----------------------------------------------------------------------
-   Início de cada tela
-   ---------------------------------------------------------------------- */
+/* ---- Início de cada tela ---- */
 
 const TELAS = {
-  inicio: { desenhar: desenharInicio },
+  painel: { desenhar: desenharPainel },
   historico: {
     desenhar: desenharHistorico,
     ligar: () => elemento('history-body')?.addEventListener('click', tratarReativacao),
@@ -303,6 +262,9 @@ const TELAS = {
       rebanho.mapa = criarMapa('herd-map', config, 16);
       if (rebanho.mapa) {
         marcarBase(rebanho.mapa, config);
+        // Centraliza no produtor só se ainda não enquadrou as coleiras:
+        // nesta tela, o que importa ver primeiro são os animais.
+        mostrarLocalizacao(rebanho.mapa, () => !rebanho.enquadrou);
         // A cerca que está valendo, para o produtor ver onde o animal está
         // em relação a ela.
         try {
@@ -327,7 +289,7 @@ const TELAS = {
 /**
  * Liga uma das quatro telas de painel.
  *
- * @param {'inicio'|'historico'|'rebanho'|'eventos'} nome
+ * @param {'painel'|'historico'|'rebanho'|'eventos'} nome
  */
 export async function iniciarPainel(nome) {
   const tela = TELAS[nome];
@@ -346,7 +308,6 @@ export async function iniciarPainel(nome) {
     onTelemetry: () => tela.desenhar(),
     onEvent: () => tela.desenhar(),
     onDelivery: () => tela.desenhar(),
-    onBase: () => atualizarIndicadorDaBase(),
     onPollingTick: () => tela.desenhar(),
   });
 }

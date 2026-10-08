@@ -27,7 +27,7 @@ Como o frontend é servido
 Tudo sai da MESMA aplicação FastAPI, na mesma origem — por isso não
 precisamos configurar CORS (seção 3 da especificação).
 
-    /                      -> frontend/index.html         (as páginas têm rota própria)
+    /                      -> redireciona para /editor    (as páginas têm rota própria)
     /css/...  /js/...      -> frontend/css/  frontend/js/
     /vendor/leaflet/...    -> frontend/vendor/leaflet/     (Leaflet 1.9.4 local, sem CDN)
     /static/VFence.png     -> static/                     (logotipo e favicon)
@@ -237,12 +237,25 @@ def create_app(
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     # ---- páginas ------------------------------------------------------
-    # Uma rota por tela, com endereço curto e sem ".html" à vista. As
-    # outras telas entram nas fases F5 (editor) e F6 (demais).
+    # Uma rota por tela, com endereço curto e sem ".html" à vista.
+    #
+    # As telas se dividem em dois modos, escolhidos no cabeçalho:
+    # Produtor (editor e rebanho) e Gestão (painel, histórico e
+    # eventos). O modo é só de navegação, não de permissão: o login
+    # continua sendo um usuário único.
     @app.get("/", include_in_schema=False)
-    async def home() -> FileResponse:
-        """Início (painel) — seção 11.4 da especificação."""
-        return FileResponse(FRONTEND_DIR / "index.html")
+    async def home() -> RedirectResponse:
+        """O produtor entra direto no editor de cerca.
+
+        Redirecionamento, e não o mesmo HTML servido em dois endereços:
+        assim cada tela tem um endereço só, e o menu marca o item certo.
+        """
+        return RedirectResponse(url="/editor", status_code=303)
+
+    @app.get("/painel", include_in_schema=False)
+    async def painel() -> FileResponse:
+        """Situação da propriedade, do modo Gestão (seção 11.4)."""
+        return FileResponse(FRONTEND_DIR / "painel.html")
 
     @app.get("/editor", include_in_schema=False)
     async def editor() -> FileResponse:

@@ -1,7 +1,8 @@
 /* ==========================================================================
    ui.js — o que é comum a todas as telas (seções 11.1 e 11.2):
-   marca o item do menu, consulta GET /api/health de tempo em tempo e
-   acende/apaga a faixa "Sem conexão com o servidor".
+   marca o item do menu, consulta GET /api/health e GET /api/bases de
+   tempo em tempo (indicador da Base no cabeçalho) e acende/apaga a
+   faixa "Sem conexão com o servidor".
 
    Começa pela conexão de propósito: a seção 11.1 trata conexão ruim como
    situação NORMAL, não erro — o Central roda na rede de uma propriedade
@@ -23,9 +24,7 @@ const HEALTH_INTERVAL_MS = 5000;
 /* Tempo máximo de espera por uma resposta. */
 const REQUEST_TIMEOUT_MS = 4000;
 
-/* ----------------------------------------------------------------------
-   Utilidades de texto, reaproveitáveis pelas outras telas
-   ---------------------------------------------------------------------- */
+/* ---- Utilidades de texto, reaproveitáveis pelas outras telas ---- */
 
 /**
  * Neutraliza caracteres de HTML em texto vindo do servidor.
@@ -69,9 +68,7 @@ export function formatClock(isoText, options = {}) {
   return `${datePart} às ${timePart}`;
 }
 
-/* ----------------------------------------------------------------------
-   Faixa de "sem conexão"
-   ---------------------------------------------------------------------- */
+/* ---- Faixa de "sem conexão" ---- */
 
 /** Mostra ou esconde a faixa de conexão perdida (tolera ela não existir). */
 export function setOfflineBanner(offline) {
@@ -79,9 +76,7 @@ export function setOfflineBanner(offline) {
   if (banner) banner.dataset.visible = offline ? 'true' : 'false';
 }
 
-/* ----------------------------------------------------------------------
-   Menu: marca a página atual
-   ---------------------------------------------------------------------- */
+/* ---- Menu: marca a página atual ---- */
 
 /**
  * Marca o item do menu do endereço aberto.
@@ -99,17 +94,16 @@ function markCurrentPage() {
   });
 }
 
-/* ----------------------------------------------------------------------
-   Verificação do servidor
-   ---------------------------------------------------------------------- */
+/* ---- Verificação do servidor ---- */
 
 /**
- * GET /api/health, ou `null` se falhar. Não deixa exceção escapar: para
- * a tela, "não respondeu" é resultado esperado, não acidente.
+ * GET em `/api/health` ou `/api/bases`, ou `null` se falhar. Não deixa
+ * exceção escapar: para a tela, "não respondeu" é resultado esperado.
+ * Não usa o `api.js` porque ele importa este arquivo.
  */
-async function fetchHealth() {
+async function fetchJson(url) {
   try {
-    const response = await fetch('/api/health', {
+    const response = await fetch(url, {
       cache: 'no-store',
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
@@ -127,11 +121,8 @@ function write(elementId, text) {
 }
 
 /**
- * Atualiza o painel "Servidor VFence".
- *
- * O indicador da Base no cabeçalho é cuidado por `paineis.js`, que lê
- * GET /api/bases — aqui só o marcamos como sem conexão quando o próprio
- * servidor não responde.
+ * Atualiza o painel "Servidor VFence" (só existe no painel da
+ * Gestão) e, se o servidor não responde, o indicador da Base.
  */
 function renderHealth(health) {
   const pill = document.getElementById('service-pill');
@@ -159,30 +150,40 @@ function renderHealth(health) {
   write('service-version', health.version ?? '—');
   write('service-time', formatClock(health.time, { withDate: true }));
   write('service-checked', formatClock(new Date().toISOString()));
-
-  if (baseIndicator) {
-    baseIndicator.dataset.state = 'unknown';
-    write('base-indicator-text', 'Base: ainda não configurada');
-  }
   setOfflineBanner(false);
+}
+
+/**
+ * Indicador da Base no cabeçalho: ligada ou não, e o último contato.
+ * Fica aqui, e não em cada tela, porque o cabeçalho é o mesmo em todas
+ * — antes o editor ficava preso em "ainda não configurada".
+ */
+function renderBase(bases) {
+  const indicator = document.getElementById('base-indicator');
+  if (!indicator || !bases) return;
+  const base = bases[0];
+  indicator.dataset.state = base ? (base.online ? 'online' : 'offline') : 'unknown';
+  let text = 'Nenhuma Base cadastrada';
+  if (base?.online) text = `Base ligada · ${formatClock(base.last_heartbeat)}`;
+  else if (base?.last_heartbeat) text = `Base sem contato desde ${formatClock(base.last_heartbeat)}`;
+  else if (base) text = 'Base nunca se conectou';
+  write('base-indicator-text', text);
 }
 
 /** Verifica agora e agenda a próxima verificação. */
 async function monitorService() {
-  renderHealth(await fetchHealth());
+  const health = await fetchJson('/api/health');
+  renderHealth(health);
+  if (health) renderBase(await fetchJson('/api/bases'));
   window.setTimeout(monitorService, HEALTH_INTERVAL_MS);
 }
 
-/* ----------------------------------------------------------------------
-   Início
-   ---------------------------------------------------------------------- */
+/* ---- Início ---- */
 
 markCurrentPage();
 monitorService();
 
-/* ----------------------------------------------------------------------
-   Sair do sistema (fase F8)
-   ---------------------------------------------------------------------- */
+/* ---- Sair do sistema (fase F8) ---- */
 
 /**
  * Liga o botão "Sair" do cabeçalho, se a tela tiver um.

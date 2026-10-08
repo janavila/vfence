@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#f8faf9">
-  <meta name="description" content="VFence — cerca virtual para pecuária. Painel do produtor.">
-  <title>Início — VFence</title>
+  <meta name="description" content="VFence — cerca virtual para pecuária. Situação da propriedade.">
+  <title>Situação da propriedade — VFence</title>
 
   <!-- O mesmo PNG serve de logotipo e de ícone da aba (seção 11.2). -->
   <link rel="icon" href="/static/VFence.png" type="image/png">
@@ -14,28 +14,29 @@
 <body>
 
 <!-- ======================================================================
-     Cabeçalho comum a todas as telas (seção 11.2).
-     Nas próximas fases este bloco se repete nas outras páginas. Mantemos
-     HTML repetido de propósito: a alternativa seria um sistema de
-     templates, que exigiria etapa de compilação — justamente o que a
-     especificação proíbe.
+     Cabeçalho comum a todas as telas (seção 11.2), repetido em cada
+     página. Mantemos HTML repetido de propósito: a alternativa seria um
+     sistema de templates, que exigiria etapa de compilação — justamente
+     o que a especificação proíbe.
+
+     Muda de uma página para outra só o modo marcado (Produtor ou
+     Gestão) e os links da navegação, que são os daquele modo.
      ====================================================================== -->
 <header class="app-header">
+  <div class="brand">
+    <a href="/"><img src="/static/VFence.png" alt="VFence"></a>
+    <strong>VFence — Cercamento Virtual</strong>
+  </div>
   <div class="header-inner">
-    <a class="brand" href="/">
-      <img src="/static/VFence.png" alt="VFence">
-      <strong aria-hidden="true">VFence</strong>
-    </a>
-
+    <div class="mode-switch" role="group" aria-label="Modo de uso">
+      <a href="/editor" title="Desenhar a cerca e acompanhar o rebanho">Produtor</a>
+      <a href="/painel" aria-current="true" title="Situação da propriedade, histórico de cercas e eventos">Gestão</a>
+    </div>
     <nav class="primary-nav" aria-label="Navegação principal">
-      <a href="/" aria-current="page">Início</a>
-      <a href="/editor">Editor de cerca</a>
+      <a href="/painel" aria-current="page">Situação da propriedade</a>
       <a href="/historico">Histórico</a>
-      <a href="/rebanho">Rebanho</a>
       <a href="/eventos">Eventos</a>
     </nav>
-
-    <!-- Situação da Base. O texto é preenchido pelo ui.js. -->
     <span class="base-indicator" id="base-indicator" data-state="unknown" aria-live="polite">
       <i aria-hidden="true"></i>
       <span id="base-indicator-text">Verificando…</span>
@@ -47,11 +48,12 @@
 <main class="workspace">
 
   <div class="page-heading">
-    <p class="eyebrow">Painel</p>
+    <p class="eyebrow">Gestão</p>
     <h1>Situação da propriedade</h1>
     <p class="lead">
       Aqui aparece a cerca que está valendo, quantas coleiras já a confirmaram
-      e o que aconteceu com o rebanho nas últimas horas.
+      e quantos animais pedem atenção. Os últimos acontecimentos ficam na
+      tela Rebanho, do modo Produtor.
     </p>
   </div>
 
@@ -125,46 +127,6 @@
     </div>
   </section>
 
-  <!-- ====================================================================
-       Últimos eventos (seção 11.4). Estrutura pronta; os dados chegam na
-       fase F6, junto com o WebSocket.
-       ==================================================================== -->
-  <section class="panel" style="margin-top: var(--gap);" aria-labelledby="events-title">
-    <div class="panel-heading">
-      <div>
-        <h2 id="events-title">Últimos acontecimentos</h2>
-        <p>O que as coleiras relataram</p>
-      </div>
-    </div>
-    <div class="table-scroll">
-      <table class="data-table">
-        <thead>
-          <tr>
-            <th scope="col">Hora</th>
-            <th scope="col">Coleira</th>
-            <th scope="col">O que aconteceu</th>
-          </tr>
-        </thead>
-        <tbody id="events-body">
-          <tr class="empty-row"><td colspan="3">Nenhum acontecimento registrado</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </section>
-
-  <section class="panel" style="margin-top: var(--gap);">
-    <div class="panel-body">
-      <div class="notice info">
-        <div>
-          <strong>Primeira vez por aqui?</strong>
-          Comece pelo <a href="/editor">Editor de cerca</a>: clique no mapa para
-          marcar os pontos da divisa e envie. O acompanhamento de cada coleira
-          aparece na mesma tela.
-        </div>
-      </div>
-    </div>
-  </section>
-
 </main>
 
 <!-- Aviso de conexão, fora do fluxo da página para não empurrar nada. -->
@@ -177,7 +139,7 @@
 <script type="module" src="/js/ui.js"></script>
 <script type="module">
   import { iniciarPainel } from "/js/paineis.js";
-  iniciarPainel("inicio");
+  iniciarPainel("painel");
 </script>
 </body>
 </html>

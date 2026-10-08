@@ -25,9 +25,7 @@ export const MIN_POINTS = 3;
 export const MAX_POINTS = 32;
 const MIN_POINT_DISTANCE_M = 1.0;
 
-/* ----------------------------------------------------------------------
-   Forma canônica: o arredondamento
-   ---------------------------------------------------------------------- */
+/* ---- Forma canônica: o arredondamento ---- */
 
 /**
  * Grau para microgradus, arredondando meio para LONGE do zero.
@@ -54,9 +52,7 @@ export function canonizar(pontos) {
   }));
 }
 
-/* ----------------------------------------------------------------------
-   Projeção local
-   ---------------------------------------------------------------------- */
+/* ---- Projeção local ---- */
 
 /**
  * Projeção local, espelho de `LocalProjection`:
@@ -104,9 +100,7 @@ export function distanciaHaversine(a, b) {
   return 2 * EARTH_RADIUS_M * Math.asin(Math.min(1, Math.sqrt(interno)));
 }
 
-/* ----------------------------------------------------------------------
-   Área, perímetro e sentido
-   ---------------------------------------------------------------------- */
+/* ---- Área, perímetro e sentido ---- */
 
 /**
  * Área COM SINAL pela fórmula do laço. Negativo = horário.
@@ -153,9 +147,7 @@ export function sentido(plano) {
   return comSinal < 0 ? 'clockwise' : 'counterclockwise';
 }
 
-/* ----------------------------------------------------------------------
-   Lados que se cruzam
-   ---------------------------------------------------------------------- */
+/* ---- Lados que se cruzam ---- */
 
 function produtoVetorial(origem, a, b) {
   return (a.x - origem.x) * (b.y - origem.y) - (a.y - origem.y) * (b.x - origem.x);
@@ -213,9 +205,7 @@ export function ladosQueSeCruzam(plano) {
   return encontrados;
 }
 
-/* ----------------------------------------------------------------------
-   Distância ponto → lado
-   ---------------------------------------------------------------------- */
+/* ---- Distância ponto → lado ---- */
 
 /** Menor distância de um ponto a um SEGMENTO (não à reta infinita). */
 export function distanciaPontoLado(ponto, inicio, fim) {
@@ -263,9 +253,7 @@ export function estaDentro(ponto, plano) {
   return dentro;
 }
 
-/* ----------------------------------------------------------------------
-   As regras VAL
-   ---------------------------------------------------------------------- */
+/* ---- As regras VAL ---- */
 
 const ERRO = 'error';
 const AVISO = 'warning';
@@ -427,9 +415,7 @@ function resultado(violacoes, area, perimetro, orientacao) {
   };
 }
 
-/* ----------------------------------------------------------------------
-   Faixas de atenção e crítica no mapa (seção 11.3, item SHOULD)
-   ---------------------------------------------------------------------- */
+/* ---- Faixas de atenção e crítica no mapa (seção 11.3, item SHOULD) ---- */
 
 /**
  * Contorno deslocado para DENTRO da cerca, a uma distância fixa.

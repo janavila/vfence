@@ -15,17 +15,18 @@
 <body>
 
 <header class="app-header">
+  <div class="brand">
+    <a href="/"><img src="/static/VFence.png" alt="VFence"></a>
+    <strong>VFence — Cercamento Virtual</strong>
+  </div>
   <div class="header-inner">
-    <a class="brand" href="/">
-      <img src="/static/VFence.png" alt="VFence">
-      <strong aria-hidden="true">VFence</strong>
-    </a>
+    <div class="mode-switch" role="group" aria-label="Modo de uso">
+      <a href="/editor" aria-current="true" title="Desenhar a cerca e acompanhar o rebanho">Produtor</a>
+      <a href="/painel" title="Situação da propriedade, histórico de cercas e eventos">Gestão</a>
+    </div>
     <nav class="primary-nav" aria-label="Navegação principal">
-      <a href="/">Início</a>
       <a href="/editor" aria-current="page">Editor de cerca</a>
-      <a href="/historico">Histórico</a>
       <a href="/rebanho">Rebanho</a>
-      <a href="/eventos">Eventos</a>
     </nav>
     <span class="base-indicator" id="base-indicator" data-state="unknown" aria-live="polite">
       <i aria-hidden="true"></i>
@@ -41,18 +42,38 @@
     <p class="eyebrow">Cerca virtual</p>
     <h1>Desenhar a cerca</h1>
     <p class="lead">
-      Clique no mapa para marcar os pontos da cerca, seguindo o sentido dos
-      ponteiros do relógio. O sistema confere os problemas na hora.
+      Marque no mapa os cantos da área onde o rebanho pode ficar. O VFence
+      transforma esse desenho na cerca virtual e a envia para as coleiras.
+    </p>
+
+    <!-- As regras de erro (VAL-01 a VAL-08) em palavras do produtor: sem
+         cumpri-las, a cerca não é aceita. O raio vem do .env (BASE_RAIO_MAX_KM)
+         e é preenchido pelo editor.js. -->
+    <p class="lead"><strong>Para a cerca ser aceita:</strong></p>
+    <ul class="requirements">
+      <li>Ter de 3 a 32 pontos.</li>
+      <li>Pontos marcados no sentido dos ponteiros do relógio.</li>
+      <li>Lados da cerca sem se cruzar.</li>
+      <li>Pontos que não fiquem todos em linha reta.</li>
+      <li>Pelo menos 1 m entre um ponto e o seguinte.</li>
+      <li>Todos os pontos a até <span id="max-radius">5</span> km da Base.</li>
+      <li>Aviso forte mais perto da cerca que o aviso ao animal (passo 2).</li>
+      <li>Um nome para a cerca (passo 3).</li>
+    </ul>
+    <p class="lead">
+      Avisos em amarelo não impedem o envio: basta marcar "Estou ciente" no passo 3.
     </p>
   </div>
 
   <div class="notice info" id="editor-announce" role="status" hidden></div>
 
   <!-- ===================================================================
-       Mapa à esquerda, passos à direita (seção 11.1).
-       Abaixo de 1024 px o painel passa para baixo do mapa.
+       Uma coluna só: o mapa em cima e os passos embaixo, na ordem em que
+       o produtor os faz. (A seção 11.1 previa mapa à esquerda e passos à
+       direita; a coluna única foi escolhida para a tela ficar mais simples
+       de seguir para quem nunca usou o sistema.)
        =================================================================== -->
-  <section class="layout-map-side">
+  <section class="stack">
 
     <article class="panel">
       <div class="panel-heading">
@@ -64,6 +85,50 @@
         </div>
         <span class="mono muted-text" id="cursor-position">—</span>
       </div>
+
+      <!-- Faixa "o que fazer agora". O editor.js mostra uma frase por vez
+           (pelo data-when) e troca a cor; com erro, fica vermelha e avisa
+           que a cerca não pode ser enviada. Os textos moram aqui, e não no
+           JavaScript, para não pesar no orçamento de 100 KB.
+           Logo abaixo dela, os problemas um a um (o passo "Conferir
+           problemas" da seção 11.3), que só aparecem quando existem. -->
+      <div class="notice map-guide info" id="map-guide" aria-live="polite">
+        <div data-when="comecar">
+          <strong>Comece por aqui</strong>
+          Clique no mapa em um dos cantos da área que você quer cercar.
+          Depois, clique nos outros cantos seguindo o sentido dos ponteiros do relógio.
+        </div>
+        <div data-when="continuar" hidden>
+          <strong>Continue marcando os cantos</strong>
+          Clique no próximo canto, sempre no sentido dos ponteiros do relógio.
+          A partir do 3º ponto a cerca se fecha sozinha.
+        </div>
+        <div data-when="erro" hidden>
+          <strong>É preciso corrigir a cerca</strong>
+          Veja logo abaixo o que está errado; os pontos e lados com problema
+          ficam em vermelho no mapa. Sem corrigir, não será possível enviar a cerca.
+        </div>
+        <div data-when="aviso" hidden>
+          <strong>Confira os avisos antes de enviar</strong>
+          A cerca pode ser enviada, mas leia os avisos logo abaixo e marque
+          "Estou ciente" no passo 3, embaixo do mapa.
+        </div>
+        <div data-when="nome" hidden>
+          <strong>Quase pronto</strong>
+          Dê um nome para a cerca no passo 3, embaixo do mapa. Depois é só enviar no passo 4.
+        </div>
+        <div data-when="pronta" hidden>
+          <strong>Cerca pronta para enviar</strong>
+          Confira o resumo no passo 3 e clique em "Enviar a cerca para as coleiras", no passo 4.
+        </div>
+        <div data-when="enviada" hidden>
+          <strong>Cerca enviada</strong>
+          Acompanhe, mais abaixo nesta página, a confirmação de cada coleira.
+        </div>
+      </div>
+
+      <div class="panel-body stack-sm" id="problems" aria-live="polite" hidden></div>
+
       <div class="map-surface" id="editor-map">
         <div class="map-fallback">
           <strong>Carregando o mapa…</strong>
@@ -74,12 +139,16 @@
         <span><i class="legend-dot" style="background: var(--primary)"></i> pontos da cerca</span>
         <span><i class="legend-dash" style="border-color: var(--neutral)"></i> cerca que está valendo</span>
         <span><i class="legend-dash" style="border-color: var(--warning)"></i> alcance do rádio</span>
+        <span><i class="legend-dot" style="background: #2f6db5"></i> você está aqui</span>
+        <span class="muted-text" id="location-note"></span>
         <span class="muted-text" id="band-note"></span>
+        <span class="muted-text" id="server-check"></span>
       </div>
     </article>
 
     <!-- =================================================================
-         Os cinco passos da seção 11.3
+         Os passos da seção 11.3, menos o "Conferir problemas", que virou
+         os avisos acima do mapa
          ================================================================= -->
     <div class="stack" id="editor-steps">
 
@@ -126,20 +195,7 @@
       <!-- Passo 2 -->
       <article class="panel">
         <div class="panel-heading">
-          <div><h2><span class="step-number">2</span> Conferir os problemas</h2></div>
-        </div>
-        <div class="panel-body stack-sm">
-          <div id="problems">
-            <p class="muted-text">Os problemas aparecem aqui conforme você marca os pontos.</p>
-          </div>
-          <p class="muted-text small" id="server-check"></p>
-        </div>
-      </article>
-
-      <!-- Passo 3 -->
-      <article class="panel">
-        <div class="panel-heading">
-          <div><h2><span class="step-number">3</span> Margens de aviso</h2></div>
+          <div><h2><span class="step-number">2</span> Margens de aviso</h2></div>
         </div>
         <div class="panel-body stack-sm">
           <div class="field">
@@ -155,10 +211,10 @@
         </div>
       </article>
 
-      <!-- Passo 4 -->
+      <!-- Passo 3 -->
       <article class="panel">
         <div class="panel-heading">
-          <div><h2><span class="step-number">4</span> Revisar</h2></div>
+          <div><h2><span class="step-number">3</span> Revisar</h2></div>
         </div>
         <div class="panel-body stack-sm">
           <div class="field">
@@ -184,10 +240,10 @@
         </div>
       </article>
 
-      <!-- Passo 5 -->
+      <!-- Passo 4 -->
       <article class="panel">
         <div class="panel-heading">
-          <div><h2><span class="step-number">5</span> Enviar</h2></div>
+          <div><h2><span class="step-number">4</span> Enviar</h2></div>
         </div>
         <div class="panel-body">
           <button class="button primary" type="button" id="send-fence" disabled>

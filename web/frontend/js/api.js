@@ -81,17 +81,11 @@ async function chamar(caminho, { metodo = 'GET', corpo = null, texto = false } =
   return texto ? resposta.text() : resposta.json();
 }
 
-/* ----------------------------------------------------------------------
-   Configuração e situação
-   ---------------------------------------------------------------------- */
+/* ---- Configuração e situação ---- */
 
 export const lerConfiguracao = () => chamar('/api/settings');
-export const lerSaude = () => chamar('/api/health');
-export const lerBases = () => chamar('/api/bases');
 
-/* ----------------------------------------------------------------------
-   Cercas
-   ---------------------------------------------------------------------- */
+/* ---- Cercas ---- */
 
 export const validarNoServidor = (cerca) =>
   chamar('/api/fences/validate', { metodo: 'POST', corpo: cerca });
@@ -101,7 +95,6 @@ export const criarCerca = (cerca) =>
 
 export const lerCercaAtiva = () => chamar('/api/fences/active');
 export const lerHistorico = () => chamar('/api/fences');
-export const lerCerca = (versao) => chamar(`/api/fences/${versao}`);
 export const reativarCerca = (versao) =>
   chamar(`/api/fences/${versao}/reactivate`, { metodo: 'POST' });
 export const lerEntregas = (versao) => chamar(`/api/fences/${versao}/deliveries`);
@@ -110,18 +103,12 @@ export const lerEntregas = (versao) => chamar(`/api/fences/${versao}/deliveries`
 export const enderecoDoLog = (versao) => `/api/fences/${versao}/log`;
 export const enderecoDoGeojson = (versao) => `/api/fences/${versao}/geojson`;
 
-/* ----------------------------------------------------------------------
-   Rebanho e eventos
-   ---------------------------------------------------------------------- */
+/* ---- Rebanho e eventos ---- */
 
 export const lerColeiras = () => chamar('/api/collars');
-export const lerTelemetria = (collarId, limite = 100) =>
-  chamar(`/api/collars/${encodeURIComponent(collarId)}/telemetry?limit=${limite}`);
 export const lerEventos = (limite = 100) => chamar(`/api/events?limit=${limite}`);
 
-/* ----------------------------------------------------------------------
-   Mensagem de erro para o produtor
-   ---------------------------------------------------------------------- */
+/* ---- Mensagem de erro para o produtor ---- */
 
 /**
  * Traduz um erro em frase que diz O QUE FAZER (seção 11.1), em vez de

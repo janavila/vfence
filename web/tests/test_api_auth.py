@@ -229,7 +229,7 @@ def test_criar_cerca_exige_login(client_anonimo, cerca_limpa):
     assert client_anonimo.post("/api/fences", json=cerca_limpa).status_code == 401
 
 
-@pytest.mark.parametrize("pagina", ["/", "/editor", "/historico", "/rebanho", "/eventos"])
+@pytest.mark.parametrize("pagina", ["/", "/editor", "/painel", "/historico", "/rebanho", "/eventos"])
 def test_paginas_redirecionam_para_o_login(client_anonimo, pagina):
     """Página devolve redirecionamento, não 401: é o que o produtor espera
     ao digitar o endereço no navegador."""
@@ -337,7 +337,7 @@ def test_com_auth_enabled_false_o_sistema_fica_aberto(monkeypatch, tmp_path):
 
     with TestClient(app) as aberto:
         assert aberto.get("/api/fences").status_code == 200
-        assert aberto.get("/", follow_redirects=False).status_code == 200
+        assert aberto.get("/editor", follow_redirects=False).status_code == 200
         assert aberto.get("/api/auth/session").json()["authenticated"] is True
 
 

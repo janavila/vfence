@@ -53,15 +53,25 @@ papel por completo.
 
 ## Telas
 
-| Endereço | Tela | O que faz |
-|---|---|---|
-| `/` | Início | cerca valendo, coleiras confirmadas, animais por situação, últimos acontecimentos |
-| `/editor` | Editor de cerca | os cinco passos: marcar, conferir, margens, revisar, enviar |
-| `/historico` | Histórico | versões anteriores, baixar relatório e mapa, usar um desenho de novo |
-| `/rebanho` | Rebanho | mapa com as coleiras coloridas pela situação, e a lista |
-| `/eventos` | Acontecimentos | linha do tempo, com filtro por coleira |
-| `/login` | Entrar | usuário único configurado no `.env` |
-| `/docs` | Documentação da API | gerada pelo FastAPI; permite disparar as rotas pelo navegador |
+O cabeçalho tem dois modos. **Produtor** é onde se entra: o editor de cerca e o
+rebanho. **Gestão** reúne a situação da propriedade, o histórico e os
+eventos. O modo é só de navegação, não de permissão — o login continua sendo um
+usuário único.
+
+| Endereço | Modo | Tela | O que faz |
+|---|---|---|---|
+| `/` | — | — | leva ao `/editor` |
+| `/editor` | Produtor | Editor de cerca | uma coluna: acima do mapa, a faixa do que fazer agora (vermelha quando há erro, e aí o envio fica bloqueado) e os avisos do que precisa ser corrigido; abaixo dele, os passos marcar, margens, revisar e enviar |
+| `/rebanho` | Produtor | Rebanho | uma coluna: o mapa com as coleiras coloridas pela situação e, abaixo dele, a lista e os últimos acontecimentos |
+| `/painel` | Gestão | Situação da propriedade | cerca valendo, coleiras confirmadas, animais por situação, servidor |
+| `/historico` | Gestão | Histórico | versões anteriores, baixar relatório e mapa, usar um desenho de novo |
+| `/eventos` | Gestão | Acontecimentos | linha do tempo, com filtro por coleira |
+| `/login` | — | Entrar | usuário único configurado no `.env` |
+| `/docs` | — | Documentação da API | gerada pelo FastAPI; permite disparar as rotas pelo navegador |
+
+Os mapas abrem na Base e vão até onde o produtor está (ponto azul), se o
+navegador der a localização. **Ele só dá em HTTPS ou em `localhost`**: aberto pelo
+IP da rede local (`http://192.168…`), o navegador recusa, e o mapa fica na Base.
 
 ## Requisitos
 
@@ -170,7 +180,7 @@ Endereços:
 
 | Endereço | O que é |
 |---|---|
-| `http://localhost:8000` | Tela de Início |
+| `http://localhost:8000` | Editor de cerca (a tela de entrada) |
 | `http://localhost:8000/docs` | Documentação automática da API, com botão de testar |
 | `http://localhost:8000/api/health` | Situação do serviço |
 
@@ -322,7 +332,7 @@ web/
 │       └── realtime.py       difusão para os navegadores conectados
 │
 ├── frontend/
-│   ├── index.html · editor.html · historico.html
+│   ├── editor.html · painel.html · historico.html
 │   ├── rebanho.html · eventos.html · login.html
 │   ├── css/style.css     estilo único de todas as telas
 │   ├── js/
@@ -332,7 +342,7 @@ web/
 │   │   ├── map.js        mapa Leaflet e camadas
 │   │   ├── editor.js     os cinco passos do editor
 │   │   ├── realtime.js   WebSocket com reconexão e plano B
-│   │   └── paineis.js    Início, Histórico, Rebanho, Eventos
+│   │   └── paineis.js    Situação, Histórico, Rebanho, Eventos
 │   └── vendor/leaflet/   Leaflet 1.9.4 local, sem CDN
 │
 ├── static/VFence.png     logotipo e ícone da aba
@@ -437,8 +447,9 @@ precisam de decisão do grupo.
 ## Dois pontos de atenção para quem continuar
 
 - **O orçamento de leveza está quase cheio.** A seção 11.1 dá 100 KB para o JS e
-  o CSS próprios; hoje estão em 99,8 KB. Acrescentar código ao frontend vai exigir
-  enxugar outra parte. O comando para conferir:
+  o CSS próprios; hoje estão em 99,4 KB. Acrescentar código ao frontend vai exigir
+  enxugar outra parte (os textos longos de orientação ficam no HTML, que não
+  conta). O comando para conferir:
 
   ```bash
   python -c "import pathlib; css=pathlib.Path('frontend/css/style.css').stat().st_size; \
