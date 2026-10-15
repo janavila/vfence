@@ -69,6 +69,15 @@ Variáveis disponíveis em `.env`:
 | `COLLAR_OFFLINE_SECONDS` | `30` | Limite reservado para estado offline |
 | `MAX_LINE_LENGTH` | `512` | Comprimento máximo de pacote |
 | `MOCK_INTERVAL_SECONDS` | `3` | Intervalo do gerador mock |
+| `CENTRAL_SYNC_ENABLED` | `false` | Ativa o cliente do servidor Central |
+| `CENTRAL_BASE_URL` | `http://127.0.0.1:8001` | URL do Central, sem barra final |
+| `BASE_ID` | `BASE01` | Identificação enviada nas rotas `/api/edge/*` |
+| `BASE_TOKEN` | — | Bearer token da Base; deve coincidir com o Central |
+| `CENTRAL_TIMEOUT_SECONDS` | `10` | Timeout HTTP |
+| `CENTRAL_SYNC_INTERVAL_SECONDS` | `5` | Intervalo normal de heartbeat/sync |
+| `CENTRAL_RETRY_SECONDS` | `5` | Espera após indisponibilidade |
+| `CENTRAL_BATCH_SIZE` | `100` | Máximo de itens por lote da outbox |
+| `COLLAR_IDS` | `COL01,COL02` | Coleiras que recebem uma cerca nova |
 
 ## Execução
 
@@ -156,6 +165,8 @@ O schema é inicializado automaticamente. Eventos de zona são registrados somen
 | `GET` | `/api/collars/{collar_id}/telemetry` | Histórico por coleira |
 | `GET` | `/api/events` | Histórico de eventos |
 | `WS` | `/ws` | Atualizações em tempo real |
+| `GET` | `/api/central` | Estado da sincronização e tamanho da outbox |
+| `GET` | `/api/fence-state` | Versões desejada/baixada/pendente/enviada/confirmada |
 
 Parâmetro `limit`: mínimo `1`, máximo `1000`, padrão `100`.
 
@@ -208,8 +219,22 @@ sudo systemctl status vfence
 
 ## Limites da versão 1.0
 
-- Sem transmissão de comandos para coleiras
 - Sem autenticação
 - Sem mapa offline
 - Um gateway por instância
 - Estado offline de coleiras ainda não aplicado automaticamente
+
+## Integração Central e gateway
+
+Quando `CENTRAL_SYNC_ENABLED=true`, uma task independente:
+
+1. envia `POST /api/edge/heartbeat`;
+2. baixa `GET /api/edge/fences/{version}` quando necessário;
+3. valida o CRC canônico E6 do Central;
+4. persiste a cerca como pendente;
+5. envia `PARAM`, `FENCE_NEW`, `FENCE_POINT` e `FENCE_SEND` pela mesma conexão Serial usada na leitura;
+6. aguarda a linha de sucesso/falha produzida pelo firmware real;
+7. envia telemetria, eventos e estados de entrega por `POST /api/edge/batch`.
+
+A outbox fica no SQLite e só remove itens confirmados por `acked_up_to`. Consulte
+`docs/INTEGRACAO_RASPBERRY_CENTRAL_GATEWAY.md` para o contrato, limites e testes.

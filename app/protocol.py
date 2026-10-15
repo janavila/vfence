@@ -37,6 +37,8 @@ class ParsedPacket:
     rssi: float | None = None
     snr: float | None = None
     sequence: int | None = None
+    battery_pct: int | None = None
+    fence_version: int | None = None
 
     def as_dict(self) -> dict:
         data = {name: getattr(self, name) for name in self.__dataclass_fields__}

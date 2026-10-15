@@ -1,5 +1,5 @@
 const collarsNode=document.querySelector('#collars'),eventsNode=document.querySelector('#events');
-let collars=[],events=[],map=null;
+let collars=[],events=[],map=null,fence=null,fenceLayer=null,fenceVertices=null;
 const zoneColors={SEGURO:'#35745c',ATENCAO:'#946e22',CRITICO:'#a0643f',FORA:'#a34f4f',GNSS_INVALIDO:'#69736f'};
 const zoneLabels={SEGURO:'NORMAL',ATENCAO:'ATENÇÃO',CRITICO:'CRÍTICO',FORA:'FORA DA ÁREA',GNSS_INVALIDO:'GNSS INVÁLIDO'};
 const markers=new Map();
@@ -14,6 +14,26 @@ function renderGateway(gateway){
   status.className=`status-pill ${online?'online':'offline'}`;
   document.querySelector('#serial-port').textContent=gateway.serial_port||'—';
   document.querySelector('#last-message').textContent=gateway.last_message||'Sem dados';
+}
+
+function renderCentral(central){
+  const status=document.querySelector('#central-status');
+  const online=central.enabled&&central.status==='online';
+  status.textContent=!central.enabled?'Desativado':online?'Online':'Offline';
+  status.className=online?'online':central.enabled?'offline':'';
+}
+
+function renderFence(data){
+  fence=data||null;
+  const desired=fence?.desired_version;
+  const local=fence?.downloaded_version;
+  const labels={not_available:'Sem cerca',downloaded:'Baixada',pending:'Pendente',synchronized:'Sincronizada'};
+  document.querySelector('#fence-desired').textContent=desired==null?'—':`v${desired}`;
+  document.querySelector('#fence-local').textContent=local==null?'—':`v${local}`;
+  document.querySelector('#fence-status').textContent=labels[fence?.status]||'Sem cerca';
+  document.querySelector('#fence-points').textContent=String(fence?.point_count||0);
+  document.querySelector('#map-state').textContent=local==null?'Sem cerca local':`Cerca v${local}`;
+  drawFence();
 }
 
 function renderCollars(){
@@ -58,6 +78,33 @@ function initMap(){
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OpenStreetMap'}).addTo(map);
 }
 
+function operationalBounds(){
+  const positions=collars.filter(collar=>collar.latitude!=null&&collar.longitude!=null)
+    .map(collar=>[collar.latitude,collar.longitude]);
+  (fence?.points||[]).forEach(point=>positions.push([point.latitude,point.longitude]));
+  return positions;
+}
+
+function fitOperationalBounds(){
+  if(!map)return;
+  const positions=operationalBounds();
+  if(positions.length)map.fitBounds(positions,{padding:[34,34],maxZoom:17});
+}
+
+function drawFence(){
+  if(!map)return;
+  if(fenceLayer){fenceLayer.remove();fenceLayer=null;}
+  if(fenceVertices){fenceVertices.remove();fenceVertices=null;}
+  const points=(fence?.points||[]).map(point=>[point.latitude,point.longitude]);
+  if(points.length<3){fitOperationalBounds();return;}
+  fenceLayer=L.polygon(points,{color:'#245c4f',weight:2,opacity:.9,fillColor:'#35745c',fillOpacity:.12})
+    .addTo(map).bindTooltip(`Cerca v${fence.downloaded_version}`,{sticky:true});
+  fenceVertices=L.layerGroup(points.map((position,index)=>L.circleMarker(position,{
+    radius:3,weight:1.5,color:'#245c4f',fillColor:'#fff',fillOpacity:1,
+  }).bindTooltip(`V${index+1}`,{direction:'top'}))).addTo(map);
+  fitOperationalBounds();
+}
+
 function renderMap(){
   if(!map)return;
   const located=collars.filter(collar=>collar.latitude!=null&&collar.longitude!=null);
@@ -70,17 +117,20 @@ function renderMap(){
       markers.set(collar.collar_id,marker);
     }else{marker.setLatLng(position);marker.setStyle({color});}
   });
-  if(located.length)map.fitBounds(located.map(collar=>[collar.latitude,collar.longitude]),{padding:[34,34],maxZoom:16});
+  fitOperationalBounds();
 }
 
 async function load(){
   try{
-    const[gateway,collarList,eventList]=await Promise.all([
+    const[gateway,central,fenceState,collarList,eventList]=await Promise.all([
       fetch('/api/gateway').then(response=>response.json()),
+      fetch('/api/central').then(response=>response.json()),
+      fetch('/api/fence-state').then(response=>response.json()),
       fetch('/api/collars').then(response=>response.json()),
       fetch('/api/events?limit=30').then(response=>response.json()),
     ]);
-    renderGateway(gateway);collars=collarList;events=eventList;renderCollars();renderEvents();
+    renderGateway(gateway);renderCentral(central);renderFence(fenceState);
+    collars=collarList;events=eventList;renderCollars();renderEvents();
   }catch{document.querySelector('#connection').textContent='LINK API INDISPONÍVEL';}
 }
 
@@ -92,6 +142,8 @@ function connect(){
   socket.onmessage=({data})=>{
     const message=JSON.parse(data);
     if(message.type==='gateway')renderGateway(message.data);
+    if(message.type==='central')renderCentral(message.data);
+    if(message.type==='fence')renderFence(message.data);
     if(message.type==='telemetry'){
       const index=collars.findIndex(collar=>collar.collar_id===message.collar.collar_id);
       if(index<0)collars.push(message.collar);else collars[index]=message.collar;

@@ -61,6 +61,14 @@ body { margin: 0; min-width: 320px; background: var(--page); color: var(--text);
 .system-line span { color: var(--muted); font-size: 12px; }
 .system-line strong { min-width: 0; color: #46514c; font-size: 11px; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+.fence-line { min-height: 58px; margin-top: 10px; padding: 0 18px; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); align-items: center; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; }
+.fence-line > div { min-width: 0; display: flex; flex-direction: column; gap: 5px; padding: 0 14px; border-left: 1px solid var(--border); }
+.fence-line > div:first-child { padding-left: 0; border-left: 0; }
+.fence-line span { color: var(--muted); font-size: 11px; }
+.fence-line strong { color: #46514c; font-size: 12px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fence-line strong.online { color: var(--success); }
+.fence-line strong.offline { color: var(--danger); }
+
 .monitor-grid { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(390px, 1fr); gap: 14px; margin-top: 14px; }
 .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 1px 3px rgba(24, 32, 29, .025); overflow: hidden; }
 .panel-heading { min-height: 72px; padding: 17px 20px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); }
@@ -98,11 +106,13 @@ body { margin: 0; min-width: 320px; background: var(--page); color: var(--text);
 .leaflet-bar a { color: var(--text) !important; border-color: var(--border) !important; }
 .leaflet-tooltip { border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 2px 8px rgba(24, 32, 29, .08); font-family: var(--mono); font-size: 11px; }
 .leaflet-control-attribution { font-size: 9px !important; }
+.fence-vertex { stroke: var(--primary); fill: #fff; }
 
 @media (max-width: 960px) {
   .metrics-grid { grid-template-columns: repeat(2, 1fr); }
   .monitor-grid { grid-template-columns: 1fr; }
   .events-table-wrap { height: 280px; }
+  .fence-line { grid-template-columns: repeat(3, 1fr); gap: 14px 0; padding-top: 13px; padding-bottom: 13px; }
 }
 
 @media (max-width: 620px) {
@@ -114,6 +124,8 @@ body { margin: 0; min-width: 320px; background: var(--page); color: var(--text);
   .metrics-grid { grid-template-columns: 1fr; gap: 10px; }
   .metric-card { min-height: 112px; padding: 18px; }
   .system-line { grid-template-columns: 1fr; gap: 9px; padding: 13px 16px; }
+  .fence-line { grid-template-columns: repeat(2, 1fr); }
+  .fence-line > div { padding: 0 10px; }
   .brand > div > span { display: none; }
   .primary-nav { margin-left: auto; }
   .primary-nav a { padding: 0 8px; font-size: 12px; }

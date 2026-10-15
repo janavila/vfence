@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#f4f5f6">
   <title>VFence Monitor v1.0</title>
   <link rel="stylesheet" href="/static/css/style.css?v=6">
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
+  <link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css">
 </head>
 <body>
   <header class="app-header">
@@ -35,9 +35,17 @@
       <div><span>Último pacote</span><strong id="last-message" class="mono">Sem dados</strong></div>
     </section>
 
+    <section class="fence-line" aria-label="Sincronização da cerca">
+      <div><span>Central</span><strong id="central-status">Desativado</strong></div>
+      <div><span>Cerca desejada</span><strong id="fence-desired" class="mono">—</strong></div>
+      <div><span>Cerca local</span><strong id="fence-local" class="mono">—</strong></div>
+      <div><span>Estado</span><strong id="fence-status">Sem cerca</strong></div>
+      <div><span>Vértices</span><strong id="fence-points" class="mono">0</strong></div>
+    </section>
+
     <section class="monitor-grid">
       <article class="panel map-panel">
-        <div class="panel-heading"><div><h3>Posicionamento</h3><p>Última localização recebida por unidade</p></div><span id="map-state">Base online</span></div>
+        <div class="panel-heading"><div><h3>Posicionamento</h3><p>Cerca local e última localização recebida por unidade</p></div><span id="map-state">Sem cerca local</span></div>
         <div id="map"><div class="map-fallback"><strong>Mapa indisponível</strong><span>Coordenadas disponíveis na tabela</span></div></div>
       </article>
       <article class="panel events-panel">
@@ -52,7 +60,7 @@
     </section>
   </main>
 
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
-  <script src="/static/js/app.js?v=4"></script>
+  <script src="/static/vendor/leaflet/leaflet.js"></script>
+  <script src="/static/js/app.js?v=5"></script>
 </body>
 </html>

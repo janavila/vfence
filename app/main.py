@@ -13,6 +13,7 @@ from app.config import settings
 from app.database import Database
 from app.realtime import RealtimeHub
 from app.serial_reader import SerialReader
+from app.sync_service import CentralSyncService
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,6 +26,7 @@ BASE_DIR = Path(__file__).resolve().parent
 database = Database(settings.database_url)
 hub = RealtimeHub()
 reader = SerialReader(settings, database, hub)
+sync_service = CentralSyncService(settings, database, reader, hub)
 
 
 @asynccontextmanager
@@ -32,12 +34,19 @@ async def lifespan(_: FastAPI):
     database.initialize()
     logger.info("service started")
     task = asyncio.create_task(reader.run(), name="vfence-serial-reader")
+    sync_task = asyncio.create_task(sync_service.run(), name="vfence-central-sync")
     yield
     logger.info("service stopping")
     await reader.stop()
+    await sync_service.stop()
     task.cancel()
+    sync_task.cancel()
     try:
         await task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await sync_task
     except asyncio.CancelledError:
         pass
 
@@ -70,6 +79,16 @@ async def gateway():
     return reader.as_dict()
 
 
+@app.get("/api/central")
+async def central():
+    return await asyncio.to_thread(sync_service.as_dict)
+
+
+@app.get("/api/fence-state")
+async def fence_state():
+    return await asyncio.to_thread(database.fence_snapshot)
+
+
 @app.get("/api/collars")
 async def collars():
     return await asyncio.to_thread(database.list_collars)
@@ -100,6 +119,10 @@ async def websocket_endpoint(websocket: WebSocket):
     await hub.connect(websocket)
     try:
         await websocket.send_json({"type": "gateway", "data": reader.as_dict()})
+        await websocket.send_json({
+            "type": "fence",
+            "data": await asyncio.to_thread(database.fence_snapshot),
+        })
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
