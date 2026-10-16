@@ -142,34 +142,38 @@ def process_batch(
     estado de uma entrega depende da sequência.
     """
     messages: list[tuple[str, dict]] = []
-    active = fence_service.active_version(db)
     stored = 0
     skipped = 0
 
-    for item in sorted(items, key=lambda entry: entry.get("edge_seq", 0)):
-        edge_seq = item["edge_seq"]
-        item_type = item["type"]
-        data = item.get("data") or {}
+    # Uma única transação cobre a reivindicação de edge_seq e a gravação dos
+    # dados correspondentes. Se qualquer operação inesperada falhar, nenhum
+    # item fica marcado como recebido sem ter seu conteúdo persistido.
+    with db.connect():
+        active = fence_service.active_version(db)
+        for item in sorted(items, key=lambda entry: entry.get("edge_seq", 0)):
+            edge_seq = item["edge_seq"]
+            item_type = item["type"]
+            data = item.get("data") or {}
 
-        if not _claim(db, base_id, edge_seq, item_type):
-            skipped += 1
-            continue
-        stored += 1
+            if not _claim(db, base_id, edge_seq, item_type):
+                skipped += 1
+                continue
+            stored += 1
 
-        if item_type == "telemetry":
-            message = _store_telemetry(db, base_id, edge_seq, data)
-            if message:
-                messages.append(("telemetry", message))
-        elif item_type == "event":
-            message = _store_event(db, base_id, edge_seq, data)
-            if message:
-                messages.append(("event", message))
-        elif item_type == "delivery":
-            message = _apply_delivery(db, base_id, data, active)
-            if message:
-                messages.append(("delivery", message))
+            if item_type == "telemetry":
+                message = _store_telemetry(db, base_id, edge_seq, data)
+                if message:
+                    messages.append(("telemetry", message))
+            elif item_type == "event":
+                message = _store_event(db, base_id, edge_seq, data)
+                if message:
+                    messages.append(("event", message))
+            elif item_type == "delivery":
+                message = _apply_delivery(db, base_id, data, active)
+                if message:
+                    messages.append(("delivery", message))
 
-    acked = acked_up_to(db, base_id)
+        acked = acked_up_to(db, base_id)
     logger.info(
         "base=%s batch received (%d stored, %d already known, acked_up_to=%d)",
         base_id, stored, skipped, acked,
@@ -180,15 +184,15 @@ def process_batch(
 def _claim(db: Database, base_id: str, edge_seq: int, item_type: str) -> bool:
     """Registra o item como recebido. Devolve `False` se já era conhecido.
 
-    É aqui que a idempotência acontece: `INSERT OR IGNORE` na chave
+    É aqui que a idempotência acontece: `ON CONFLICT DO NOTHING` na chave
     `(base_id, edge_seq)`. O `rowcount` diz se a linha foi inserida
     agora (item novo) ou ignorada (reenvio).
     """
     with db.connect() as conn:
         cursor = conn.execute(
             """
-            INSERT OR IGNORE INTO edge_items (base_id, edge_seq, type, received_at)
-            VALUES (?,?,?,?)
+            INSERT INTO edge_items (base_id, edge_seq, type, received_at)
+            VALUES (?,?,?,?) ON CONFLICT(base_id, edge_seq) DO NOTHING
             """,
             (base_id, edge_seq, item_type, utc_now_iso()),
         )
@@ -255,7 +259,8 @@ def _ensure_collar(conn, collar_id: str, base_id: str) -> None:
     só porque ninguém lembrou de acrescentá-la ao `COLARES_CONHECIDOS`.
     """
     conn.execute(
-        "INSERT OR IGNORE INTO collars (collar_id, base_id) VALUES (?,?)",
+        """INSERT INTO collars (collar_id, base_id) VALUES (?,?)
+           ON CONFLICT(collar_id) DO NOTHING""",
         (collar_id, base_id),
     )
 
@@ -361,10 +366,11 @@ def _store_event(db: Database, base_id: str, edge_seq: int, data: dict) -> dict 
             """
             INSERT INTO events (base_id, edge_seq, collar_id, kind, zone, detail, ts)
             VALUES (?,?,?,?,?,?,?)
+            RETURNING id
             """,
             (base_id, edge_seq, collar_id, kind, zone, data.get("detail"), ts),
         )
-        event_id = cursor.lastrowid
+        event_id = cursor.fetchone()["id"]
 
     logger.info("base=%s collar=%s event %s zone=%s", base_id, collar_id, kind, zone)
     return {

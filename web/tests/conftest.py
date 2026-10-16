@@ -59,6 +59,9 @@ def settings(monkeypatch: pytest.MonkeyPatch, data_dir: Path) -> Settings:
     `.env` de quem está rodando não entre na conta.
     """
     monkeypatch.setenv("DATA_DIR", str(data_dir))
+    # A suíte rápida nunca deve tocar num PostgreSQL informado no ambiente de
+    # quem a executa. Integração real usa TEST_DATABASE_URL em arquivo próprio.
+    monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.setenv("LOG_LEVEL", "WARNING")  # testes sem log de INFO
     monkeypatch.setenv("BASE_ID", TEST_BASE_ID)
     monkeypatch.setenv("BASE_TOKEN", TEST_BASE_TOKEN)
@@ -127,7 +130,7 @@ def database(client, settings: Settings) -> Database:
     Depende de `client` para garantir que o `lifespan` já rodou. Serve
     aos testes que conferem o banco sem passar pela API.
     """
-    return Database(settings.db_path)
+    return Database(settings.database_target)
 
 
 @pytest.fixture

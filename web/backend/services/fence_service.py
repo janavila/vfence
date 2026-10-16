@@ -164,17 +164,6 @@ def validate(
 # ---------------------------------------------------------------------------
 
 
-def _next_version(conn) -> int:
-    """Próximo número de versão: sempre maior que qualquer já usado.
-
-    Baseado no MAIOR já existente, não na contagem de linhas. Com a
-    contagem, apagar uma cerca faria o próximo número repetir um já
-    usado — e um CRC antigo passaria a valer para uma cerca diferente.
-    """
-    row = conn.execute("SELECT COALESCE(MAX(version), 0) AS maximum FROM fences").fetchone()
-    return int(row["maximum"]) + 1
-
-
 def create_fence(
     db: Database,
     settings: Settings,
@@ -204,7 +193,11 @@ def create_fence(
     warnings = [v.as_dict() for v in result.warnings]
 
     with db.connect() as conn:
-        version = _next_version(conn)
+        # No PostgreSQL, esta chamada adquire pg_advisory_xact_lock antes
+        # de consultar MAX(version). Duas instâncias serverless não conseguem
+        # reservar a mesma versão. No SQLite, a trava local do Database
+        # serializa a transação.
+        version = db.next_fence_version(conn)
         blob = canonical_bytes(version, attention_cm, critical_cm, points_e6)
         crc32 = crc32_hex(blob)
 
@@ -217,6 +210,7 @@ def create_fence(
             INSERT INTO fences (version, name, status, margin_attention_cm, margin_critical_cm,
                                 area_m2, perimeter_m, crc32, warnings_json, reactivated_from, created_at)
             VALUES (?,?,'active',?,?,?,?,?,?,?,?)
+            RETURNING id
             """,
             (
                 version, name.strip(), attention_cm, critical_cm,
@@ -224,7 +218,7 @@ def create_fence(
                 json.dumps(warnings, ensure_ascii=False), reactivated_from, created_at,
             ),
         )
-        fence_id = cursor.lastrowid
+        fence_id = cursor.fetchone()["id"]
         conn.executemany(
             "INSERT INTO fence_points (fence_id, seq, lat_e6, lon_e6) VALUES (?,?,?,?)",
             [

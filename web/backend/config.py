@@ -141,6 +141,7 @@ class Settings:
     app_port: int
     log_level: str
     data_dir: Path
+    database_url: str | None
 
     # Base de desenvolvimento
     base_id: str
@@ -172,6 +173,18 @@ class Settings:
     def db_path(self) -> Path:
         """Arquivo do banco SQLite."""
         return self.data_dir / "vfence.db"
+
+    @property
+    def uses_postgresql(self) -> bool:
+        return bool(
+            self.database_url
+            and self.database_url.startswith(("postgresql://", "postgres://"))
+        )
+
+    @property
+    def database_target(self) -> Path | str:
+        """URL PostgreSQL em produção ou arquivo SQLite no desenvolvimento."""
+        return self.database_url or self.db_path
 
     @property
     def log_dir(self) -> Path:
@@ -217,6 +230,7 @@ def load_settings(env_file: Path | None = DEFAULT_ENV_FILE) -> Settings:
         app_port=_integer("APP_PORT", 8000),
         log_level=_text("LOG_LEVEL", "INFO").upper(),
         data_dir=data_dir,
+        database_url=_database_url(),
         base_id=_text("BASE_ID", "BASE01").upper(),
         base_token=_text("BASE_TOKEN", "troque-este-token"),
         base_lat=_decimal("BASE_LAT", -31.306200),
@@ -236,6 +250,19 @@ def load_settings(env_file: Path | None = DEFAULT_ENV_FILE) -> Settings:
     )
     _check(settings)
     return settings
+
+
+def _database_url() -> str | None:
+    """Lê DATABASE_URL sem jamais incluir seu conteúdo em mensagens de erro."""
+    value = os.getenv("DATABASE_URL")
+    if value is None or not value.strip():
+        return None
+    value = value.strip()
+    if not value.startswith(("postgresql://", "postgres://", "sqlite:///")):
+        raise ConfigError(
+            "DATABASE_URL deve começar com postgresql://, postgres:// ou sqlite:///"
+        )
+    return value
 
 
 def _check(settings: Settings) -> None:

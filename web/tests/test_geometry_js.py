@@ -51,7 +51,7 @@ def resultado_js() -> dict:
     """Roda o espelho JavaScript uma vez e devolve o resultado."""
     processo = subprocess.run(
         [node, str(PASTA / "espelho_geometry.mjs")],
-        capture_output=True, text=True, timeout=60,
+        capture_output=True, text=True, encoding="utf-8", timeout=60,
     )
     assert processo.returncode == 0, processo.stderr
     return json.loads(processo.stdout)

@@ -101,7 +101,7 @@ def create_app(
     if settings is None:
         settings = load_settings(env_file=env_file)
 
-    database = Database(settings.db_path)
+    database = Database(settings.database_target)
     hub = RealtimeHub()
 
     @asynccontextmanager
@@ -124,15 +124,19 @@ def create_app(
         saem antes desta configuração e usam o formato padrão dele. Da
         terceira linha em diante tudo segue o formato da seção 10.
 
-        As operações de banco vão em `asyncio.to_thread` porque o
-        `sqlite3` é bloqueante: rodá-lo direto aqui travaria o laço de
-        eventos do servidor durante a criação das tabelas.
+        As operações de banco vão em `asyncio.to_thread` porque os drivers
+        síncronos SQLite e PostgreSQL são bloqueantes: executá-los direto aqui
+        travaria o laço de eventos durante a criação das tabelas.
         """
-        setup_logging(settings.log_level, settings.log_file if log_to_file else None)
+        # No PostgreSQL/Vercel, nenhum arquivo de runtime é criado dentro do
+        # deployment. Os logs ficam no stdout e são coletados pela plataforma.
+        file_log = settings.log_file if log_to_file and not settings.uses_postgresql else None
+        setup_logging(settings.log_level, file_log)
         await asyncio.to_thread(database.initialize)
         await asyncio.to_thread(database.seed_from_settings, settings)
         logger.info(
-            "central started (version=%s, data_dir=%s)", __version__, settings.data_dir
+            "central started (version=%s, database=%s)",
+            __version__, database.backend,
         )
         yield
         logger.info("central stopping")

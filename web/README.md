@@ -12,9 +12,9 @@ Projeto Integrador V — Engenharia de Computação, UNIPAMPA, 2026/2.
 
 ```text
 Produtor (navegador)
-      │  HTTP + WebSocket — rede local
+      │  HTTPS + WebSocket — internet
       ▼
-Central  ← esta pasta (vfence/web)
+Central no Vercel  ← esta pasta (vfence/web) + PostgreSQL persistente
       ▲
       │  a Base sempre inicia a conexão (heartbeat)
 Base = VFence Monitor (vfence/app) no Raspberry Pi
@@ -129,6 +129,13 @@ especificação, sem alteração.
 | `APP_PORT` | `8000` | Porta HTTP |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING` ou `ERROR` |
 | `DATA_DIR` | `./data` | Onde ficam o banco e os logs. Fora do Git |
+| `DATABASE_URL` | vazio | Vazio usa SQLite local; `postgresql://...` usa PostgreSQL persistente |
+
+Em desenvolvimento, o Central continua usando SQLite. Em produção serverless no
+Vercel, configure `DATABASE_URL` com um PostgreSQL externo persistente; não use
+SQLite em `/tmp` como banco de produção. A configuração completa, incluindo
+Neon/Supabase, schema, testes e validação Vercel → Raspberry, está em
+[`docs/POSTGRESQL_VERCEL.md`](docs/POSTGRESQL_VERCEL.md).
 
 ### Base e coleiras
 
@@ -200,8 +207,9 @@ source .venv/bin/activate
 pytest
 ```
 
-São 352 testes, em cerca de 7 segundos. Eles usam banco em pasta temporária e
-**não** tocam em `data/vfence.db` nem no `.env` de quem está rodando.
+A suíte rápida usa banco SQLite em pasta temporária e **não** toca em
+`data/vfence.db`, no `.env` nem em `DATABASE_URL` de quem está rodando. Os testes
+PostgreSQL reais são opcionais e exigem `TEST_DATABASE_URL`; veja o guia acima.
 
 | Arquivo | O que cobre |
 |---|---|
@@ -309,8 +317,9 @@ web/
 │   ├── logging_setup.py  formato de log da seção 10
 │   ├── security.py       hash de token e de senha, cookie de sessão
 │   ├── errors.py         corpo de erro no formato da seção 6
-│   ├── db.py             SQLite: conexão, tabelas, cadastro inicial
-│   ├── schema.sql        as nove tabelas da seção 7
+│   ├── db.py             camada comum para SQLite e PostgreSQL
+│   ├── schema.sql        schema SQLite para desenvolvimento local
+│   ├── schema_postgresql.sql schema PostgreSQL para produção
 │   ├── routers/
 │   │   ├── health.py     GET /api/health
 │   │   ├── auth.py       login, logout, sessão
@@ -381,8 +390,9 @@ que a tela usa; nenhum segredo, com teste garantindo.
 
 ## Logs
 
-Formato da seção 10 da especificação, em **UTC**, no console e em
-`data/logs/central.log`:
+Formato da seção 10 da especificação, em **UTC**. Com SQLite local, sai no
+console e em `data/logs/central.log`; com PostgreSQL/Vercel, sai somente no
+stdout coletado pela plataforma:
 
 ```text
 2026-10-06 13:02:05 [INFO] db: database ready (/.../data/vfence.db)

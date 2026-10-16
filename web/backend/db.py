@@ -1,46 +1,21 @@
-"""Acesso ao banco SQLite do Central.
+"""Camada de persistência do VFence Central.
 
-O que faz
----------
-Três coisas: abre conexões com o SQLite, cria as tabelas a partir do
-`schema.sql` e faz o cadastro inicial da Base e das coleiras conhecidas
-a partir do `.env`.
+O Central usa SQLite em desenvolvimento e PostgreSQL quando ``DATABASE_URL``
+aponta para ``postgresql://`` ou ``postgres://``. Serviços e routers continuam
+usando o mesmo subconjunto DB-API: ``execute()``, ``executemany()``,
+``fetchone()``, ``fetchall()`` e ``rowcount``.
 
-Por que SQLite "na mão", sem ORM
---------------------------------
-É o padrão que o VFence Monitor já usa (`app/database.py`), e a
-especificação pede continuidade. Para o tamanho deste projeto um ORM
-seria mais coisa para aprender e manter do que ajuda: as consultas aqui
-são simples e o SQL fica visível, o que é bom para o relatório.
+As diferenças de dialeto ficam concentradas neste módulo:
 
-O padrão herdado do Monitor, e o porquê de cada peça
-----------------------------------------------------
-- **`@contextmanager connect()`**: garante `commit` no sucesso,
-  `rollback` no erro e `close` sempre. Ninguém precisa lembrar disso em
-  cada consulta.
-- **`threading.RLock`**: o FastAPI roda as consultas em threads
-  separadas (via `asyncio.to_thread`). O SQLite aceita leituras
-  simultâneas, mas uma escrita concorrente pode devolver "database is
-  locked". A trava serializa as operações do nosso processo. É `RLock`
-  (reentrante) e não `Lock` porque um método que já segura a trava pode
-  chamar outro que também a pede, e com `Lock` isso travaria para sempre.
-- **`row_factory = sqlite3.Row`**: as linhas viram objetos acessíveis
-  por nome de coluna, e `dict(row)` entrega um dicionário que o FastAPI
-  serializa direto em JSON.
-- **`PRAGMA foreign_keys = ON`**: o SQLite ignora chaves estrangeiras
-  por padrão. Sem este pragma, `fence_points.fence_id` apontando para
-  uma cerca inexistente passaria sem reclamar.
+* SQLite usa placeholders ``?``; PostgreSQL usa ``%s``;
+* cada backend possui seu schema idempotente;
+* SQLite recebe PRAGMAs; PostgreSQL não;
+* a geração da versão da cerca usa trava transacional do PostgreSQL.
 
-Uma diferença em relação ao Monitor: aqui também ligamos
-`PRAGMA journal_mode = WAL`, que permite ler enquanto se escreve. O
-Central tem um WebSocket lendo o tempo todo enquanto a Base envia
-lotes, e o WAL evita bloqueio mútuo nesse cenário.
-
-Onde se conecta
----------------
-`main.py` cria um `Database` por aplicação e o guarda em `app.state.db`.
-As rotas das fases seguintes recebem esse objeto e chamam seus métodos
-sempre dentro de `asyncio.to_thread`, para não travar o servidor.
+Uma conexão é aberta por operação. Isso funciona em processos locais e em
+instâncias serverless que podem nascer e morrer a qualquer momento. Em Neon ou
+Supabase deve ser usada, preferencialmente, a URL de conexão com pool fornecida
+pelo provedor.
 """
 
 from __future__ import annotations
@@ -48,90 +23,183 @@ from __future__ import annotations
 import logging
 import sqlite3
 import threading
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
+from typing import Any
 
 from backend.config import Settings
 from backend.security import hash_token
 
 logger = logging.getLogger("db")
 
-SCHEMA_FILE = Path(__file__).resolve().parent / "schema.sql"
+BACKEND_DIR = Path(__file__).resolve().parent
+SQLITE_SCHEMA_FILE = BACKEND_DIR / "schema.sql"
+POSTGRESQL_SCHEMA_FILE = BACKEND_DIR / "schema_postgresql.sql"
+FENCE_VERSION_LOCK_ID = 0x5646454E  # "VFEN", estável entre processos.
+
+
+class DatabaseError(RuntimeError):
+    """Erro público e sanitizado da camada de banco."""
+
+
+class DatabaseConfigurationError(DatabaseError):
+    pass
+
+
+class DatabaseConnectionError(DatabaseError):
+    pass
+
+
+def _postgres_sql(sql: str) -> str:
+    """Converte placeholders qmark do código existente para psycopg."""
+    return sql.replace("?", "%s")
+
+
+def _schema_statements(script: str) -> Iterator[str]:
+    """Divide nossos schemas simples sem enviar comentários ao PostgreSQL."""
+    lines = [line for line in script.splitlines() if not line.lstrip().startswith("--")]
+    for statement in "\n".join(lines).split(";"):
+        if statement.strip():
+            yield statement.strip()
+
+
+class _PostgresConnection:
+    """Adaptador mínimo para manter SQL e serviços independentes do driver."""
+
+    def __init__(self, connection: Any) -> None:
+        self._connection = connection
+
+    def execute(self, sql: str, parameters: Iterable[Any] | None = None):
+        return self._connection.execute(
+            _postgres_sql(sql), tuple(parameters) if parameters is not None else None
+        )
+
+    def executemany(self, sql: str, parameters: Iterable[Iterable[Any]]):
+        cursor = self._connection.cursor()
+        cursor.executemany(_postgres_sql(sql), parameters)
+        return cursor
 
 
 class Database:
-    """Conexões e operações de banco do Central."""
+    """Banco do Central, selecionado por caminho SQLite ou URL PostgreSQL."""
 
-    def __init__(self, path: Path | str) -> None:
-        self.path = Path(path)
-        # Trava única por instância; ver explicação no topo do módulo.
+    def __init__(self, target: Path | str) -> None:
         self._lock = threading.RLock()
+        self._state = threading.local()
+        self.path: Path | None = None
+        self.database_url: str | None = None
 
-    # -- conexão --------------------------------------------------------
+        if isinstance(target, Path):
+            self.backend = "sqlite"
+            self.path = target
+            return
+
+        value = str(target)
+        if value.startswith(("postgresql://", "postgres://")):
+            self.backend = "postgresql"
+            self.database_url = value
+        elif value.startswith("sqlite:///"):
+            self.backend = "sqlite"
+            raw_path = value[len("sqlite:///"):]
+            self.path = Path(raw_path)
+        elif "://" in value:
+            raise DatabaseConfigurationError("unsupported database scheme")
+        else:
+            # Compatibilidade com os testes e chamadas antigas Database(path).
+            self.backend = "sqlite"
+            self.path = Path(value)
+
+    @property
+    def is_postgresql(self) -> bool:
+        return self.backend == "postgresql"
+
+    def _open_postgresql(self):
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError:
+            raise DatabaseConfigurationError(
+                "driver PostgreSQL não instalado; instale as dependências do Central"
+            ) from None
+
+        try:
+            return psycopg.connect(
+                self.database_url,
+                row_factory=dict_row,
+                connect_timeout=10,
+            )
+        except psycopg.Error:
+            # A URL pode conter usuário e senha; nunca propagamos seu conteúdo.
+            raise DatabaseConnectionError("database connection failed") from None
 
     @contextmanager
-    def connect(self) -> Iterator[sqlite3.Connection]:
-        """Abre uma conexão, confirma ou desfaz, e fecha.
+    def connect(self):
+        """Abre uma transação, confirma no sucesso e desfaz no erro.
 
-        Uso:
-            with db.connect() as conn:
-                conn.execute(...)
+        Chamadas aninhadas na mesma thread reutilizam a transação externa. Isso
+        permite que um lote inteiro seja atômico mesmo quando seus serviços
+        auxiliares também usam ``with db.connect()``.
         """
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.path, timeout=10)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        try:
-            yield connection
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+        current = getattr(self._state, "connection", None)
+        if current is not None:
+            yield current
+            return
 
-    # -- criação ---------------------------------------------------------
+        lock = nullcontext() if self.is_postgresql else self._lock
+        with lock:
+            if self.is_postgresql:
+                raw_connection = self._open_postgresql()
+                connection = _PostgresConnection(raw_connection)
+            else:
+                assert self.path is not None
+                if self.path != Path(":memory:"):
+                    self.path.parent.mkdir(parents=True, exist_ok=True)
+                raw_connection = sqlite3.connect(self.path, timeout=10)
+                raw_connection.row_factory = sqlite3.Row
+                raw_connection.execute("PRAGMA foreign_keys = ON")
+                connection = raw_connection
+
+            self._state.connection = connection
+            try:
+                yield connection
+                raw_connection.commit()
+            except Exception:
+                raw_connection.rollback()
+                raise
+            finally:
+                del self._state.connection
+                raw_connection.close()
 
     def initialize(self) -> None:
-        """Cria as tabelas e os índices. Pode ser chamada em toda subida.
+        """Cria o schema correto. Pode ser chamada em toda inicialização."""
+        if self.is_postgresql:
+            script = POSTGRESQL_SCHEMA_FILE.read_text(encoding="utf-8")
+            with self.connect() as conn:
+                for statement in _schema_statements(script):
+                    conn.execute(statement)
+        else:
+            script = SQLITE_SCHEMA_FILE.read_text(encoding="utf-8")
+            with self.connect() as conn:
+                conn.execute("PRAGMA journal_mode = WAL")
+                conn.executescript(script)
+                conn.execute("PRAGMA optimize")
+        logger.info("database ready (backend=%s)", self.backend)
 
-        Todo comando do `schema.sql` usa `IF NOT EXISTS`, então rodar de
-        novo em um banco existente não faz nada. É assim que o Monitor
-        também funciona: não há "migração" a executar à mão.
-        """
-        script = SCHEMA_FILE.read_text(encoding="utf-8")
-        with self._lock, self.connect() as conn:
-            # WAL é propriedade do arquivo e persiste; aplicar aqui basta.
-            conn.execute("PRAGMA journal_mode = WAL")
-            conn.executescript(script)
-            conn.execute("PRAGMA optimize")
-        logger.info("database ready (%s)", self.path)
+    def next_fence_version(self, conn) -> int:
+        """Reserva com segurança a próxima versão dentro da transação atual."""
+        if self.is_postgresql:
+            conn.execute("SELECT pg_advisory_xact_lock(?)", (FENCE_VERSION_LOCK_ID,))
+        row = conn.execute(
+            "SELECT COALESCE(MAX(version), 0) AS maximum FROM fences"
+        ).fetchone()
+        return int(row["maximum"]) + 1
 
     def seed_from_settings(self, settings: Settings) -> None:
-        """Cadastra a Base e as coleiras conhecidas a partir do .env.
-
-        Seção 7 da especificação: "A Base de desenvolvimento é cadastrada
-        na inicialização a partir do .env, com o token guardado como
-        hash" e "Coleiras: cadastradas a partir de COLARES_CONHECIDOS".
-
-        Duas regras diferentes, de propósito:
-
-        - **A Base é atualizada** a cada subida (`ON CONFLICT DO UPDATE`):
-          trocar o BASE_TOKEN no .env e reiniciar precisa valer. Mas só
-          os campos de configuração — token, latitude e longitude. Os
-          campos de estado reportado (`last_heartbeat`, `queue_size`,
-          `serial_status`, `fence_version_reported`) são preservados,
-          porque pertencem à Base, não ao arquivo de configuração.
-
-        - **As coleiras só são inseridas se não existirem**
-          (`INSERT OR IGNORE`): elas carregam estado de verdade (última
-          zona, bateria, última posição) que não pode ser apagado a cada
-          reinício do servidor.
-        """
+        """Cadastra/atualiza a Base e cadastra coleiras sem apagar estado."""
         token_hash = hash_token(settings.base_token)
 
-        with self._lock, self.connect() as conn:
+        with self.connect() as conn:
             conn.execute(
                 """
                 INSERT INTO bases (base_id, token_hash, lat, lon)
@@ -146,8 +214,9 @@ class Database:
             for collar_id in settings.known_collars:
                 conn.execute(
                     """
-                    INSERT OR IGNORE INTO collars (collar_id, base_id, last_seen)
+                    INSERT INTO collars (collar_id, base_id, last_seen)
                     VALUES (?, ?, NULL)
+                    ON CONFLICT(collar_id) DO NOTHING
                     """,
                     (collar_id, settings.base_id),
                 )
@@ -159,26 +228,28 @@ class Database:
             settings.base_lon,
             ",".join(settings.known_collars) or "-",
         )
-    # -- consultas de apoio ---------------------------------------------
 
     def table_names(self) -> list[str]:
-        """Lista as tabelas existentes. Usada pelos testes e no diagnóstico."""
-        with self._lock, self.connect() as conn:
-            rows = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
-            ).fetchall()
+        with self.connect() as conn:
+            if self.is_postgresql:
+                rows = conn.execute(
+                    """SELECT table_name AS name FROM information_schema.tables
+                       WHERE table_schema = current_schema() ORDER BY table_name"""
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+                ).fetchall()
         return [row["name"] for row in rows]
 
     def get_base(self, base_id: str) -> dict | None:
-        """Devolve a Base cadastrada, ou None."""
-        with self._lock, self.connect() as conn:
+        with self.connect() as conn:
             row = conn.execute(
                 "SELECT * FROM bases WHERE base_id = ?", (base_id,)
             ).fetchone()
         return dict(row) if row else None
 
     def list_collars(self) -> list[dict]:
-        """Devolve as coleiras cadastradas, em ordem de identificador."""
-        with self._lock, self.connect() as conn:
+        with self.connect() as conn:
             rows = conn.execute("SELECT * FROM collars ORDER BY collar_id").fetchall()
         return [dict(row) for row in rows]

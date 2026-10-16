@@ -12,3 +12,4 @@ uvicorn[standard]==0.54.0   # servidor que executa o FastAPI
 python-dotenv==1.2.3        # lê o .env de dentro da aplicação (decisão B2 da fase F0)
 httpx==0.28.1               # cliente HTTP: usado pelo TestClient e pelo simulador da Base (F4)
 pytest==8.4.2               # testes
+psycopg[binary]==3.3.6      # driver PostgreSQL 3; inclui binário para Vercel/Python 3.12
