@@ -128,6 +128,7 @@ class Database:
                 self.database_url,
                 row_factory=dict_row,
                 connect_timeout=10,
+                prepare_threshold=None,
             )
         except psycopg.Error:
             # A URL pode conter usuário e senha; nunca propagamos seu conteúdo.
@@ -176,6 +177,7 @@ class Database:
         if self.is_postgresql:
             script = POSTGRESQL_SCHEMA_FILE.read_text(encoding="utf-8")
             with self.connect() as conn:
+                conn.execute("SELECT pg_advisory_xact_lock(hashtext('vfence_schema_init'))")
                 for statement in _schema_statements(script):
                     conn.execute(statement)
         else:
