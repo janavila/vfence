@@ -3,6 +3,7 @@
 #include <Preferences.h>
 #include <SPI.h>
 #include <LoRa.h>
+#include <ESP32Servo.h>
 
 #include "collar_config.h"
 
@@ -19,6 +20,7 @@ using namespace vfence;
 TinyGPSPlus gps;
 HardwareSerial GPSserial(1);
 Preferences prefs;
+Servo secondActuatorServo;
 
 // ============================================================
 // ESTADO VFENCE
@@ -402,18 +404,51 @@ void loadDevelopmentFence() {
 // ATUADORES
 // ============================================================
 
+void initActuators() {
+  // Buzzer: codigo assume buzzer ativo/modulo com entrada logica.
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, BUZZER_ACTIVE_HIGH ? LOW : HIGH);
+  buzzerActive = false;
+
+  // Microservo: PWM padrao de servo em 50 Hz.
+  secondActuatorServo.setPeriodHertz(50);
+  secondActuatorServo.attach(SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
+  secondActuatorServo.write(SERVO_INACTIVE_ANGLE);
+  secondActuatorActive = false;
+
+  Serial.print("[ATUADOR] buzzer inicializado no GPIO");
+  Serial.println(BUZZER_PIN);
+  Serial.print("[ATUADOR] microservo inicializado no GPIO");
+  Serial.print(SERVO_PIN);
+  Serial.print(" | repouso=");
+  Serial.print(SERVO_INACTIVE_ANGLE);
+  Serial.print(" deg | ativo=");
+  Serial.print(SERVO_ACTIVE_ANGLE);
+  Serial.println(" deg");
+}
+
 void setBuzzer(bool on) {
   if (buzzerActive == on) return;
+
+  const uint8_t level =
+      (on == BUZZER_ACTIVE_HIGH) ? HIGH : LOW;
+  digitalWrite(BUZZER_PIN, level);
+
   buzzerActive = on;
   Serial.println(on ? "[ATUADOR] buzzer ON" : "[ATUADOR] buzzer OFF");
-  // TODO: implementar GPIO do buzzer.
 }
 
 void setSecondActuator(bool on) {
   if (secondActuatorActive == on) return;
+
+  const int angle = on ? SERVO_ACTIVE_ANGLE : SERVO_INACTIVE_ANGLE;
+  secondActuatorServo.write(angle);
+
   secondActuatorActive = on;
-  Serial.println(on ? "[ATUADOR] segundo atuador ON" : "[ATUADOR] segundo atuador OFF");
-  // TODO: implementar motor/vibracao da prova de conceito.
+  Serial.print(on ? "[ATUADOR] microservo ATIVO -> "
+                  : "[ATUADOR] microservo REPOUSO -> ");
+  Serial.print(angle);
+  Serial.println(" deg");
 }
 
 void applyActuators(const GeofenceResult& result) {
@@ -898,6 +933,9 @@ void setup() {
   delay(1500);
 
   randomSeed(static_cast<uint32_t>(micros()));
+
+  // Coloca os atuadores em estado seguro antes de iniciar sensores/radio.
+  initActuators();
 
   GPSserial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, -1);
 

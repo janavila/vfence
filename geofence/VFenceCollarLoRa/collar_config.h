@@ -29,3 +29,20 @@ static const int  LORA_CODING_RATE_DENOMINATOR = 5; // 4/5
 static const long LORA_PREAMBLE_LENGTH = 8;
 static const uint8_t LORA_SYNC_WORD = 0x12;
 static const int LORA_TX_POWER_DBM = 14;
+
+// ============================================================
+// ATUADORES - PROVA DE CONCEITO
+// ============================================================
+// IMPORTANTE: GPIO7 nao deve ser usado na Heltec WiFi LoRa 32 V2,
+// pois pertence ao barramento da memoria flash do ESP32.
+// O buzzer foi realocado para GPIO32.
+static const int BUZZER_PIN = 32;
+static const bool BUZZER_ACTIVE_HIGH = true;
+
+// Microservo usado somente como segundo atuador de prova de conceito.
+// GPIO13 nao conflita com GPS/LoRa usados neste firmware.
+static const int SERVO_PIN = 13;
+static const int SERVO_INACTIVE_ANGLE = 0;
+static const int SERVO_ACTIVE_ANGLE = 90;
+static const int SERVO_MIN_US = 500;
+static const int SERVO_MAX_US = 2400;
