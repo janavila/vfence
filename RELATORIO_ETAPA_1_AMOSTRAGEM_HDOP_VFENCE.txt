@@ -1,0 +1,191 @@
+VFENCE — RELATÓRIO TÉCNICO DA ETAPA 1
+Amostragem de HDOP e cálculo da média em janelas de 60 segundos
+Data: 18/11/2026
+
+1. OBJETIVO E RESULTADO
+
+O firmware ativo da coleira ESP32 coleta atualizações de HDOP do GNSS,
+aceita no máximo uma amostra nova e válida por segundo e publica a média
+ao fechar cada janela de 60 segundos. O resultado fica disponível em RAM
+no próprio sketch, acompanhado da quantidade utilizada e de uma flag de
+validade. O monitor Serial imprime um diagnóstico por janela processada.
+
+HDOP é uma medida adimensional da geometria horizontal dos satélites.
+Nesta etapa, o dado agregado é uma estatística local da coleira. O HDOP
+instantâneo continua sendo usado pelos pacotes e eventos existentes.
+
+2. ARQUIVO E ESCOPO DA IMPLEMENTAÇÃO
+
+C:/Users/leobo/OneDrive/Desktop/vfence/geofence/VFenceCollarLoRa/VFenceCollarLoRa.ino
+
+Foram adicionadas as funções hasNumericHdopField(), sampleUpdatedHdop()
+e serviceHdopWindow(). Os pontos de integração são setup() e loop().
+O cabeçalho collar_config.h continua com GPS_RX = 23 e GPS_BAUD = 115200.
+No setup(), a UART1 é inicializada em 8N1, com RX no GPIO 23 e TX
+desabilitado. A Serial do console também opera em 115200 baud.
+
+O código de geofencing, a telemetria LoRa, os alertas, os ACKs e a
+configuração do rádio foram preservados. Gateway, Raspberry Pi e FPGA
+ficam fora do escopo da etapa.
+
+3. REFERÊNCIA DE SÍMBOLOS E LINHAS
+
+As linhas a seguir correspondem ao estado local conferido nesta entrega.
+
+438–443  currentHdopX100(): leitura instantânea preexistente usada por
+         telemetria e eventos.
+445–447  HDOP_SAMPLE_INTERVAL_MS = 1000, HDOP_WINDOW_MS = 60000 e
+         HDOP_SLOTS_PER_WINDOW = 60. Definem a duração de cada intervalo
+         de amostragem, a duração da janela e o número de intervalos.
+449      hdopWindowStartMs, uint32_t: início da janela ativa em millis().
+450      hdopWindowSumX100, uint32_t: soma em centésimos de HDOP.
+451      hdopWindowSampleCount, uint8_t: número de amostras acumuladas
+         na janela ativa.
+452      hdopLastSampleSlot, uint8_t: índice do último intervalo que
+         aceitou uma amostra. O valor 60 representa o estado inicial.
+455      hdopMeanX100, uint16_t: média da última janela em centésimos.
+456      hdopSampleCount, uint8_t: número de amostras da última janela.
+457      hdopMeanValid, bool: indica disponibilidade da última média.
+459–485  serviceHdopWindow(now): fecha a janela vencida, atualiza o
+         resultado, zera os acumuladores e emite o diagnóstico Serial.
+487–513  hasNumericHdopField(byte): acompanha a presença e o formato do
+         campo HDOP durante a leitura de cada sentença NMEA.
+515–528  sampleUpdatedHdop(now, hasNumericField): consome a atualização,
+         valida a medição e seleciona a amostra do segundo.
+934      processNewGpsPosition(): caminho preexistente de posição e
+         geofencing, chamado pelo loop() na linha 1035.
+981–987  setup(): inicialização do console e da UART do GNSS.
+1021     Inicialização de hdopWindowStartMs após o envio de DEVICE_STARTED.
+1024–1048 loop(): leitura UART, processamento de posição e rotina de
+         fechamento da janela mesmo sem novas amostras.
+
+4. FLUXO DE LEITURA E CRITÉRIOS DE VALIDADE
+
+1) O loop() drena os bytes disponíveis em GPSserial. Cada byte passa
+   pelo acompanhamento do campo e pelo parser gps.encode().
+2) O acompanhamento reinicia ao receber '$'. A variável field conta
+   separadores até o campo 8 da GGA. integerDigits limita a parte
+   inteira a três dígitos. hasDigit registra a presença de um dígito,
+   hasDot permite um ponto decimal e malformed registra caracteres
+   inválidos. O campo só é aceito após seu delimitador de fechamento.
+3) A coleta é chamada quando gps.encode() indica uma sentença aceita
+   e gps.hdop.isUpdated() sinaliza uma atualização. A TinyGPSPlus
+   permanece responsável pela interpretação da sentença e do checksum.
+4) sampleUpdatedHdop() exige gps.hdop.isValid() e usa gps.hdop.value()
+   para obter o inteiro já escalado por 100. Essa leitura consome a flag
+   de atualização. A checagem explícita do campo evita aceitar o HDOP
+   anterior quando uma GGA válida por checksum chega com o campo vazio
+   e a biblioteca ainda assim sinaliza uma atualização.
+5) A coleta aceita a faixa de 0 a 65534. Valores negativos e o valor
+   65535, reservado para U16_UNAVAILABLE, são descartados.
+6) O índice do segundo é a divisão inteira de (now - hdopWindowStartMs)
+   por 1000. A primeira amostra válida do segundo entra imediatamente na
+   soma. As demais daquele segundo são descartadas e o contador fica
+   igual. Uma atualização numérica igual à anterior continua elegível em
+   outro segundo quando vem em uma nova sentença aceita. Segundos sem
+   atualização válida ficam vazios.
+
+Referências da biblioteca consultadas na implementação:
+https://github.com/mikalhart/TinyGPSPlus/blob/master/src/TinyGPS%2B%2B.h
+https://github.com/mikalhart/TinyGPSPlus/blob/master/src/TinyGPS%2B%2B.cpp
+
+5. FECHAMENTO, CÁLCULO E ARMAZENAMENTO
+
+serviceHdopWindow() usa a diferença sem sinal entre o relógio atual e o
+início da janela. A aritmética de uint32_t lida com a volta de millis()
+a zero. O início avança em múltiplos de 60000 ms para manter as janelas
+alinhadas. Uma amostra processada exatamente no limite pertence à janela
+seguinte. A chamada no fim do loop() fecha janelas mesmo sem dados GNSS.
+
+Com N > 0, usando aritmética inteira:
+
+  hdopMeanX100 = (hdopWindowSumX100 + N / 2) / N
+  N = hdopWindowSampleCount no instante do fechamento
+
+Isso arredonda ao centésimo mais próximo, com empate arredondado para
+cima. Para amostras 141 e 142, o resultado é 142, exibido como 1.42.
+A maior soma possível é 60 × 65534 = 3932040, dentro de uint32_t.
+Depois de publicar a média, a função zera a soma e o contador em andamento
+e libera o primeiro intervalo da janela nova. A média publicada permanece
+disponível até o fechamento seguinte ou até o reinício do firmware.
+
+Com N = 0, a média recebe U16_UNAVAILABLE, hdopSampleCount recebe zero e
+hdopMeanValid fica false. Se o loop() voltar a rodar após atravessar dois
+ou mais limites de janela de uma vez, publica a última janela vencida como
+vazia e avança diretamente para a janela atual. O armazenamento usa um
+conjunto fixo de variáveis e dispensa um vetor de amostras.
+
+6. VERIFICAÇÃO EM BANCADA
+
+Use o sketch ativo VFenceCollarLoRa.ino e abra o monitor Serial da coleira
+em 115200 baud depois de gravá-lo. Aguarde aproximadamente 60 segundos
+após a inicialização. Exemplos ilustrativos de saída:
+
+  [HDOP_AGG] Janela=60s | Amostras=58 | HDOP medio=1.42 | Valido=SIM
+  [HDOP_AGG] Janela=60s | Amostras=0 | HDOP medio=N/A | Valido=NAO
+
+Na primeira linha, 58 segundos da janela contribuíram com amostras.
+Na segunda, nenhum segundo contribuiu. O número máximo é 60. O número
+observado depende da saída GGA, da recepção UART e da disponibilidade de
+campos válidos. A taxa física do GNSS precisa ser medida no módulo. O
+intervalo usa o tempo de processamento no ESP32 e a validade de HDOP é
+avaliada separadamente da validade da posição para geofencing.
+
+7. TESTES E LIMITAÇÕES
+
+Na implementação foram executados seis cenários em simulação JavaScript
+da lógica extraída do sketch, com relógio e entrada GNSS simulados. Os seis
+passaram. Foram exercitados o limite de uma amostra por segundo, o
+arredondamento e a passagem de janela, a janela vazia, o limite de 60
+amostras, a volta de millis() a zero, o salto de janelas e a presença de
+campos NMEA vazios, ausentes, malformados e numéricos.
+
+git diff --check passou. Os avisos LF/CRLF exibidos pelo Git se referem a
+app/serial_reader.py e tests/test_central_integration.py, que já estavam
+modificados. A compilação ESP32 ficou pendente por ausência de Arduino CLI,
+PlatformIO e compilador Xtensa no ambiente consultado. A simulação cobre a
+lógica de agregação. A compilação com as bibliotecas instaladas e o ensaio
+com hardware ainda precisam ser executados.
+
+8. DIFF E SEPARAÇÃO DAS ALTERAÇÕES
+
+Saída de git diff --stat para os arquivos rastreados, conferida antes de
+criar este relatório:
+
+ app/serial_reader.py                           | 288 ++++++++++++++----
+ gateway/VFenceGateway/README.md                |  47 +++
+ gateway/VFenceGateway/VFenceGateway.ino        | 402 ++++++++++++++++++++++---
+ geofence/VFenceCollarLoRa/VFenceCollarLoRa.ino |  94 +++++-
+ tests/test_central_integration.py              |  96 ++++--
+ 5 files changed, 807 insertions(+), 120 deletions(-)
+
+A etapa de HDOP corresponde à linha do sketch, com 93 inserções e 1
+remoção. As outras quatro linhas são mudanças preexistentes. Este TXT é
+um novo arquivo local e, enquanto não for rastreado, aparece no status
+do Git como não rastreado.
+
+Trechos selecionados do diff do firmware:
+
+  +static uint16_t hdopMeanX100 = U16_UNAVAILABLE;
+  +static uint8_t hdopSampleCount = 0;
+  +static bool hdopMeanValid = false;
+
+   sendDeviceStartedEvent();
+  +hdopWindowStartMs = millis();
+
+  -    gps.encode(GPSserial.read());
+  +    const char byte = static_cast<char>(GPSserial.read());
+  +    const bool hasNumericField = hasNumericHdopField(byte);
+  +    if (gps.encode(byte) && gps.hdop.isUpdated()) {
+  +      sampleUpdatedHdop(millis(), hasNumericField);
+  +    }
+
+  +  serviceHdopWindow(millis());
+
+9. USO FUTURO
+
+Depois de validar a coleta no monitor Serial, uma etapa de transporte
+poderá usar hdopMeanX100, hdopSampleCount e hdopMeanValid como a fonte do
+resumo de HDOP. As três variáveis descrevem a mesma janela concluída. O
+envio ao Gateway e a escolha do formato de transporte ficam para essa
+etapa posterior.

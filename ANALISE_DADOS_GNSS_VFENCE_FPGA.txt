@@ -1,0 +1,924 @@
+AUDITORIA TÉCNICA — DADOS GNSS, TELEMETRIA, ENLACE E PERSISTÊNCIA DO VFENCE
+Data da auditoria: 27/10/2026
+Fonte de verdade: working tree atual do repositório.
+Escopo: análise somente. FPGA NÃO IMPLEMENTADO nesta tarefa.
+
+LEGENDA
+IMPLEMENTADO: existe caminho executável no código atual.
+PARCIAL: parte do caminho existe, mas há perda, ausência de persistência ou produtor não integrado.
+NÃO IMPLEMENTADO: não foi encontrado caminho executável correspondente.
+PROTOCOLO SUPORTA, MAS NÃO PRODUZIDO: encoder/decoder existe, porém o firmware ativo não gera o dado/evento.
+
+CONCLUSÃO EXECUTIVA
+
+1. O firmware ativo da coleira é geofence/VFenceCollarLoRa/VFenceCollarLoRa.ino.
+2. O GNSS usa HardwareSerial UART1, RX GPIO23, 115200 baud, 8N1, somente recepção.
+3. TinyGPSPlus recebe caracteres individuais. O código não preserva sentenças brutas nem horário GNSS.
+4. Do GNSS, o firmware ativo consulta somente localização (lat/lon), validade/atualização da localização,
+   satélites e HDOP. Altitude, velocidade, curso, data e hora não são consultados.
+5. Lat/lon passam de double em graus para int32_t E7 antes do pacote LoRa.
+6. A telemetria LoRa é binária, não texto e não JSON: header de 5 bytes + payload de 18 bytes.
+7. O Gateway converte E7 de volta para graus e acrescenta RSSI e SNR medidos pelo receptor LoRa.
+8. Gateway -> Base usa JSON por linha com prefixo [APP] e schema vfence.gateway.serial.v1.
+9. A Base reduz inside/near/veryNear/gpsValid a uma única zona e descarta distanceBorderM.
+10. SQLite local não possui colunas para battery_pct, fence_version, distanceBorderM, gpsValid,
+    inside, near ou veryNear. Battery/fenceVersion seguem para a outbox, mas não para telemetry local.
+11. PostgreSQL recebe lat, lon, zone, satellites, hdop, battery_pct, fence_version, rssi e snr.
+    Não recebe sequence, distanceBorderM, gpsValid, inside, near ou veryNear.
+12. RSSI/SNR não vêm do GPS. São medidos por pacote no Gateway com LoRa.packetRssi()/packetSnr().
+13. Não existem contadores agregados de TX, RX, ACK, NACK, retries, timeouts ou duplicatas.
+    Portanto PDR/PER não podem ser calculados corretamente com a instrumentação atual.
+14. Não foi encontrado código FPGA, driver FPGA, barramento FPGA ou processo de alimentação do FPGA.
+
+============================================================
+1. MAPA DE ARQUIVOS RELEVANTES
+============================================================
+
+Foram analisados 40 arquivos relevantes, contando código ativo, schemas, testes e documentação usada
+para confronto. Pastas explicitamente chamadas "beta legado" foram tratadas como referência histórica,
+não como firmware ativo.
+
+FIRMWARE ATIVO DA COLEIRA
+
+1) geofence/VFenceCollarLoRa/collar_config.h
+Finalidade: identidade, UART do GPS e parâmetros/pinos LoRa.
+Recebe: nenhuma entrada em runtime.
+Produz: COLLAR_ID, GPS_RX, GPS_BAUD e constantes LORA_*.
+Símbolos: GPS_RX=23, GPS_BAUD=115200, LORA_FREQUENCY_HZ=915000000.
+
+2) geofence/VFenceCollarLoRa/VFenceCollarLoRa.ino
+Finalidade: aplicação embarcada ativa da coleira.
+Recebe: caracteres GNSS pela UART; pacotes binários LoRa; comandos de teste RX pela Serial.
+Produz: telemetria/eventos VFENCE binários, ACK/NACK/PONG, estados de atuadores e NVS.
+Funções: setup, loop, processNewGpsPosition, serviceGpsTimeout, sendTelemetryPacket,
+sendOutsideOrBackInside, sendGpsLostEvent, sendGpsRecoveredEvent, sendDeviceStartedEvent,
+pollLoRaReceive, processIncomingPacket, sendReliable, serviceReliableTx, transportSend.
+Variáveis/objetos: gps, GPSserial, latestPosition, latestGeofence, batteryPct, nextSequence,
+pendingTx, activeFence, params.
+
+3) geofence/VFenceCollarLoRa/vfence_protocol.h
+Finalidade: contrato binário VFENCE v1.
+Recebe/produz: declarações de headers, payloads, flags, sentinelas e encoders/decoders.
+Structs: CoordinateE7, Header, PacketView, TelemetryPayload, PositionEventPayload,
+GpsLostPayload, GpsRecoveredPayload, BatteryEventPayload, DeviceStartedPayload,
+AckPayload, NackPayload, ParametersPayload.
+
+4) geofence/VFenceCollarLoRa/vfence_protocol.cpp
+Finalidade: serialização/desserialização binária big-endian.
+Funções: degreesToE7, e7ToDegrees, encodeHeader, decodePacket, encodeTelemetry,
+decodeTelemetry, encode/decode dos eventos, ACK/NACK, FENCE_* e PARAMETERS.
+Produz: uint8_t[] pronto para LoRa; reconstrói structs a partir de bytes.
+
+5) geofence/VFenceCollarLoRa/vfence_geofence.h
+Finalidade: API do geofencing.
+Struct/classe: GeofenceResult, GeofenceEngine, ProximityState.
+
+6) geofence/VFenceCollarLoRa/vfence_geofence.cpp
+Finalidade: projeção WGS84 local, ponto-no-polígono e distância à borda.
+Recebe: CoordinateE7 e cerca E7.
+Produz: valid, inside, distanceBorderM (double) e proximity.
+Funções: setFence, setThresholds, analyze, toXY, pointInside, distanceToBorder.
+
+7) geofence/VFenceCollarLoRa/vfence_fence_transfer.h
+8) geofence/VFenceCollarLoRa/vfence_fence_transfer.cpp
+Finalidade: montagem transacional da cerca recebida por chunks.
+Classe: FenceAssembler.
+Dados: version, vertexCount, chunkCount, CRC32, receivedMask e CoordinateE7[].
+Funções: begin, addChunk, missingBitmap, complete, crcValid, validateCommit.
+
+9) geofence/VFenceCollarLoRa/README.md
+Finalidade: dependências, ligação do NEO-6M e teste físico da coleira.
+
+GATEWAY ATIVO
+
+10) gateway/VFenceGateway/gateway_config.h
+Finalidade: parâmetros LoRa e timeout offline.
+Dados: frequência, SF, BW, CR, preâmbulo, sync word, potência, pinos,
+COLLAR_OFFLINE_TIMEOUT_MS, ACK_TIMEOUT_MS, MAX_TRANSMISSIONS.
+
+11) gateway/VFenceGateway/VFenceGateway.ino
+Finalidade: LoRa <-> protocolo VFENCE <-> USB/Serial da Base.
+Recebe: bytes LoRa e [CMD] JSON/texto pela Serial.
+Produz: [APP] JSON, logs humanos, ACK/NACK/PING/PARAMETERS/FENCE_* LoRa.
+Funções: pollLoRaReceive, processIncomingPacket, processTelemetry, processEventPayload,
+processEvent, processControl, markCollarSeen, serviceOfflineDetection, sendReliable,
+serviceReliableTx, emitAppHeader, emitCollarState, emitGatewayAndCollarStatus,
+emitRadioConfig, processJsonCommand, pollSerialCommands.
+Structs/variáveis: CollarState, PendingReliableTx, FenceTxSession, collars, pendingTx, fenceTx.
+
+12) gateway/VFenceGateway/vfence_protocol.h
+13) gateway/VFenceGateway/vfence_protocol.cpp
+Finalidade: cópia byte a byte do protocolo da coleira. Os hashes dos arquivos ativos da coleira
+e do Gateway são iguais na auditoria.
+
+14) gateway/VFenceGateway/README.md
+Finalidade: operação manual e protocolo Serial da Base.
+
+PROTÓTIPOS/TESTES EMBARCADOS
+
+15) geofence/vfence.ino
+Finalidade: protótipo monolítico anterior de GPS/geofence. Não contém transporte LoRa ativo;
+há comentário de futura telemetria. Não deve ser confundido com VFenceCollarLoRa.ino.
+
+16) testeconexao/testeconexao.ino
+Finalidade: teste isolado do NEO-6M/TinyGPSPlus; imprime lat/lon/satélites/HDOP.
+
+17) Testelora/receiver/receiver.ino
+18) Testelora/sender/sender.ino
+Finalidade: teste LoRa textual VFENCE_TESTE_N. Não implementam o protocolo binário atual.
+
+BASE PYTHON/RASPBERRY
+
+19) app/serial_reader.py
+Finalidade: conexão Serial assíncrona, parsing [APP], persistência, WebSocket e envio [CMD].
+Recebe: bytes/linhas UTF-8 do Gateway.
+Produz: ParsedPacket, gravações SQLite/outbox, broadcast, comandos JSON.
+Classe/funções: SerialReader; _run_serial, process_line, _parse_gateway_app,
+_telemetry_packet, _process_gateway_app, _save_and_broadcast, send_gateway_command, send_fence.
+
+20) app/protocol.py
+Finalidade: ParsedPacket e parser textual legado V1|.../Recebido:...
+Observação: telemetria [APP] atual não passa por parse_message; é adaptada por _telemetry_packet.
+
+21) app/database.py
+Finalidade: SQLite local, estado atual, histórico, outbox e cercas.
+Funções: initialize, save_packet, enqueue_event, enqueue_delivery, outbox_batch,
+acknowledge_outbox, save_pending_fence, fence_state.
+
+22) app/central_client.py
+Finalidade: HTTPS/HTTP assíncrono para heartbeat, download de cerca e POST batch.
+Classe/funções: CentralClient, heartbeat, download_fence, send_batch.
+
+23) app/sync_service.py
+Finalidade: ciclo de sincronização Central <-> Base <-> Gateway.
+Classe/funções: CentralSyncService, run, sync_once, _deliver_fence, _flush_outbox.
+
+24) app/config.py
+Finalidade: variáveis de ambiente. Relevantes: SERIAL_PORT, SERIAL_BAUD,
+DATABASE_URL, CENTRAL_SYNC_ENABLED, CENTRAL_BASE_URL, CENTRAL_BATCH_SIZE.
+
+25) app/main.py
+Finalidade: instancia Database, SerialReader e CentralSyncService; lifespan cria tasks asyncio.
+
+26) app/models.py
+Finalidade: GatewayState. Não contém modelo de telemetria; esse modelo está em protocol.py.
+
+CENTRAL E BANCOS
+
+27) web/backend/schemas/edge.py
+Finalidade: Pydantic do heartbeat, cerca e batch. BatchItemIn.data é dict[str, Any].
+
+28) web/backend/routers/edge.py
+Finalidade: POST /api/edge/heartbeat, GET /api/edge/fences/{version}, POST /api/edge/batch.
+Função central para esta auditoria: batch_route.
+
+29) web/backend/services/edge_service.py
+Finalidade: idempotência edge_seq e INSERT de telemetria/eventos.
+Funções: process_batch, _claim, _store_telemetry, _store_event, _apply_delivery.
+
+30) web/backend/db.py
+Finalidade: abstração SQLite/PostgreSQL da Central e inicialização do schema.
+
+31) web/backend/schema.sql
+32) web/backend/schema_postgresql.sql
+Finalidade: schemas da Central. Tabelas relevantes: telemetry, collars, events, edge_items.
+
+33) web/backend/services/delivery.py
+Finalidade: estado e CRC das entregas de cerca.
+
+DOCUMENTAÇÃO E TESTES CONFRONTADOS
+
+34) README.md
+35) docs/INTEGRACAO_RASPBERRY_CENTRAL_GATEWAY.md
+36) GUIA_ESTUDO_RASPBERRY.md
+37) web/docs/CONTRATO_BASE.md
+38) tests/test_gateway_serial.py
+39) tests/test_central_integration.py
+40) web/tests/test_api_edge.py
+Finalidade: confrontar contratos descritos com o código executável e confirmar campos testados.
+
+============================================================
+2. GNSS NA COLEIRA
+============================================================
+
+ARQUIVO: geofence/VFenceCollarLoRa/collar_config.h (aprox. linhas 9-11)
+ARQUIVO: geofence/VFenceCollarLoRa/VFenceCollarLoRa.ino (linhas 19-21, 849-890, 896-955)
+
+Interface: UART via HardwareSerial.
+Objeto: HardwareSerial GPSserial(1), portanto UART1 do ESP32.
+Configuração: GPSserial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, -1).
+Baud: 115200.
+Pino: RX do ESP32 = GPIO23; comentário: TX do GPS -> GPIO23. TX do ESP32 = -1, não usado.
+Biblioteca: TinyGPSPlus, objeto TinyGPSPlus gps.
+
+Formato bruto:
+- O loop lê GPSserial.read() e entrega cada byte/caractere a gps.encode().
+- TinyGPSPlus é usada como parser de fluxo textual GNSS/NMEA.
+- O código não configura modo binário UBX e não trata frames binários.
+- O repositório não captura exemplos de sentenças brutas nem verifica tipos GGA/RMC.
+- Portanto: fluxo de caracteres compatível com NMEA é a expectativa do código; as sentenças exatas
+  produzidas pelo módulo físico não são comprováveis apenas pelo repositório.
+
+Mensagem NMEA original: NÃO É MANTIDA. Não há buffer, log ou persistência das sentenças.
+
+Campos/estados TinyGPSPlus realmente consultados:
+- gps.location.isUpdated() -> bool; dispara processNewGpsPosition.
+- gps.location.isValid() -> bool; exige fix/localização válida.
+- gps.location.lat() -> double; latitude em graus.
+- gps.location.lng() -> double; longitude em graus.
+- gps.satellites.isValid() -> bool.
+- gps.satellites.value() -> valor tratado como uint32_t.
+- gps.hdop.isValid() -> bool.
+- gps.hdop.hdop() -> double.
+
+Tempo/idade usado pelo firmware:
+- lastValidGpsMs, gpsMonitorStartMs e millis() são relógio monotônico do ESP32, NÃO horário GNSS.
+- positionAgeSeconds() mede segundos desde o último fix válido usando millis().
+
+Campos não consultados em nenhum ponto do firmware ativo:
+- altitude;
+- velocidade;
+- curso/heading;
+- data GNSS;
+- hora GNSS;
+- idade fornecida pela própria biblioteca para o campo location;
+- número de caracteres processados/checksum failed/sentences with fix;
+- precisão estimada horizontal/vertical além de HDOP.
+
+DADOS DISPONÍVEIS NA BIBLIOTECA MAS NÃO USADOS PELO VFENCE
+
+O projeto não inclui o fonte da versão instalada de TinyGPSPlus; por isso a auditoria não atribui
+tipos/garantias a APIs externas não presentes no repositório. É comprovado somente que o código VFence
+não referencia altitude, speed, course, date, time nem estatísticas do parser. Essas famílias são comuns
+em TinyGPSPlus, mas sua disponibilidade exata deve ser confirmada na versão instalada antes de um projeto futuro.
+
+============================================================
+3. DICIONÁRIO COMPLETO DOS DADOS GNSS USADOS
+============================================================
+
+CAMPO | ORIGEM | VARIÁVEL/EXPRESSÃO | TIPO C/C++ | UNIDADE | EXEMPLO | VALIDAÇÃO | DESTINO
+latitude | TinyGPSPlus | gps.location.lat() | double | graus | -31.3054583 | location.isUpdated && isValid | degreesToE7 -> latestPosition.lat
+longitude | TinyGPSPlus | gps.location.lng() | double | graus | -54.0643931 | location.isUpdated && isValid | degreesToE7 -> latestPosition.lon
+fix/localização válida | TinyGPSPlus | gps.location.isValid() | bool | lógico | true | condição do loop | gpsEverValid/gpsLostState/stateFlags
+posição atualizada | TinyGPSPlus | gps.location.isUpdated() | bool | lógico | true | condição do loop | chama processNewGpsPosition
+satélites | TinyGPSPlus | gps.satellites.value() | lido em uint32_t | contagem | 10 | satellites.isValid(); clamp 254 | uint8_t ou 0xFF
+validade de satélites | TinyGPSPlus | gps.satellites.isValid() | bool | lógico | true | se falso usa 0xFF | telemetria/eventos
+HDOP | TinyGPSPlus | gps.hdop.hdop() | double | adimensional | 0.90 | hdop.isValid(); 0..655.34 após escala | uint16_t x100 ou 0xFFFF
+validade HDOP | TinyGPSPlus | gps.hdop.isValid() | bool | lógico | true | se falso usa 0xFFFF | telemetria/eventos
+idade desde último fix | ESP32, não GNSS | (millis()-lastValidGpsMs)/1000 | uint32_t -> uint16_t | segundos | 12 | clamp 65534 | GPS_LOST/bateria
+
+============================================================
+4. TRANSFORMAÇÕES DOS DADOS
+============================================================
+
+LATITUDE/LONGITUDE DE TELEMETRIA
+double graus (TinyGPSPlus)
+-> degreesToE7: llround(graus * 10.000.000)
+-> int32_t CoordinateE7
+-> writeI32BE: 4 bytes signed em big-endian por coordenada
+-> LoRa
+-> readI32BE no Gateway
+-> e7ToDegrees: double = E7/10.000.000
+-> Serial.print(..., 7): JSON decimal com 7 casas ou null
+-> json.loads: float Python ou None
+-> SQLite REAL/NULL
+-> JSON batch: número/JSON null
+-> PostgreSQL DOUBLE PRECISION/NULL.
+
+HDOP
+double gps.hdop.hdop()
+-> multiplicação por 100, lround
+-> uint16_t hdopX100; 0xFFFF significa indisponível
+-> 2 bytes big-endian
+-> Gateway divide por 100.0 e imprime 2 casas
+-> float Python
+-> SQLite REAL
+-> PostgreSQL DOUBLE PRECISION.
+Perda deliberada de resolução: centésimos de HDOP.
+
+SATÉLITES
+valor TinyGPSPlus tratado como uint32_t
+-> clamp máximo 254
+-> uint8_t; 0xFF significa indisponível
+-> 1 byte
+-> JSON inteiro/null
+-> Python int/None
+-> SQLite/PostgreSQL INTEGER/NULL.
+
+DISTÂNCIA À BORDA
+double latestGeofence.distanceBorderM
+-> clampDistanceMeters + lround
+-> uint16_t metros inteiros; 0xFFFF indisponível
+-> JSON distanceBorderM inteiro/null no Gateway
+-> DESCARTADA por SerialReader._telemetry_packet.
+
+ESTADOS BOOLEANOS
+GeofenceResult + estados do dispositivo
+-> buildStateFlags() em uint8_t:
+bit0 inside, bit1 near, bit2 veryNear, bit3 gpsValid, bit4 lowBattery,
+bit5 criticalBattery, bit6 buzzer, bit7 segundo atuador
+-> Gateway expõe somente inside/near/veryNear/gpsValid em JSON
+-> Base converte os quatro para uma zone:
+   !gpsValid=GNSS_INVALIDO; !inside=FORA; veryNear=CRITICO; near=ATENCAO; senão SEGURO.
+-> flags de bateria/atuadores não chegam à Base.
+
+CERCA CENTRAL -> COLEIRA (não é dado GNSS, mas esclarece E6/E7)
+Central e SQLite local: int E6
+-> Base divide por 1.000.000 e envia graus decimais em FENCE_POINT
+-> Gateway degreesToE7 multiplica por 10.000.000
+-> LoRa/coleira usam int32_t E7.
+
+============================================================
+5. COLEIRA -> PACOTE LoRa: TELEMETRY/POSITION_STATUS
+============================================================
+
+ARQUIVO: vfence_protocol.cpp, encodeTelemetry (aprox. linhas 305-325)
+ARQUIVO: VFenceCollarLoRa.ino, sendTelemetryPacket (linhas 548-573)
+
+O pacote tem 23 bytes: header 5 + payload 18. Ordem em rede big-endian.
+
+HEADER (5 bytes)
+byte 0: control — versão 2 bits, MessageType 2 bits, ACK_REQ, RETRY, URGENT, reservado.
+byte 1: collarId uint8_t.
+bytes 2-3: sequence uint16_t big-endian.
+byte 4: payloadLength uint8_t (=18).
+
+PAYLOAD POSITION_STATUS (18 bytes)
+offset | bytes | campo | tipo wire | unidade | categoria/fonte
+0 | 1 | subtype=0x01 | uint8 | enum | D protocolo
+1 | 4 | latitude | int32 E7 BE | 1e-7 grau | A GNSS
+5 | 4 | longitude | int32 E7 BE | 1e-7 grau | A GNSS
+9 | 2 | distanceBorderM | uint16 BE | metro inteiro | B geofencing
+11 | 1 | batteryPct | uint8 | % ou 0xFF | C dispositivo
+12 | 1 | satellites | uint8 | contagem ou 0xFF | A GNSS
+13 | 2 | hdopX100 | uint16 BE | HDOP x100 ou 0xFFFF | A GNSS
+15 | 1 | stateFlags | bitset uint8 | estados | B/C
+16 | 2 | fenceVersion | uint16 BE | versão | C configuração
+
+sequence está no header, não no payload. Telemetria não solicita ACK (ackReq=false) e não usa retry.
+batteryPct: PARCIAL. A variável existe, mas permanece U8_UNAVAILABLE porque a leitura de bateria
+está explicitamente comentada como ainda não integrada.
+
+============================================================
+6. TELEMETRIA E EVENTOS, SEPARADOS
+============================================================
+
+TELEMETRY / POSITION_STATUS — IMPLEMENTADO
+Produção: periódica, telemetryIntervalS (padrão 10 s) + jitter aleatório 0..3 s.
+Confiabilidade: sem ACK/retry.
+Campos: todos os 18 bytes descritos acima.
+
+EVENT OUTSIDE/BACK_INSIDE — IMPLEMENTADO
+Payload 17 bytes: subtype(1), fenceVersion(2), lat E7(4), lon E7(4),
+distanceBorderM(2), batteryPct(1), satellites(1), hdopX100(2).
+ACK_REQ=true, URGENT=true; usa sendReliable.
+
+EVENT GPS_LOST — IMPLEMENTADO
+Payload 11 bytes: subtype(1), lastLatitude E7(4), lastLongitude E7(4), positionAgeS(2).
+Disparado após gpsTimeoutS sem fix (padrão 60 s). ACK_REQ/URGENT.
+
+EVENT GPS_RECOVERED — IMPLEMENTADO
+Payload 12 bytes: subtype(1), latitude E7(4), longitude E7(4), satellites(1), hdopX100(2).
+Disparado no primeiro fix após estado perdido. ACK_REQ, não urgente.
+
+EVENT DEVICE_STARTED — IMPLEMENTADO
+Payload 5 bytes: subtype(1), resetReason(1), activeFenceVersion(2), batteryPct(1).
+É enviado no setup. resetReason está fixo em POWER_ON; leitura real de esp_reset_reason NÃO IMPLEMENTADA.
+
+EVENT LOW_BATTERY/CRITICAL_BATTERY — PROTOCOLO SUPORTA, MAS NÃO PRODUZIDO
+Encoder, decoder e parser do Gateway existem. Não foi encontrada chamada a encodeBatteryEvent no
+firmware ativo. batteryPct permanece indisponível. Portanto esses eventos não são gerados hoje.
+
+Perdas no Gateway ao converter EVENT para JSON:
+- OUTSIDE/BACK_INSIDE: LoRa contém battery/satellites/hdop; JSON omite os três.
+- GPS_RECOVERED: LoRa contém satellites/hdop; JSON omite os dois.
+- Eventos não incluem RSSI/SNR no JSON, embora o Gateway os tenha medido para o pacote.
+- Alguns JSONs de evento não incluem sequence; somente OUTSIDE/BACK_INSIDE o incluem atualmente.
+
+============================================================
+7. O QUE REALMENTE VIAJA PELO LoRa
+============================================================
+
+Resposta explícita: bytes binários. Não é texto e não é JSON.
+
+ESP32 coleira
+-> preenche struct C++ (ex.: TelemetryPayload)
+-> encodeTelemetry/encode* escreve uint8_t packet[MAX_PACKET_SIZE]
+-> inteiros multibyte em big-endian
+-> transportSend chama LoRa.beginPacket(), LoRa.write(data,len), LoRa.endPacket()
+-> SX1276 transmite.
+
+MAX_PACKET_SIZE=64. HEADER_SIZE=5. PROTOCOL_VERSION=0 (wire v1 do projeto).
+O subtipo é o primeiro byte de cada payload.
+Exemplo comprovado pelo layout, para telemetria: 5 bytes header + 18 bytes payload = 23 bytes.
+
+============================================================
+8. GATEWAY: RECEPÇÃO E QUALIDADE DO ENLACE
+============================================================
+
+ARQUIVO: gateway/VFenceGateway/VFenceGateway.ino
+
+1. pollLoRaReceive chama LoRa.parsePacket().
+2. Bytes entram em uint8_t data[MAX_PACKET_SIZE], preenchido por LoRa.read().
+3. Após drenar o pacote, coleta:
+   - const int rssi = LoRa.packetRssi(); unidade exibida dBm;
+   - const float snr = LoRa.packetSnr(); unidade exibida dB.
+4. processIncomingPacket chama decodePacket, que reconstrói PacketView/Header.
+5. header.type identifica TELEMETRY/EVENT/CONTROL/CONFIG.
+6. processTelemetry confirma subtype POSITION_STATUS e chama decodeTelemetry.
+7. processEvent/processEventPayload escolhe EventSubtype e decoder correspondente.
+
+Alterações feitas pelo Gateway:
+- E7 -> graus decimais para JSON;
+- sentinelas COORD_UNAVAILABLE/U8_UNAVAILABLE/U16_UNAVAILABLE -> null;
+- stateFlags -> booleanos inside/near/veryNear/gpsValid;
+- acrescenta RSSI/SNR somente ao JSON de telemetria recebida fisicamente;
+- acrescenta estado ONLINE/OFFLINE e lastSeen em memória.
+
+RSSI/SNR são medidos por pacote recebido no Gateway. NÃO são GNSS e NÃO são calculados pela coleira.
+Pacotes injetados pelo comando RX usam hasRadioMetrics=false, portanto rssi/snr são omitidos.
+
+============================================================
+9. GATEWAY -> BASE: vfence.gateway.serial.v1
+============================================================
+
+Gateway gera JSON manualmente com Serial.print, prefixo [APP] e newline por Serial.println.
+Baud USB/Serial: 115200 (setup, Serial.begin).
+Comandos de entrada têm limite 512 caracteres. Não existe verificação equivalente explícita para
+linhas [APP] de saída, mas as mensagens geradas são curtas e limitadas pelos campos fixos.
+
+TELEMETRIA [APP] contém:
+schema string; kind string; collarId inteiro; sequence inteiro;
+latitude número/null; longitude número/null; distanceBorderM inteiro/null;
+battery inteiro/null; satellites inteiro/null; hdop número/null;
+inside bool; near bool; veryNear bool; gpsValid bool; fenceVersion inteiro;
+rssi inteiro e snr número quando hasRadioMetrics=true; caso contrário são OMITIDOS.
+
+Exemplo realista baseado exatamente nas chaves e formatação do código:
+[APP] {"schema":"vfence.gateway.serial.v1","kind":"telemetry","collarId":1,
+"sequence":27,"latitude":-31.3054583,"longitude":-54.0643931,
+"distanceBorderM":12,"battery":null,"satellites":10,"hdop":0.90,
+"inside":true,"near":true,"veryNear":false,"gpsValid":true,
+"fenceVersion":2,"rssi":-65,"snr":9.25}
+Na Serial real isso é uma única linha, sem as quebras usadas acima para leitura.
+
+============================================================
+10. BASE PYTHON: RECEPÇÃO E CONVERSÃO
+============================================================
+
+Fluxo real:
+serial.Serial.readline em asyncio.to_thread
+-> SerialReader.process_line
+-> strip UTF-8
+-> _parse_gateway_app remove [APP] e usa json.loads
+-> valida schema/kind
+-> _process_gateway_app
+-> para telemetry: _telemetry_packet cria ParsedPacket
+-> _save_and_broadcast
+-> Database.save_packet + WebSocket.
+
+CAMPO SERIAL | TIPO RECEBIDO | CONVERSÃO NA BASE | DESTINO | TIPO FINAL
+collarId | int | f"COL{int(value):02d}" | ParsedPacket.collar_id | str
+sequence | int esperado | int(data["sequence"]) | SQLite telemetry.sequence/collars.last_sequence | INTEGER
+latitude | float/null | data.get, sem range check | ParsedPacket/SQLite/outbox | float/None, REAL
+longitude | float/null | data.get, sem range check | ParsedPacket/SQLite/outbox | float/None, REAL
+distanceBorderM | int/null | nenhuma | DESCARTADO | não existe
+battery | int/null | data.get | ParsedPacket e outbox; não SQLite telemetry | int/None
+satellites | int/null | data.get | SQLite/outbox | int/None
+hdop | float/null | data.get | SQLite/outbox | float/None
+inside | bool esperado | bool(data.get) | cálculo de zone | não persistido separadamente
+near | bool esperado | truthiness | cálculo de zone | não persistido separadamente
+veryNear | bool esperado | truthiness | cálculo de zone | não persistido separadamente
+gpsValid | bool esperado | bool(data.get) | cálculo de zone | não persistido separadamente
+fenceVersion | int | data.get | ParsedPacket/outbox; não SQLite telemetry | int/None
+rssi | int/ausente | data.get | SQLite/outbox | int/None (coluna local REAL)
+snr | float/ausente | data.get | SQLite/outbox | float/None
+
+Validação real: schema/kind e presença de collarId/sequence por acesso direto; sequence vira int.
+ParsedPacket é dataclass, não Pydantic. Não há validação de faixa de lat/lon, tipos booleanos,
+bateria, satélites, HDOP, RSSI ou SNR para [APP]. O parser textual legado possui validações maiores,
+mas não é usado para a telemetria estruturada atual.
+
+============================================================
+11. SQLITE LOCAL
+============================================================
+
+TABELA collars
+id INTEGER PK; collar_id TEXT NOT NULL UNIQUE; last_seen TEXT NOT NULL;
+status TEXT NOT NULL; latitude REAL NULL; longitude REAL NULL; zone TEXT NULL;
+satellites INTEGER NULL; hdop REAL NULL; rssi REAL NULL; snr REAL NULL;
+last_sequence INTEGER NULL.
+Origem: último ParsedPacket. COALESCE preserva valor anterior quando novo campo é null.
+
+TABELA telemetry
+id INTEGER PK; collar_id TEXT NOT NULL; timestamp TEXT NOT NULL;
+latitude REAL NULL; longitude REAL NULL; zone TEXT NULL; satellites INTEGER NULL;
+hdop REAL NULL; rssi REAL NULL; snr REAL NULL; sequence INTEGER NULL;
+raw_message TEXT NOT NULL.
+
+TABELA events
+id; collar_id; timestamp; event_type; old_value; new_value.
+Guarda somente mudanças da zone derivada em save_packet.
+IMPORTANTE: eventos estruturados LoRa (GPS_LOST etc.) não são inseridos nessa tabela. Quando a
+sincronização está ativa, viram itens "event" em central_outbox; sem sync, só são broadcast em memória.
+
+TABELA central_outbox
+edge_seq INTEGER autoincrement; item_type; data_json; created_at.
+Telemetria enfileirada: collar_id, ts, lat, lon, zone, satellites, hdop, battery_pct,
+fence_version, rssi, snr. Não inclui sequence nem distanceBorderM nem booleanos.
+
+TABELAS fence_state/fence_points/fence_deliveries
+Guardam sincronização da cerca; não guardam amostras GNSS.
+
+Dados da coleira NÃO persistidos em colunas locais: distanceBorderM, batteryPct, fenceVersion,
+gpsValid, inside, near, veryNear, flags dos atuadores/bateria. battery/fence só sobrevivem na outbox
+enquanto o item ainda não foi confirmado pela Central.
+
+============================================================
+12. BASE -> CENTRAL
+============================================================
+
+Database.save_packet -> _queue("telemetry") -> central_outbox
+-> CentralSyncService._flush_outbox
+-> Database.outbox_batch produz {edge_seq,type,data}
+-> CentralClient.send_batch
+-> POST /api/edge/batch com Authorization Bearer e JSON
+-> após acked_up_to, acknowledge_outbox apaga itens locais confirmados.
+
+Campos de telemetria enviados exatamente:
+collar_id, ts, lat, lon, zone, satellites, hdop, battery_pct, fence_version, rssi, snr.
+Adicionados pela Base: ts (hora UTC de recepção/processamento), collar_id textual, zone derivada,
+edge_seq autoincremental e envelope type="telemetry".
+
+Descartados antes da Central: sequence, distanceBorderM, inside, near, veryNear, gpsValid,
+lowBattery flag, criticalBattery flag, buzzer e segundo atuador.
+
+Eventos estruturados: a Base envia kind em minúsculas e armazena o dicionário [APP] inteiro como
+uma string JSON no campo detail. Portanto campos de evento podem chegar à Central apenas como texto
+não estruturado, e somente os campos que o Gateway colocou no JSON.
+
+============================================================
+13. CENTRAL -> POSTGRESQL
+============================================================
+
+Endpoint: web/backend/routers/edge.py, batch_route, POST /api/edge/batch.
+Modelo: BatchIn -> BatchItemIn; data é dict[str, Any], sem modelo rígido por telemetria.
+Serviço: edge_service.process_batch -> _claim -> _store_telemetry/_store_event.
+Banco: Database usa schema_postgresql.sql quando DATABASE_URL é postgresql://.
+
+DADO ORIGINAL | JSON BASE | MODELO | TABELA/COLUNA POSTGRESQL | TIPO
+latitude | data.lat | dict Any | telemetry.lat; collars.last_lat | DOUBLE PRECISION
+longitude | data.lon | dict Any | telemetry.lon; collars.last_lon | DOUBLE PRECISION
+GPS válido | NÃO ENVIADO | — | NÃO IMPLEMENTADO | —
+satélites | data.satellites | dict Any | telemetry.satellites | INTEGER
+HDOP | data.hdop | dict Any | telemetry.hdop | DOUBLE PRECISION
+distanceBorder | NÃO ENVIADO | — | NÃO IMPLEMENTADO | —
+inside | reduzido a zone | dict Any | telemetry.zone; collars.last_zone | TEXT
+near | reduzido a zone | dict Any | telemetry.zone; collars.last_zone | TEXT
+veryNear | reduzido a zone | dict Any | telemetry.zone; collars.last_zone | TEXT
+battery | data.battery_pct | dict Any | telemetry.battery_pct; collars.battery_pct | INTEGER
+fenceVersion | data.fence_version | dict Any | telemetry.fence_version; collars.fence_version_reported | INTEGER
+RSSI | data.rssi | dict Any | telemetry.rssi; collars.rssi | INTEGER
+SNR | data.snr | dict Any | telemetry.snr; collars.snr | DOUBLE PRECISION
+sequence VFENCE | NÃO ENVIADO | — | NÃO IMPLEMENTADO | —
+timestamp | data.ts (Base) | dict Any | telemetry.ts; collars.last_seen | TEXT
+edge_seq | envelope | BatchItemIn.edge_seq int | telemetry.edge_seq/edge_items.edge_seq | BIGINT
+
+Eventos vão para events(base_id,edge_seq,collar_id,kind,zone,detail,ts). Dados específicos GNSS
+dos eventos não têm colunas próprias; quando presentes, ficam dentro de detail TEXT.
+
+Falha relevante: app/database.enqueue_delivery inclui detail para falhas locais, mas
+edge_service._apply_delivery não repassa data.detail a delivery.apply_report. Assim ACK_TIMEOUT,
+CRC_ERROR e detalhes semelhantes não são preservados como detail da entrega na Central; a Central
+só gera detail próprio para crc_missing/crc_mismatch.
+
+============================================================
+14. CAMINHO COMPLETO DE DADOS INDIVIDUAIS
+============================================================
+
+LATITUDE
+satélite/NEO-6M -> caracteres UART -> gps.encode -> gps.location.lat() double graus
+-> degreesToE7 int32 -> TelemetryPayload.position.lat -> 4 bytes BE -> LoRa
+-> Gateway readI32BE -> e7ToDegrees -> JSON latitude float -> USB Serial
+-> json.loads -> ParsedPacket.latitude -> SQLite telemetry.latitude REAL
+-> outbox data.lat -> HTTPS JSON -> BatchItemIn.data -> _store_telemetry
+-> PostgreSQL telemetry.lat DOUBLE PRECISION e collars.last_lat.
+
+LONGITUDE
+Mesmo fluxo da latitude usando gps.location.lng(), CoordinateE7.lon, longitude/data.lon,
+SQLite telemetry.longitude e PostgreSQL telemetry.lon/collars.last_lon.
+
+SATÉLITES
+gps.satellites.value() -> uint32 tratado -> clamp/uint8 ou 0xFF -> 1 byte
+-> Gateway inteiro/null -> JSON satellites -> Python int/None
+-> SQLite INTEGER -> outbox -> PostgreSQL telemetry.satellites INTEGER.
+
+HDOP
+gps.hdop.hdop() double -> x100+lround -> uint16/0xFFFF -> 2 bytes BE
+-> Gateway /100 e JSON float/null -> Python -> SQLite REAL
+-> outbox -> PostgreSQL DOUBLE PRECISION.
+
+RSSI
+NÃO passa pela coleira e NÃO vem do GNSS.
+SX1276 receptor no Gateway -> LoRa.packetRssi() int por pacote -> JSON rssi
+-> Python -> SQLite telemetry.rssi/collars.rssi REAL
+-> outbox -> PostgreSQL telemetry.rssi/collars.rssi INTEGER.
+
+SNR
+NÃO passa pela coleira e NÃO vem do GNSS.
+SX1276 receptor no Gateway -> LoRa.packetSnr() float por pacote
+-> Serial.print com 2 casas -> JSON snr -> Python float
+-> SQLite REAL -> outbox -> PostgreSQL DOUBLE PRECISION.
+
+============================================================
+15. INVENTÁRIO DE QUALIDADE DO ENLACE
+============================================================
+
+MÉTRICA | IMPLEMENTADA/ONDE | VARIÁVEL | PERSISTIDA? | BASE? | CENTRAL? | FPGA SEM MUDAR LoRa?
+RSSI | sim, Gateway pollLoRaReceive | int rssi/CollarState.lastRssi | SQLite telemetria | sim | sim | sim, já chega à Base
+SNR | sim, Gateway pollLoRaReceive | float snr/lastSnr | SQLite telemetria | sim | sim | sim
+sequence | sim, header uint16 | nextSequence/lastTelemetrySequence | SQLite local | sim | não | sim na Base
+TX count agregado | NÃO IMPLEMENTADO | — | não | não | não | não disponível
+RX count agregado | NÃO IMPLEMENTADO | — | não | não | não | não disponível
+ACK count | NÃO IMPLEMENTADO como contador | ACK é processado | não | não estruturado | não | exige instrumentação
+NACK count | NÃO IMPLEMENTADO como contador | NACK é processado | não | não estruturado | não | exige instrumentação
+retry count agregado | NÃO IMPLEMENTADO | transmissions existe por PendingReliableTx | não | não | não | só temporário no Gateway
+timeout count | NÃO IMPLEMENTADO | timers/limite existem | não | falha final pode virar ACK_TIMEOUT | detalhe se perde na Central | parcial
+duplicatas | detecção implementada | recentReliable[16] | não | não | não | não há contador
+lastSeen | implementado no Gateway | CollarState.lastSeenMs | não pelo status; Base tem chegada de telemetria | collar_status em memória | indiretamente | sim em memória
+online/offline | implementado no Gateway | seen/online | não no SQLite pelo status | sim em memória/event outbox | evento | sim
+CRC físico LoRa inválido | biblioteca CRC habilitada, contador NÃO IMPLEMENTADO | — | não | não | não | não disponível
+CRC da cerca | implementado | fenceTx.crc32/FenceAssembler | estado/delivery | resultado | delivery | não é PER do rádio
+MISSING_CHUNKS | implementado | NACK detail bitmap | não como métrica | fence_transfer em falha/reenvio | detalhe falha não preservado | parcial
+tempo envio->ACK | NÃO MEDIDO | nextActionMs é deadline, não latência | não | não | não | exige timestamp/medição
+
+Observação: lastTelemetrySequence existe, mas o próprio código alerta que a sequência é global por
+coleira e também é consumida por EVENT/CONTROL. Logo saltos entre telemetrias não provam perda.
+
+Há dois limites diferentes no repositório: o Gateway usa COLLAR_OFFLINE_TIMEOUT_MS=180000 (180 s)
+e efetivamente emite collar_state OFFLINE; app/config.py possui COLLAR_OFFLINE_SECONDS padrão 30,
+mas essa configuração da Base não é consumida por nenhuma lógica atual. Portanto o timeout efetivo
+de estado da coleira é o do Gateway, e o parâmetro Python está apenas reservado.
+
+============================================================
+16. "PEGAR DO BANCO PARA O FPGA"
+============================================================
+
+1. Primeiro ponto de disponibilidade na Raspberry:
+SerialReader.process_line/_process_gateway_app, no dict retornado por json.loads, antes do SQLite.
+
+2. Dados em memória antes do SQLite: SIM. O dict [APP] e o ParsedPacket existem em memória;
+_save_and_broadcast chama Database.save_packet depois da conversão.
+
+3. Enviar diretamente do processo Python ao FPGA futuramente: tecnicamente possível, pois o ponto
+de interceptação existe. NÃO IMPLEMENTADO: não há driver, SPI/UART/PCIe/GPIO, fila ou protocolo FPGA.
+
+4. Se a leitura fosse do SQLite:
+- telemetry: lat/lon/zone/satellites/hdop/rssi/snr/sequence/hora;
+- collars: último valor desses campos;
+- central_outbox, antes do ACK: também battery_pct/fence_version em data_json;
+- events: somente mudanças de zone;
+- não há distanceBorderM nem booleanos originais.
+
+5. PostgreSQL é remoto quando Central está na nuvem. Depender dele introduziria internet e ida/volta
+HTTPS, contrariando a autonomia local existente. Isso não decide a arquitetura, apenas registra o efeito.
+
+COMPARAÇÃO
+A) SerialReader/memória -> FPGA
+latência: menor; internet: nenhuma; complexidade: driver/fila novos; dados: conjunto [APP] completo,
+inclusive distanceBorderM antes do descarte; autonomia: preservada; histórico/replay: precisa ser criado.
+
+B) SQLite local -> FPGA
+latência: baixa/moderada; internet: nenhuma; complexidade: consultas/controle de cursor;
+dados: somente campos persistidos; autonomia: preservada; histórico: já existe; há perdas de campos.
+
+C) PostgreSQL/Central -> FPGA
+latência: maior e variável; internet: obrigatória; complexidade: autenticação/API/consulta;
+dados: campos do batch, sem sequence/distance/flags; autonomia: reduzida; histórico remoto disponível.
+
+ANÁLISE, NÃO DECISÃO DE ARQUITETURA.
+
+============================================================
+17. IMPORTANTE: NEM TODAS AS MÉTRICAS VÊM DO GPS
+============================================================
+
+GNSS:
+latitude, longitude, validade/atualização do fix, satellites, HDOP.
+
+GEOFENCING:
+inside, near, veryNear, distanceBorderM e zone derivada pela Base.
+
+LoRa/Gateway:
+RSSI, SNR e último instante em que qualquer pacote foi visto.
+
+PROTOCOLO:
+collarId, sequence, type/subtype, ACK_REQ, RETRY, URGENT, ACK, NACK,
+retry temporário, timeout de ACK, deduplicação e CRC da cerca.
+
+DISPOSITIVO/CONFIGURAÇÃO:
+batteryPct (atualmente indisponível), fenceVersion, buzzer, segundo atuador,
+resetReason (atualmente fixo), online/offline.
+
+PDR/PER não vêm do GPS e não são calculados no sistema atual.
+
+============================================================
+18. O QUE FALTA PARA PDR/PER
+============================================================
+
+PDR = RX/TX e PER = perdidos/enviados exigem denominador TX conhecido e definição clara de janela,
+origem/destino, tipo de pacote e tratamento de retransmissões.
+
+Já existe:
+- sequence uint16 por emissor;
+- indicador RETRY no header;
+- transmissions por mensagem confiável enquanto pendente;
+- ACK/NACK e timeout/retry para mensagens confiáveis;
+- deduplicação de até 16 EVENTs recentes no Gateway;
+- RSSI/SNR do pacote recebido.
+
+Não existe:
+- contador TX total por coleira/tipo/janela;
+- contador RX total válido/inválido;
+- contador de pacotes perdidos;
+- contadores ACK/NACK/retry/timeout/duplicata;
+- contagem de CRC físico rejeitado;
+- persistência e timestamps de envio/ACK;
+- identidade de sessão robusta além de DEVICE_STARTED/limpeza de histórico;
+- exposição estruturada dessas métricas à Base.
+
+Sequence sozinha não resolve: reinicia no boot, faz wrap em uint16 e é compartilhada por telemetria,
+eventos e controle. Uma lacuna entre duas telemetrias pode ser um evento válido, não perda.
+
+Pontos futuros onde seria tecnicamente possível instrumentar, sem implementação nesta tarefa:
+- transportSend/sendReliable/serviceReliableTx na coleira e Gateway para TX/retry/timeout;
+- pollLoRaReceive/processIncomingPacket no Gateway para RX válido/inválido;
+- acknowledgeReliable/rejectReliable/processEvent para ACK/NACK/duplicata;
+- uma nova mensagem [APP] de métricas ou extensão de status para a Base;
+- SQLite local para séries temporais. Nenhuma dessas extensões existe hoje.
+
+============================================================
+19. TRECHOS/LOCAIS QUE PROVAM A ANÁLISE
+============================================================
+
+GNSS UART:
+ARQUIVO: collar_config.h; VARIÁVEIS GPS_RX/GPS_BAUD.
+ARQUIVO: VFenceCollarLoRa.ino; OBJETOS gps/GPSserial; setup/loop.
+
+Conversão E7:
+ARQUIVO: vfence_protocol.cpp; FUNÇÕES degreesToE7/e7ToDegrees.
+
+Payload:
+ARQUIVO: vfence_protocol.h; STRUCT TelemetryPayload.
+ARQUIVO: vfence_protocol.cpp; FUNÇÕES encodeTelemetry/decodeTelemetry.
+
+Geofence:
+ARQUIVO: vfence_geofence.h/.cpp; CLASSE GeofenceEngine; FUNÇÃO analyze.
+
+RSSI/SNR:
+ARQUIVO: VFenceGateway.ino; FUNÇÃO pollLoRaReceive;
+EXPRESSÕES LoRa.packetRssi()/LoRa.packetSnr().
+
+Serial JSON:
+ARQUIVO: VFenceGateway.ino; FUNÇÕES processTelemetry/appPrintCoordinate/appPrintHdop.
+
+Base:
+ARQUIVO: app/serial_reader.py; CLASSE SerialReader;
+FUNÇÕES process_line/_parse_gateway_app/_telemetry_packet/_save_and_broadcast.
+
+SQLite/outbox:
+ARQUIVO: app/database.py; CLASSE Database; FUNÇÕES initialize/save_packet/_queue.
+
+Central/PostgreSQL:
+ARQUIVOS: schemas/edge.py, routers/edge.py, services/edge_service.py,
+schema_postgresql.sql; FUNÇÕES batch_route/process_batch/_store_telemetry.
+
+============================================================
+20. DOCUMENTAÇÃO DESATUALIZADA
+============================================================
+
+DOCUMENTAÇÃO DESATUALIZADA — gateway/VFenceGateway/README.md, aprox. linha 116.
+Afirmação antiga: a coleira ainda tinha transportSend simulando pela Serial e precisava receber LoRa.
+Código atual: geofence/VFenceCollarLoRa/VFenceCollarLoRa.ino já usa LoRa.beginPacket/write/endPacket.
+
+DOCUMENTAÇÃO DESATUALIZADA — README.md, integração Central, aprox. linhas 235-237.
+Afirmação antiga: Base envia comandos textuais PARAM/FENCE_* e aguarda linha humana de sucesso.
+Código atual: Base envia [CMD] JSON e aguarda command_response/fence_transfer estruturado por requestId.
+
+DOCUMENTAÇÃO DESATUALIZADA — GUIA_ESTUDO_RASPBERRY.md, seções 4.3, 17 e 18.
+Afirmação antiga: escrita Serial, cliente HTTPS, download, fragmentação, confirmação e sincronização
+ainda seriam futuras.
+Código atual: essas camadas estão implementadas em central_client.py, sync_service.py,
+serial_reader.py e Gateway; validação física ponta a ponta continua necessária.
+
+DOCUMENTAÇÃO DESATUALIZADA — web/docs/CONTRATO_BASE.md, seção 12.
+Afirmação antiga: conflito E6/E7 "precisa ser decidido", CRC firmware não implementado e zonas fixas.
+Código atual: Central/Base usam E6, Base envia graus, Gateway converte a E7, protocolo LoRa usa CRC E7,
+e margens são enviadas por SET_PARAMETERS/PARAMETERS. Os dois CRCs têm finalidades distintas.
+
+DOCUMENTAÇÃO PARCIALMENTE IMPRECISA — schemas/edge.py, docstring FenceForBaseOut.
+Afirma que Base, gateway e coleira trabalham apenas com micrograus. Código atual: resposta Central e
+SQLite local usam E6; Base converte para graus decimais na Serial; Gateway/coleira usam E7.
+
+============================================================
+21. RESUMO PARA DISCUSSÃO COM O GRUPO
+============================================================
+
+A) GNSS usado: lat, lon, validade/atualização, satélites e HDOP. Sem altitude, velocidade, curso,
+data/hora ou NMEA persistida.
+
+B) Geofencing: inside, distância à borda e proximidade FAR/NEAR/VERY_NEAR; Base deriva cinco zonas.
+
+C) LoRa disponível: RSSI e SNR por pacote no Gateway; parâmetros de rádio fixos/configurados.
+
+D) Protocolo: sequence, flags, ACK/NACK, retry temporário, deduplicação de EVENT e erros de cerca.
+
+E) Gateway recebe payload binário com posição/geofence/dispositivo e acrescenta RSSI/SNR.
+
+F) Base recebe JSON estruturado. Antes do SQLite, possui distanceBorder e booleanos; depois os reduz.
+
+G) SQLite guarda lat/lon/zone/satélites/HDOP/RSSI/SNR/sequence/raw e horários de chegada.
+Battery/fenceVersion ficam só na outbox enquanto pendentes.
+
+H) Central/PostgreSQL recebe lat/lon/zone/satélites/HDOP/bateria/fenceVersion/RSSI/SNR.
+Não recebe sequence, distanceBorder ou flags originais.
+
+I) Somente em memória: NMEA sendo parseada; GeofenceResult double; contadores transmissions por
+mensagem; bitmap/duplicatas; lastSeen do Gateway; collar_status; dict [APP] completo.
+
+J) Candidatos naturais existentes para estudo futuro, sem decisão: lat/lon, satélites, HDOP,
+distanceBorder, zona/flags, RSSI, SNR, sequence, retry/ACK/timeout quando instrumentados.
+
+K) Falta instrumentar: TX/RX totals, perdas, ACK/NACK/retry/timeout/duplicata agregados, latência ACK,
+CRC físico rejeitado, sessões/janelas e persistência dos campos descartados.
+
+============================================================
+22. DIAGRAMA ASCII FINAL
+============================================================
+
+GNSS NEO-6M
+    | caracteres UART1, 115200 8N1, RX GPIO23
+    | formato esperado pelo TinyGPSPlus; bruto não armazenado
+    v
+ESP32 COLEIRA
+    | gps.location -> double graus
+    | degreesToE7 -> int32; HDOP x100; sat uint8
+    | geofence -> inside/proximity/distance
+    |
+    | VFENCE v1: bytes binários, header 5 + payload
+    v
+LoRa SX1276 915 MHz
+    |
+    v
+ESP32 GATEWAY
+    | decodePacket/decodeTelemetry
+    | acrescenta RSSI(int dBm) e SNR(float dB) por pacote
+    | E7 -> graus; sentinelas -> null; flags -> bool
+    |
+    | USB Serial 115200, UTF-8, uma linha:
+    | [APP] {schema,kind:"telemetry",...}\n
+    v
+BASE PYTHON / SerialReader
+    | json.loads -> dict -> ParsedPacket
+    | bools -> zone; distanceBorder descartado
+    |
+    +--> memória/WebSocket (dados do ParsedPacket)
+    |
+    +--> SQLite local
+    |    telemetry/collars: lat,lon,zone,sat,hdop,rssi,snr,sequence
+    |    central_outbox: + battery,fenceVersion; - sequence/distance/flags
+    |
+    +--> HTTPS POST /api/edge/batch
+             envelope edge_seq/type/data
+             v
+         VFENCE CENTRAL / FastAPI
+             | BatchIn -> process_batch -> _store_telemetry
+             v
+         PostgreSQL
+             telemetry/collars: lat,lon,zone,sat,hdop,battery,
+             fenceVersion,rssi,snr; sem sequence/distance/flags
+
+FPGA: NÃO IMPLEMENTADO em nenhum ponto do diagrama atual.
+
+============================================================
+23. CONFERÊNCIA FINAL E PONTOS INCONCLUSIVOS
+============================================================
+
+Confirmado no working tree atual:
+- firmware ativo e protótipos foram diferenciados;
+- nomes, offsets, tamanhos, tipos e unidades do payload foram conferidos no encoder/decoder;
+- hashes confirmam protocolo ativo idêntico em coleira e Gateway;
+- RSSI/SNR são criados no Gateway, após leitura do pacote LoRa;
+- schemas SQLite local e PostgreSQL foram confrontados com os INSERTs;
+- o batch real foi seguido até _store_telemetry;
+- mudanças locais não commitadas em serial_reader.py/Gateway foram consideradas.
+
+Pontos inconclusivos por ausência de evidência no repositório:
+1. Sentenças NMEA exatas e configuração interna real do módulo NEO-6M físico.
+2. Versão exata da biblioteca TinyGPSPlus instalada e todas as APIs disponíveis nessa versão.
+3. Comportamento/precisão reais de RSSI/SNR do hardware sem ensaio de bancada.
+4. Funcionamento ponta a ponta em hardware do novo protocolo Serial ainda depende de compilar/gravar
+   o firmware e testar com ESPs/LoRa reais.
+5. Testes PostgreSQL reais dependem de TEST_DATABASE_URL externo; schema/código foram auditados.
+6. Interface, clock, protocolo e papel do FPGA: NÃO IMPLEMENTADOS e ainda não definidos.
+
+FIM DA AUDITORIA

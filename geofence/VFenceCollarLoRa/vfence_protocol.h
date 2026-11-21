@@ -42,7 +42,8 @@ enum class EventSubtype : uint8_t {
 };
 
 enum class TelemetrySubtype : uint8_t {
-  POSITION_STATUS = 0x01
+  POSITION_STATUS = 0x01,
+  HDOP_WINDOW_SUMMARY = 0x02
 };
 
 enum class ControlSubtype : uint8_t {
@@ -149,6 +150,20 @@ struct TelemetryPayload {
   uint16_t fenceVersion;
 };
 
+static const uint16_t HDOP_SUMMARY_WINDOW_MS = 60000;
+static const uint8_t HDOP_SUMMARY_MAX_SAMPLES = 60;
+static const uint8_t HDOP_SUMMARY_PAYLOAD_SIZE = 27;
+
+struct HdopSummaryPayload {
+  uint64_t sessionId;
+  uint64_t windowId;
+  uint32_t startedAtMs;
+  uint16_t durationMs;
+  uint16_t hdopMeanX100;
+  uint8_t hdopSampleCount;
+  bool hdopMeanValid;
+};
+
 struct AckPayload {
   uint16_t ackedSequence;
   uint8_t status;
@@ -243,6 +258,10 @@ size_t encodeTelemetry(uint8_t* out, size_t capacity,
                        uint8_t collarId, uint16_t sequence,
                        const TelemetryPayload& data);
 
+size_t encodeHdopSummary(uint8_t* out, size_t capacity,
+                         uint8_t collarId, uint16_t sequence,
+                         const HdopSummaryPayload& data);
+
 // CONTROL
 size_t encodeAck(uint8_t* out, size_t capacity,
                  uint8_t collarId, uint16_t sequence,
@@ -277,6 +296,7 @@ bool decodeGpsRecovered(const PacketView& packet, GpsRecoveredPayload& out);
 bool decodeBatteryEvent(const PacketView& packet, BatteryEventPayload& out);
 bool decodeDeviceStarted(const PacketView& packet, DeviceStartedPayload& out);
 bool decodeTelemetry(const PacketView& packet, TelemetryPayload& out);
+bool decodeHdopSummary(const PacketView& packet, HdopSummaryPayload& out);
 bool decodeAck(const PacketView& packet, AckPayload& out);
 bool decodeNack(const PacketView& packet, NackPayload& out);
 bool decodePingPong(const PacketView& packet, uint16_t& token);

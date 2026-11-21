@@ -1,0 +1,689 @@
+AUDITORIA TÉCNICA — CONFIGURAÇÕES ATUAIS DO ENLACE LoRa VFENCE
+Data: 27/10/2026
+Fonte de verdade: working tree atual, incluindo alterações locais não commitadas.
+Escopo: somente análise. Nenhum parâmetro ou código foi alterado.
+
+LEGENDA
+IMPLEMENTADA: existe caminho executável no firmware atual.
+PARCIAL: existe somente durante uma operação, em logs ou sem persistência/contagem agregada.
+NÃO IMPLEMENTADA: não foi encontrado mecanismo correspondente.
+NÃO COMPROVADO PELO CÓDIGO: depende da biblioteca externa, hardware ou ensaio físico não incluído.
+
+CONCLUSÃO EXECUTIVA
+
+A hipótese apresentada está CONFIRMADA pelo código executável dos dois lados:
+
+- frequência: 915.000.000 Hz = 915 MHz;
+- spreading factor: SF7;
+- bandwidth: 125.000 Hz = 125 kHz;
+- coding rate: LoRa.setCodingRate4(5), isto é, 4/5;
+- preâmbulo: 8 símbolos;
+- sync word: 0x12;
+- potência TX solicitada à biblioteca: 14 dBm;
+- CRC físico LoRa: habilitado com LoRa.enableCrc().
+
+Gateway e coleira usam as mesmas constantes e as mesmas chamadas de inicialização. Não existe
+SET_RADIO, PROFILE_CHANGE, PROFILE_ACK ou mudança dinâmica de SF/BW/CR/potência. Hoje uma alteração
+manual exige editar os headers de configuração, recompilar e gravar ambos os ESP32.
+
+O resultado de campo informado pela equipe — perdas consideráveis por volta de 500 m — é aceito
+somente como observação preliminar. O repositório não contém dados suficientes para atribuir a causa
+ao software, ao perfil LoRa ou ao conjunto físico de antenas/instalação.
+
+============================================================
+1. MAPA DOS ARQUIVOS LoRa
+============================================================
+
+ARQUIVO: gateway/VFenceGateway/gateway_config.h
+FINALIDADE: configuração de hardware, PHY LoRa e confiabilidade Gateway -> coleira.
+CONFIGURAÇÕES: frequência, pinos SPI/SX1276, SF, BW, CR, preâmbulo, sync word, TX power,
+timeout offline, máximo de transmissões, timeout ACK e jitter.
+FUNÇÕES: não contém funções; fornece constantes para VFenceGateway.ino.
+LADO: GATEWAY.
+
+ARQUIVO: gateway/VFenceGateway/VFenceGateway.ino
+FINALIDADE: inicializar SX1276, transmitir/receber bytes VFENCE, medir RSSI/SNR,
+gerenciar ACK/NACK/retry, deduplicação e transferência de cerca.
+CONFIGURAÇÕES APLICADAS: todas as LORA_* de gateway_config.h.
+FUNÇÕES: initLoRa, transportSend, pollLoRaReceive, sendReliable, serviceReliableTx,
+acknowledgeReliable, rejectReliable, processIncomingPacket, processTelemetry,
+processEvent, processControl, serviceFenceTransfer, emitRadioConfig.
+LADO: GATEWAY.
+
+ARQUIVO: geofence/VFenceCollarLoRa/collar_config.h
+FINALIDADE: identidade da coleira, GNSS e configuração PHY/pinos LoRa.
+CONFIGURAÇÕES: frequência, SPI, SF, BW, CR, preâmbulo, sync word e TX power.
+FUNÇÕES: não contém funções; fornece constantes ao firmware.
+LADO: COLEIRA.
+
+ARQUIVO: geofence/VFenceCollarLoRa/VFenceCollarLoRa.ino
+FINALIDADE: inicializar SX1276, transmitir telemetria/eventos, receber configurações/cerca,
+responder ACK/NACK/PONG e executar retries.
+CONFIGURAÇÕES APLICADAS: LORA_* do collar_config.h; ACK/retry locais.
+FUNÇÕES: initLoRa, transportSend, pollLoRaReceive, sendReliable, serviceReliableTx,
+sendTelemetryPacket, processIncomingPacket, sendAckResponse, sendNackResponse.
+LADO: COLEIRA.
+
+ARQUIVOS: gateway/VFenceGateway/vfence_protocol.h/.cpp
+ARQUIVOS: geofence/VFenceCollarLoRa/vfence_protocol.h/.cpp
+FINALIDADE: wire format binário compartilhado, header, tamanhos, flags, encode/decode e CRC da cerca.
+CONFIGURAÇÕES: HEADER_SIZE=5, MAX_PACKET_SIZE=64, POINTS_PER_CHUNK=2,
+FLAG_ACK_REQ=0x08, FLAG_RETRY=0x04.
+FUNÇÕES: encodeHeader/decodePacket, encode/decodeTelemetry, eventos, ACK/NACK,
+PING/PONG, PARAMETERS e FENCE_*.
+LADO: COMPARTILHADO. Os hashes dos arquivos ativos são iguais.
+
+ARQUIVOS: geofence/VFenceCollarLoRa/vfence_fence_transfer.h/.cpp
+FINALIDADE: montagem de chunks, bitmap de ausentes e validação CRC da cerca.
+CONFIGURAÇÕES: MAX_VERTICES=32, MAX_CHUNKS=16, 2 pontos por chunk.
+FUNÇÕES: begin, addChunk, missingBitmap, validateCommit.
+LADO: COLEIRA/PROTOCOLO DE CONFIGURAÇÃO.
+
+ARQUIVO: gateway/VFenceGateway/README.md
+ARQUIVO: geofence/VFenceCollarLoRa/README.md
+FINALIDADE: documentação dos firmwares. Valores PHY coincidem com o código, salvo divergência
+histórica específica registrada na seção 21.
+LADO: DOCUMENTAÇÃO.
+
+ARQUIVOS: Testelora/sender/sender.ino e Testelora/receiver/receiver.ino
+FINALIDADE: teste antigo textual VFENCE_TESTE_N.
+CONFIGURAÇÕES: 915 MHz e mesma pinagem; sender usa potência 5 dBm e não configura o perfil completo.
+LADO: PROTÓTIPO/TESTE, NÃO É O FIRMWARE VFENCE ATIVO.
+
+ARQUIVO: geofence/vfence.ino
+FINALIDADE: protótipo de GNSS/geofence sem transporte LoRa ativo.
+LADO: PROTÓTIPO, NÃO É O FIRMWARE LoRa ATIVO.
+
+ARQUIVO: app/serial_reader.py
+FINALIDADE: Base envia GET_RADIO e recebe kind=radio_config; não configura o rádio.
+LADO: RASPBERRY/OBSERVAÇÃO.
+
+ARQUIVO: vfence_pc_serial.py
+FINALIDADE: cliente de referência que consulta GET_RADIO; não muda PHY.
+LADO: FERRAMENTA DE REFERÊNCIA.
+
+ARQUIVOS: tests/test_gateway_serial.py e tests/test_central_integration.py
+FINALIDADE: validam contrato Serial, não o alcance nem o PHY real.
+LADO: TESTES SEM HARDWARE.
+
+============================================================
+2. CONFIGURAÇÃO ATUAL DO RÁDIO
+============================================================
+
+PARÂMETRO | GATEWAY | COLEIRA | IGUAIS? | ARQUIVO/CONSTANTE
+frequência | 915000000 Hz (915 MHz) | 915000000 Hz | sim | gateway_config.h/collar_config.h: LORA_FREQUENCY_HZ
+SF | 7 | 7 | sim | LORA_SPREADING_FACTOR
+BW | 125000 Hz (125 kHz) | 125000 Hz | sim | LORA_SIGNAL_BANDWIDTH
+CR | 4/5 | 4/5 | sim | LORA_CODING_RATE_DENOMINATOR=5
+TX power | 14 dBm solicitado | 14 dBm solicitado | sim | LORA_TX_POWER_DBM
+preâmbulo | 8 | 8 | sim | LORA_PREAMBLE_LENGTH
+sync word | 0x12 | 0x12 | sim | LORA_SYNC_WORD
+CRC PHY | ligado | ligado | sim | LoRa.enableCrc()
+pinos SPI/SX1276 | 5/19/27/18/14/26 | iguais | sim | LORA_SCK/MISO/MOSI/SS/RST/DIO0
+modo RX após init/TX | LoRa.receive() | LoRa.receive() | sim | initLoRa/transportSend
+
+GAIN/LNA: não há chamada LoRa.setGain nem escrita direta de registrador. NÃO CONFIGURADO
+EXPLICITAMENTE. Comportamento automático/default pertence à biblioteca e NÃO É COMPROVADO PELO CÓDIGO.
+
+IQ INVERSION: não há enableInvertIQ/disableInvertIQ nem escrita equivalente. NÃO CONFIGURADO
+EXPLICITAMENTE; ambos usam o mesmo comportamento default da biblioteca.
+
+AGC: não há chamada/configuração explícita no projeto. Comportamento da biblioteca/chip:
+NÃO COMPROVADO PELO CÓDIGO do repositório.
+
+LOW DATA RATE OPTIMIZATION: não existe chamada ou bit configurado diretamente pelo projeto.
+Se a biblioteca ajusta esse recurso internamente, isso NÃO É COMPROVADO PELO CÓDIGO porque o fonte
+da versão instalada de LoRa by Sandeep Mistry não está no repositório.
+
+Outros parâmetros não definidos explicitamente: header implícito/explícito, frequência de hopping,
+limite de corrente, boost de LNA, ramp e SPI clock. O comportamento efetivo vem do default da
+biblioteca/chip e deve ser confirmado na versão instalada antes de uma auditoria de registradores.
+
+============================================================
+3. ONDE O RÁDIO É CONFIGURADO
+============================================================
+
+GATEWAY
+ARQUIVO: gateway/VFenceGateway/gateway_config.h, linhas aproximadas 10-26.
+ARQUIVO: gateway/VFenceGateway/VFenceGateway.ino, initLoRa, linhas 216-232.
+
+- LORA_FREQUENCY_HZ -> LoRa.begin(LORA_FREQUENCY_HZ)
+- LORA_SPREADING_FACTOR -> LoRa.setSpreadingFactor(...)
+- LORA_SIGNAL_BANDWIDTH -> LoRa.setSignalBandwidth(...)
+- LORA_CODING_RATE_DENOMINATOR -> LoRa.setCodingRate4(...)
+- LORA_PREAMBLE_LENGTH -> LoRa.setPreambleLength(...)
+- LORA_SYNC_WORD -> LoRa.setSyncWord(...)
+- LORA_TX_POWER_DBM -> LoRa.setTxPower(...)
+- CRC -> LoRa.enableCrc()
+- recepção -> LoRa.receive()
+
+COLEIRA
+ARQUIVO: geofence/VFenceCollarLoRa/collar_config.h, linhas aproximadas 17-31.
+ARQUIVO: geofence/VFenceCollarLoRa/VFenceCollarLoRa.ino, initLoRa, linhas 123-139.
+As chamadas são as mesmas e na mesma ordem lógica.
+
+Nenhum desses setters é chamado novamente após initLoRa durante a operação normal.
+
+============================================================
+4. COMPARAÇÃO GATEWAY X COLEIRA
+============================================================
+
+Parâmetros que precisam ser compatíveis para decodificação confiável neste projeto:
+- frequência;
+- spreading factor;
+- bandwidth;
+- coding rate;
+- sync word;
+- modo de CRC;
+- modo de header e inversão IQ, embora o projeto deixe ambos nos mesmos defaults;
+- preâmbulo deve ser coordenado para o comportamento esperado.
+
+Parâmetros que podem diferir sem tornar a modulação incompatível:
+- TX power, pois afeta o transmissor daquela direção;
+- ganho/LNA/AGC do receptor, se configurados;
+- pinos SPI, quando placas diferentes exigirem pinagem diferente;
+- identidade collarId, sequence, payload e temporização da aplicação.
+
+Se mudar somente o Gateway:
+- SF/BW/CR/frequência/sync incompatíveis impedem ou tornam improvável a demodulação mútua;
+- a coleira não recebe CONFIG/PING/ACK; o Gateway não recebe telemetria/eventos;
+- mensagens confiáveis entram em retry e terminam em timeout;
+- a coleira pode ficar marcada offline após 180 s no Gateway.
+
+Se mudar somente a coleira: resultado simétrico; uplink e downlink deixam de se entender.
+
+Coordenação dinâmica de mudança: NÃO IMPLEMENTADA ATUALMENTE.
+PROFILE_CHANGE: NÃO IMPLEMENTADO ATUALMENTE.
+PROFILE_ACK: NÃO IMPLEMENTADO ATUALMENTE.
+Mudança de SF em runtime: NÃO IMPLEMENTADA ATUALMENTE.
+Mudança de BW em runtime: NÃO IMPLEMENTADA ATUALMENTE.
+Mudança de CR em runtime: NÃO IMPLEMENTADA ATUALMENTE.
+Mudança de TX power em runtime: NÃO IMPLEMENTADA ATUALMENTE.
+
+GET_RADIO/radio_config são somente leitura. SET_PARAMETERS altera margens de geofencing,
+intervalo de telemetria, timeout GPS e limiares de bateria; não altera o PHY LoRa.
+
+============================================================
+5. INICIALIZAÇÃO DO SX1276 E PINAGEM
+============================================================
+
+Fluxo real em ambos:
+setup
+-> initLoRa
+-> SPI.begin(SCK,MISO,MOSI,SS)
+-> LoRa.setPins(SS,RST,DIO0)
+-> LoRa.begin(915000000)
+-> setters SF/BW/CR/preâmbulo/sync/TX
+-> LoRa.enableCrc
+-> LoRa.receive
+-> rádio pronto; falha em LoRa.begin causa loop fatal.
+
+SINAL | GPIO GATEWAY | GPIO COLEIRA | FUNÇÃO
+SCK | 5 | 5 | SPI.begin
+MISO | 19 | 19 | SPI.begin
+MOSI | 27 | 27 | SPI.begin
+NSS/CS/SS | 18 | 18 | SPI.begin + LoRa.setPins
+RESET | 14 | 14 | LoRa.setPins
+DIO0 | 26 | 26 | LoRa.setPins
+
+As duas placas estão configuradas para Heltec WiFi LoRa 32 V2/SX1276 com a mesma pinagem.
+
+============================================================
+6. TAMANHO E TIPO DOS PACOTES
+============================================================
+
+Wire format: binário, big-endian, MAX_PACKET_SIZE=64, HEADER_SIZE=5.
+Tamanho total = 5 + payloadLength.
+
+TIPO | TOTAL BYTES | ACK_REQ? | RETRY? | PERIODICIDADE/GATILHO
+POSITION_STATUS | 23 | não | não | 10..13 s padrão
+ACK | 9 | não | não | resposta a pacote confiável
+NACK | 11 | não | não | erro em pacote confiável/configuração
+OUTSIDE | 22 | sim | até 4 transmissões | transição para fora
+BACK_INSIDE | 22 | sim | até 4 transmissões | retorno para dentro
+GPS_LOST | 16 | sim | até 4 transmissões | timeout GPS
+GPS_RECOVERED | 17 | sim | até 4 transmissões | recuperação GPS
+LOW_BATTERY | 17 | sim | até 4; produtor não ativo | não produzido hoje
+CRITICAL_BATTERY | 17 | sim | até 4; produtor não ativo | não produzido hoje
+DEVICE_STARTED | 10 | sim | até 4 transmissões | boot
+FENCE_BEGIN | 14 | sim | até 4 transmissões | envio de cerca
+FENCE_CHUNK, 1 ponto | 19 | não por chunk | reenvio seletivo | envio de cerca
+FENCE_CHUNK, 2 pontos | 27 | não por chunk | reenvio seletivo | envio de cerca
+FENCE_COMMIT | 12 | sim | até 4 transmissões | fim da cerca
+PARAMETERS | 18 | sim | até 4 transmissões | configuração remota
+PING | 8 | não | não | comando/diagnóstico
+PONG | 8 | não | não | resposta ao PING
+
+FENCE_CHUNK varia: payload=6+(8 x pointCount), com 1 ou 2 pontos. Não usa ACK individual.
+O FENCE_COMMIT permite à coleira responder NACK MISSING_CHUNKS com bitmap; o Gateway reenvia
+somente chunks ausentes e envia novo COMMIT. Isso é retransmissão seletiva da cerca, diferente da
+fila genérica ACK_REQ/retry.
+
+============================================================
+7. TELEMETRIA ATUAL
+============================================================
+
+Parâmetro padrão: params.telemetryIntervalS=10 s.
+scheduleNextTelemetry: próximo envio = millis + 10.000 ms + random(0,3001).
+Intervalo nominal: 10 a 13 segundos, média aproximada 11,5 s se o random for uniforme.
+Estimativa: cerca de 60/11,5 = 5,2 telemetrias por minuto por coleira.
+Faixa teórica pelo agendamento: aproximadamente 4,6 a 6 por minuto.
+Eventos, boot e respostas de controle são tráfego adicional.
+
+POSITION_STATUS não define ACK_REQ, não entra em sendReliable e não é retransmitido.
+sequence é uint16 global da coleira, incrementado também por eventos/controle; reinicia no boot
+e naturalmente faz wrap. transportSend usa LoRa.beginPacket/write/endPacket e volta a receive.
+
+============================================================
+8. ACK, TIMEOUT E RETRANSMISSÃO
+============================================================
+
+PARÂMETRO | VALOR | GATEWAY | COLEIRA
+ACK timeout | 5000 ms | gateway_config.h ACK_TIMEOUT_MS | VFenceCollarLoRa.ino ACK_TIMEOUT_MS
+retry jitter | random 0..2000 ms | RETRY_JITTER_MS | RETRY_JITTER_MS
+próxima tentativa | 5..7 s após envio/tentativa | scheduleRetryFromNow | scheduleRetryFromNow
+máximo total | 4 transmissões | MAX_TRANSMISSIONS=4 | MAX_TRANSMISSIONS=4
+retries adicionais | até 3 | transmissions começa em 1 | igual
+ACK_REQ | bit 0x08 | FLAG_ACK_REQ | igual
+RETRY | bit 0x04 | FLAG_RETRY | igual
+fila confiável | 8 entradas | MAX_PENDING_RELIABLE=8 | igual
+histórico dedup EVENT | 16 sequences/coleira | MAX_RECENT_RELIABLE=16 | n/a
+offline | 180000 ms | COLLAR_OFFLINE_TIMEOUT_MS | n/a
+
+Ao reenviar, o mesmo sequence é mantido e tx.packet[0] recebe FLAG_RETRY.
+Gateway deduplica EVENT confiável por collarId+sequence e reenvia ACK sem processar novamente.
+DEVICE_STARTED original limpa o histórico de sessão. A montagem de cerca também reconhece chunk
+duplicado idêntico e rejeita duplicata diferente.
+
+Não existem contadores agregados de ACK, NACK, retry, timeout ou duplicatas.
+
+============================================================
+9. RSSI E SNR
+============================================================
+
+Biblioteca: LoRa by Sandeep Mistry.
+Local de medição: receptor, depois de drenar cada pacote físico em pollLoRaReceive.
+RSSI: const int rssi = LoRa.packetRssi(); exibido em dBm.
+SNR: const float snr = LoRa.packetSnr(); exibido em dB.
+
+São obtidos para todo pacote físico recebido pelo Gateway antes da classificação TELEMETRY/EVENT/
+CONTROL. markCollarSeen guarda o último RSSI/SNR para qualquer pacote com header/collarId válido.
+
+Preservação atual por tipo:
+- TELEMETRY: preservados no JSON [APP], SQLite local e Central/PostgreSQL.
+- EVENT: medidos e atualizam CollarState.lastRssi/lastSnr, mas não entram no JSON do evento;
+  podem aparecer depois em GET_STATUS/collar_status como último valor, sem vínculo histórico.
+- ACK/NACK/PONG: medidos e atualizam o último valor, mas não são persistidos/associados ao pacote.
+- CONFIG recebido da coleira: não esperado; métricas não são preservadas historicamente.
+- Pacotes enviados pelo Gateway: não há RSSI/SNR no transmissor.
+- Coleira também chama packetRssi/packetSnr ao receber, mas apenas imprime log humano; não envia
+  essas métricas à Base.
+
+Portanto os testes atuais têm histórico de RSSI/SNR apenas para telemetria de uplink.
+
+============================================================
+10. LIMITES ATUAIS DA ANÁLISE DE ALCANCE
+============================================================
+
+MÉTRICA | STATUS | EVIDÊNCIA
+TX total | NÃO IMPLEMENTADA | não existe contador agregado em transportSend
+RX total | NÃO IMPLEMENTADA | não existe contador agregado em pollLoRaReceive
+pacotes perdidos | NÃO IMPLEMENTADA | sequence global não basta
+PDR | NÃO IMPLEMENTADA | falta TX/RX por janela
+PER | NÃO IMPLEMENTADA | falta enviados/perdidos e CRC rejeitado
+ACK count | NÃO IMPLEMENTADA | ACK é processado, não contado
+NACK count | NÃO IMPLEMENTADA | NACK é processado, não contado
+retry count | PARCIAL | transmissions existe apenas enquanto PendingReliableTx está ativo
+timeout count | NÃO IMPLEMENTADA | timeout causa log/falha, sem contador
+RSSI médio | NÃO IMPLEMENTADA | só amostras de telemetria/último valor
+RSSI mínimo/máximo | NÃO IMPLEMENTADA | sem agregador
+SNR médio | NÃO IMPLEMENTADA | sem agregador
+SNR mínimo/máximo | NÃO IMPLEMENTADA | sem agregador
+latência | NÃO IMPLEMENTADA | nenhum timestamp envio/recepção correlacionado
+RTT PING/ACK | NÃO IMPLEMENTADA | token/sequence existe, tempo não é medido
+CRC físico rejeitado | NÃO IMPLEMENTADA | CRC está ligado, rejeições não são contadas/expostas
+duplicatas | PARCIAL | detectadas em RAM/log, sem contador
+MISSING_CHUNKS | PARCIAL | bitmap/reenvio existe, sem série estatística
+
+Não é possível calcular PDR/PER científico com o código atual. Saltos de sequence de telemetria
+podem ser eventos/controle e a telemetria não possui ACK/retry.
+
+============================================================
+11. ONDE ALTERAR AS CONFIGURAÇÕES
+============================================================
+
+PARÂMETRO | ARQUIVO GATEWAY | ARQUIVO COLEIRA | CONSTANTE | FUNÇÃO | RECOMPILAR? | AMBOS? | RUNTIME?
+SF | gateway_config.h | collar_config.h | LORA_SPREADING_FACTOR | initLoRa/setSpreadingFactor | sim | sim | não
+BW | gateway_config.h | collar_config.h | LORA_SIGNAL_BANDWIDTH | setSignalBandwidth | sim | sim | não
+CR | gateway_config.h | collar_config.h | LORA_CODING_RATE_DENOMINATOR | setCodingRate4 | sim | sim | não
+TX power | gateway_config.h | collar_config.h | LORA_TX_POWER_DBM | setTxPower | sim | não tecnicamente; sim para teste simétrico | não
+preâmbulo | gateway_config.h | collar_config.h | LORA_PREAMBLE_LENGTH | setPreambleLength | sim | coordenar ambos | não
+sync word | gateway_config.h | collar_config.h | LORA_SYNC_WORD | setSyncWord | sim | sim | não
+frequência | gateway_config.h | collar_config.h | LORA_FREQUENCY_HZ | LoRa.begin | sim | sim | não
+CRC | VFenceGateway.ino | VFenceCollarLoRa.ino | sem constante; chamada direta | LoRa.enableCrc | sim | sim | não
+
+Para teste manual SF8/SF9/SF10, os únicos valores a editar são LORA_SPREADING_FACTOR nos dois
+headers ativos, mantendo os demais constantes. Depois é necessário recompilar/gravar os dois ESP32.
+
+============================================================
+12. FLUXO DE UMA ALTERAÇÃO MANUAL HOJE
+============================================================
+
+1. Registrar hash/versão dos firmwares e o perfil atual SF7.
+2. Editar LORA_SPREADING_FACTOR no gateway_config.h.
+3. Editar o mesmo valor em collar_config.h.
+4. Manter frequência, BW, CR, TX, preâmbulo, sync e CRC constantes.
+5. Compilar VFenceGateway.ino para a placa Gateway.
+6. Compilar VFenceCollarLoRa.ino para a placa coleira.
+7. Gravar os dois ESP32.
+8. Conferir o log printRadioConfig em ambos e GET_RADIO no Gateway.
+9. Fazer teste curto de bancada antes do campo.
+10. Executar o mesmo roteiro/distâncias/duração do perfil anterior.
+11. Registrar amostras e perdas externamente; os contadores necessários ainda não existem no firmware.
+12. Voltar ao perfil conhecido antes de trocar outra variável.
+
+============================================================
+13. É POSSÍVEL ALTERAR SEM REGRAVAR?
+============================================================
+
+Resposta: NÃO.
+
+Prova no código:
+- initLoRa aplica todos os setters apenas no startup;
+- processJsonCommand suporta GET_STATUS, GET_RADIO, PING, SET_PARAMETERS, FENCE_NEW,
+  FENCE_POINT, FENCE_SEND e FENCE_CANCEL; não há SET_RADIO;
+- emitRadioConfig somente informa constantes compiladas;
+- PARAMETERS contém muitoPertoM, pertoM, telemetryIntervalS, gpsTimeoutS,
+  lowBatteryPct e criticalBatteryPct; nenhum campo PHY;
+- NVS da coleira guarda cerca e ParametersPayload, não perfil LoRa;
+- não existe PROFILE_CHANGE/PROFILE_ACK.
+
+SET_PARAMETERS pode alterar frequência de geração de telemetria (intervalo), mas não SF/BW/CR,
+frequência, potência, preâmbulo, sync word ou CRC do rádio.
+
+============================================================
+14. EFEITO ESPERADO DOS PARÂMETROS
+============================================================
+
+CONHECIMENTO TÉCNICO GERAL — NÃO É RESULTADO DO CÓDIGO
+
+SF: aumentar SF tende a elevar sensibilidade/robustez e tempo no ar, reduzindo taxa útil e aumentando
+ocupação/consumo por pacote. Não garante alcance específico.
+
+BW: bandwidth menor tende a aumentar sensibilidade e tempo no ar; maior tende a elevar taxa e reduzir
+tempo no ar, com menor sensibilidade. Interferência e estabilidade de oscilador também importam.
+
+CR: maior redundância pode melhorar tolerância a erros, ao custo de airtime e capacidade.
+
+TX POWER: potência solicitada maior pode melhorar orçamento de enlace, mas aumenta consumo e pode
+ser limitada pelo módulo, alimentação, PA, antena e regulamentação aplicável.
+
+PREÂMBULO: ajuda detecção/sincronização do pacote; maior preâmbulo aumenta airtime.
+
+FREQUÊNCIA: define canal/faixa, propagação, antena adequada e regras regulatórias.
+
+Nenhum desses efeitos permite prometer distância sem ensaio controlado.
+
+============================================================
+15. PERFIS EXPERIMENTAIS FUTUROS — SEM ALTERAÇÃO DO CÓDIGO
+============================================================
+
+PERFIL 0 (baseline): SF7, BW125, CR4/5, TX14, preâmbulo8, sync0x12, 915 MHz, CRC ON.
+PERFIL 1 candidato: SF8, todos os demais parâmetros iguais.
+PERFIL 2 candidato: SF9, todos os demais parâmetros iguais.
+PERFIL 3 candidato: SF10, todos os demais parâmetros iguais.
+
+A biblioteca fonte não está vendorizada e o repositório não declara a faixa aceita por
+setSpreadingFactor. Logo o suporte formal a SF8/SF9/SF10 é NÃO COMPROVADO PELO CÓDIGO LOCAL,
+embora sejam os perfis pretendidos pela equipe e compatíveis conceitualmente com a família citada.
+Antes do ensaio, confirmar versão da biblioteca, datasheet da placa/módulo e compilação.
+
+Testar uma variável por vez permite atribuir diferenças de PDR/RSSI/SNR/airtime ao SF; mudar SF,
+BW, CR e potência simultaneamente torna o resultado causalmente ambíguo.
+
+============================================================
+16. FATORES FÍSICOS QUE PODEM LIMITAR O ALCANCE
+============================================================
+
+Todos os itens abaixo precisam ser verificados em campo; o repositório não fornece especificações:
+
+- modelo/ganho real da antena e adequação a 915 MHz;
+- conector, solda, pigtail/cabo e perdas;
+- orientação e polarização relativa;
+- altura das duas antenas;
+- proximidade do solo;
+- corpo do animal e orientação variável da coleira;
+- caixa, material e proximidade de metal/bateria/placa;
+- tensão, corrente e estabilidade da alimentação durante TX;
+- árvores, folhagem, umidade, construções, cercas metálicas e veículos;
+- morros, depressões e linha de visada/Fresnel;
+- ruído e interferência na faixa;
+- posição e altura do Gateway;
+- danos ou ausência de antena durante testes;
+- variação entre unidades de hardware.
+
+PRECISA SER VERIFICADO EM CAMPO. Não há modelo de antena documentado no código.
+
+============================================================
+17. COMO TRANSFORMAR O TESTE DE 500 M EM ENSAIO CONTROLADO
+============================================================
+
+Informação fornecida pela equipe: perto de 500 m ocorreram perdas consideráveis. Isso não define
+limite teórico nem desempenho garantido.
+
+Em cada ponto registrar:
+- perfil completo e hash/versão dos firmwares;
+- distância e método de medição;
+- número total enviado e recebido por direção;
+- RSSI médio, mínimo, máximo e distribuição;
+- SNR médio, mínimo, máximo e distribuição;
+- ACKs, NACKs, retries, timeouts e duplicatas;
+- PDR=recebidos/enviados e PER=1-PDR, com definição de retry;
+- tamanho/tipo do pacote e intervalo;
+- duração, horário e quantidade de amostras;
+- altura, orientação e polarização das antenas;
+- linha de visada, obstáculos, relevo e clima;
+- alimentação e posição corporal/caixa da coleira;
+- tráfego nos dois sentidos separadamente.
+
+O firmware atual não coleta todos esses contadores; até instrumentá-lo, um gerador/receptor de teste
+ou registro externo deve contar mensagens com identificador próprio.
+
+============================================================
+18. DISTÂNCIAS SUGERIDAS — SEM PROMESSA DE ALCANCE
+============================================================
+
+Progressão conservadora para cada perfil, mantendo cenário e duração iguais:
+
+- bancada/curta distância: 5-10 m para validar configuração;
+- baseline: 50 m, 100 m e 200 m;
+- aproximação da região observada: 300 m e 400 m;
+- maior resolução perto da degradação: 450 m, 500 m e 550 m;
+- 600 m apenas se o enlace ainda estiver operacional e seguro;
+- distâncias adicionais somente guiadas pelos resultados, sem presumir quilômetros.
+
+Repetir pontos críticos em ida/volta e, idealmente, em mais de um horário. A concentração perto de
+400-600 m serve para caracterizar a transição observada, não para declarar limite universal.
+
+============================================================
+19. PREPARAÇÃO FUTURA PARA FPGA/PROFILE_CHANGE
+============================================================
+
+NÃO IMPLEMENTADO. Mudanças provavelmente necessárias:
+
+- gateway_config.h/collar_config.h: representar perfis permitidos, não uma única constante;
+- VFenceGateway.ino: comando vindo da Base, estado de transição, PROFILE_CHANGE/ACK, timeout/rollback;
+- VFenceCollarLoRa.ino: validar perfil, confirmar recebimento no perfil antigo, trocar no instante
+  coordenado, persistir perfil e recuperar após reboot;
+- vfence_protocol.h/.cpp nos dois lados: novos subtipos/estruturas e versão compatível;
+- app/serial_reader.py: comando/resposta estruturados e correlação;
+- app/database.py/config.py: perfil desejado, aplicado, anterior, tentativa e resultado;
+- futura interface FPGA/Raspberry: protocolo, autenticação/validação, limites e fail-safe.
+
+Estado mínimo futuro: profileId desejado/ativo/anterior, versão, request/sequence, horário de
+ativação, ACK por coleira, retries, deadline e perfil de recuperação.
+
+Para evitar lados diferentes:
+1. enviar mudança no perfil atual;
+2. receber PROFILE_ACK ainda no perfil atual;
+3. definir momento/condição de ativação;
+4. Gateway e coleira mudarem coordenadamente;
+5. validar comunicação no novo perfil;
+6. timeout causar rollback conhecido;
+7. manter perfil seguro de recuperação após reboot.
+
+O detalhe exato exige projeto de protocolo; esta auditoria não escolhe a solução.
+
+============================================================
+20. RISCO CRÍTICO: MUDAR SÓ UM LADO
+============================================================
+
+Exemplo Gateway SF8 / coleira SF7:
+- ambos podem transmitir RF na mesma frequência, mas usam chirps/taxa de símbolo incompatíveis;
+- o receptor normalmente não decodifica header/payload;
+- não há [APP] telemetry, ACK ou PONG;
+- mensagens confiáveis repetem até quatro transmissões e falham;
+- o Gateway marca a coleira offline após 180 s sem pacote válido.
+
+BW incompatível altera taxa de símbolo/filtro e impede decodificação confiável. CR incompatível impede
+interpretação correta da codificação. Sync word incompatível faz o receptor rejeitar a rede/pacote.
+Frequência diferente coloca os rádios em canais diferentes. CRC incompatível pode fazer um lado
+descartar pacotes ou interpretar formato divergente. Preâmbulo incompatível pode prejudicar detecção;
+o comportamento exato depende do chip/biblioteca e deve ser testado, mas não deve ser mudado só de um lado.
+
+Alterar apenas TX power é diferente: a modulação continua compatível, mas somente aquela direção muda
+o orçamento de enlace. Ainda assim, comparação experimental bidirecional deve controlar ambos.
+
+O sistema atual não tem canal de recuperação ou negociação dinâmica. Uma troca unilateral exige
+regravar fisicamente ou recolocar os dois no mesmo perfil.
+
+============================================================
+21. DOCUMENTAÇÃO DESATUALIZADA/DIVERGÊNCIAS
+============================================================
+
+DOCUMENTAÇÃO DESATUALIZADA
+ARQUIVO: gateway/VFenceGateway/README.md, seção "estado atual da integração".
+AFIRMAÇÃO: a coleira ainda teria transportSend simulado pela Serial.
+CONFIGURAÇÃO REAL: o firmware ativo da coleira já transmite via LoRa real.
+PROVA: VFenceCollarLoRa.ino transportSend chama beginPacket/write/endPacket.
+
+POTENCIAL FONTE DE CONFUSÃO, NÃO FIRMWARE ATIVO
+ARQUIVO: Testelora/sender/sender.ino.
+AFIRMAÇÃO IMPLÍCITA PELO CÓDIGO DE TESTE: TX power 5 e somente LoRa.begin(915E6).
+CONFIGURAÇÃO REAL DO VFENCE ATIVO: 14 dBm e perfil completo SF7/BW125/CR4/5/etc.
+PROVA: headers ativos e initLoRa dos diretórios VFenceGateway/VFenceCollarLoRa.
+
+DOCUMENTAÇÃO ATUAL CORRETA PARA O PHY
+ARQUIVOS: READMEs ativos de Gateway e coleira.
+AFIRMAÇÃO: 915 MHz, SF7, BW125 kHz, CR4/5, preâmbulo8, sync0x12, TX14, CRC ON.
+PROVA: coincide com constantes e chamadas atuais.
+
+NÃO COMPROVADO PELO CÓDIGO
+O alcance de 500 m não aparece como limite em firmware. É dado experimental fornecido pela equipe.
+
+============================================================
+22. RESUMO PARA DEFINIÇÃO DOS TESTES DE ALCANCE
+============================================================
+
+A) Configuração atual: 915 MHz, SF7, BW125 kHz, CR4/5, TX14 dBm solicitado,
+preâmbulo8, sync0x12, CRC ON.
+
+B) Gateway: gateway/VFenceGateway/gateway_config.h, aplicado por initLoRa em VFenceGateway.ino.
+
+C) Coleira: geofence/VFenceCollarLoRa/collar_config.h, aplicado por initLoRa em VFenceCollarLoRa.ino.
+
+D) Precisam coincidir: frequência, SF, BW, CR, sync, CRC/defaults de header/IQ e preâmbulo coordenado.
+
+E) Hoje podemos mudar os parâmetros compilados editando headers e regravando; CRC está direto no .ino.
+
+F) Runtime: nenhum parâmetro PHY. GET_RADIO é leitura; SET_PARAMETERS não é rádio.
+
+G) Métricas existentes: RSSI/SNR por pacote no receptor, sequence, flags ACK_REQ/RETRY,
+estado temporário transmissions, ACK/NACK, deduplicação e MISSING_CHUNKS.
+
+H) Falta: TX/RX/perdas, PDR/PER, contadores ACK/NACK/retry/timeout/duplicata,
+agregados RSSI/SNR, RTT/latência e CRC físico rejeitado.
+
+I) SF8: mudar LORA_SPREADING_FACTOR para 8 nos dois headers ativos e regravar ambos.
+J) SF9: mesmo procedimento com 9.
+K) SF10: mesmo procedimento com 10.
+Suporte formal da versão instalada da biblioteca deve ser confirmado antes: NÃO COMPROVADO PELO CÓDIGO.
+
+L) Mudar nos dois lados todos os parâmetros de modulação/rede; potência pode diferir, mas deve ser controlada.
+
+M) Riscos: perda total de enlace, retries/timeouts, coleira offline e necessidade de acesso físico.
+
+N) Físicos: antena/frequência/conector/orientação/altura/solo/corpo/caixa/alimentação/
+obstáculos/relevo/interferência/posição do Gateway. PRECISA SER VERIFICADO EM CAMPO.
+
+O) Sequência segura: baseline SF7 -> SF8 -> SF9 -> SF10, uma variável por vez, bancada primeiro,
+mesmas distâncias/duração/cenário e retorno ao perfil conhecido entre mudanças.
+
+============================================================
+23. DIAGRAMA FINAL
+============================================================
+
+GATEWAY ESP32
+    |
+    | gateway_config.h + initLoRa
+    | frequency = 915000000 Hz
+    | SF = 7
+    | BW = 125000 Hz
+    | CR = 4/5
+    | TX = 14 dBm solicitado
+    | preamble = 8
+    | sync = 0x12
+    | CRC = ON
+    v
+SX1276 GATEWAY
+    |
+    | LoRa binário VFENCE v1
+    | parâmetros compatíveis obrigatórios
+    v
+SX1276 COLEIRA
+    ^
+    | collar_config.h + initLoRa
+    | mesmos frequency/SF/BW/CR/preamble/sync/CRC
+    | TX power atual também 14 dBm
+    |
+COLEIRA ESP32
+
+CONFIG ATUAL/BASELINE: SF7, demais parâmetros atuais
+    |
+    v
+PERFIL TESTE 1 CANDIDATO: SF8, demais parâmetros iguais
+    |
+    v
+PERFIL TESTE 2 CANDIDATO: SF9, demais parâmetros iguais
+    |
+    v
+PERFIL TESTE 3 CANDIDATO: SF10, demais parâmetros iguais
+
+Nenhum perfil foi aplicado por esta auditoria.
+
+============================================================
+24. CONFERÊNCIA FINAL E PONTOS INCONCLUSIVOS
+============================================================
+
+Confirmado:
+- firmware ativo separado de protótipos;
+- Gateway e coleira possuem constantes idênticas;
+- setters e ordem de inicialização conferidos nos dois initLoRa;
+- packet sizes calculados pelos payloadLen reais;
+- ACK timeout, jitter, máximo e flags conferidos;
+- RSSI/SNR localizados no receptor e rastreados até a Base;
+- inexistência de SET_RADIO/PROFILE_CHANGE/mudança dinâmica confirmada por busca no working tree;
+- arquivos exatos para teste manual de SF identificados.
+
+Pontos inconclusivos/NÃO COMPROVADOS PELO CÓDIGO:
+1. versão exata e comportamento interno/defaults da biblioteca LoRa instalada;
+2. faixa formal de SF aceita pela versão instalada;
+3. registradores finais do SX1276 após inicialização;
+4. modelo, ganho, casamento e eficiência das antenas;
+5. potência RF realmente entregue, alimentação e calibração do módulo;
+6. causa das perdas observadas perto de 500 m;
+7. desempenho/alcance de qualquer perfil candidato;
+8. conformidade regulatória aplicável ao local e ao ensaio;
+9. métricas PDR/PER, pois os contadores necessários ainda não existem.
+
+FIM DA AUDITORIA

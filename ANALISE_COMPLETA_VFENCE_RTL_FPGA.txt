@@ -1,0 +1,662 @@
+ANÁLISE COMPLETA DO VFENCE — PREPARAÇÃO PARA ARQUITETURA RTL NA FPGA
+Data: 10/11/2026
+Fonte de verdade: working tree atual do repositório VFence.
+
+LEGENDA
+
+FATO: comportamento encontrado no código atual.
+PARCIAL: parte do caminho existe, mas faltam métricas, persistência ou integração.
+PLANEJADO: descrito ou proposto, porém sem caminho executável atual.
+SUGESTÃO: proposta para estudo; não representa comportamento implementado.
+
+CONCLUSÃO PRINCIPAL
+
+O VFence atual não possui algoritmo adaptativo de Spreading Factor.
+
+O sistema opera com SF7 fixo, mede RSSI e SNR no Gateway, mas não calcula PDR, PER ou PLR,
+não recomenda outro SF e não altera o rádio durante a execução.
+
+============================================================
+1. RESUMO DO PROJETO ATUAL
+============================================================
+
+O VFence é um sistema de cerca virtual para animais com quatro camadas:
+
+Servidor web central
+        ↕ HTTPS
+Raspberry Pi / Base Python
+        ↕ USB Serial
+ESP32 Gateway + SX1276
+        ↕ LoRa 915 MHz
+ESP32 Coleira + SX1276 + GNSS
+
+A coleira:
+
+- lê latitude e longitude do GNSS;
+- executa o geofencing localmente;
+- aciona buzzer e segundo atuador;
+- transmite telemetria e eventos em protocolo binário;
+- recebe parâmetros e novas cercas por LoRa.
+
+O Gateway:
+
+- recebe e transmite pacotes LoRa;
+- mede RSSI e SNR de cada pacote recebido;
+- converte os pacotes para JSON Serial com prefixo [APP];
+- recebe comandos [CMD] da Base;
+- implementa ACK, NACK, retransmissão e transferência de cerca.
+
+O Raspberry:
+
+- lê o Gateway pela Serial;
+- armazena telemetria no SQLite;
+- atualiza dashboard e WebSocket;
+- sincroniza dados e cercas com o servidor central.
+
+O servidor central:
+
+- permite desenhar e publicar cercas;
+- armazena telemetria recebida da Base;
+- mantém estado de coleiras e entregas.
+
+============================================================
+2. ARQUIVOS E MÓDULOS RELEVANTES
+============================================================
+
+gateway/VFenceGateway/gateway_config.h
+Responsabilidade: constantes PHY, pinagem e temporizações do Gateway.
+
+gateway/VFenceGateway/VFenceGateway.ino
+Responsabilidade: rádio, métricas, protocolo, ACK/retry e ponte Serial.
+
+geofence/VFenceCollarLoRa/collar_config.h
+Responsabilidade: identidade, GNSS e configuração PHY da coleira.
+
+geofence/VFenceCollarLoRa/VFenceCollarLoRa.ino
+Responsabilidade: GNSS, geofencing, telemetria, rádio e atuadores.
+
+geofence/VFenceCollarLoRa/vfence_protocol.h/.cpp
+Responsabilidade: tipos, limites, codificação e decodificação do protocolo binário.
+
+geofence/VFenceCollarLoRa/vfence_geofence.h/.cpp
+Responsabilidade: ponto no polígono e distância até a borda.
+
+geofence/VFenceCollarLoRa/vfence_fence_transfer.h/.cpp
+Responsabilidade: montagem e validação da cerca recebida.
+
+app/serial_reader.py
+Responsabilidade: entrada Serial, conversão, banco e WebSocket.
+
+app/database.py
+Responsabilidade: SQLite local, histórico, estado atual e outbox da Central.
+
+web/backend/services/edge_service.py
+Responsabilidade: persistência da telemetria na Central.
+
+web/backend/schema_postgresql.sql
+Responsabilidade: schema PostgreSQL.
+
+Testelora/
+Responsabilidade: testes antigos de LoRa textual. Não é o firmware ativo.
+
+geofence/vfence.ino
+Responsabilidade: protótipo anterior de geofencing. Não é a versão LoRa ativa.
+
+geofence/VFenceProtocol beta legado/
+Responsabilidade: versão histórica. Não é a versão ativa.
+
+Dependências principais:
+
+- ESP32/Arduino;
+- SX1276;
+- LoRa by Sandeep Mistry;
+- TinyGPSPlus;
+- Python, FastAPI, pyserial e asyncio;
+- SQLite local e PostgreSQL na Central;
+- WebSocket e Leaflet.
+
+============================================================
+3. INVENTÁRIO DAS VARIÁVEIS E MÉTRICAS
+============================================================
+
+VARIÁVEL | TIPO ATUAL | UNIDADE/LIMITE | ORIGEM | UTILIZAÇÃO REAL
+
+Frequência | long | 915000000 Hz | headers de configuração | inicialização do SX1276
+SF | int | somente 7 atualmente | LORA_SPREADING_FACTOR | configuração fixa do rádio
+Bandwidth | long | 125000 Hz | configuração | configuração fixa
+Coding rate | int | denominador 5, ou 4/5 | configuração | configuração fixa
+TX Power | int | 14 dBm solicitados | configuração | LoRa.setTxPower
+Preâmbulo | long | 8 símbolos | configuração | configuração fixa
+Sync word | uint8_t | 0x12 | configuração | identificação lógica da rede
+CRC PHY | configuração | habilitado | LoRa.enableCrc | proteção física
+RSSI | int no Gateway | dBm, intervalo não definido localmente | LoRa.packetRssi | log e persistência
+SNR | float no Gateway | dB, intervalo não definido localmente | LoRa.packetSnr | log e persistência
+Sequence | uint16_t | 0 a 65535 | header VFENCE | identificação de pacotes
+Retry flag | 1 bit | ligado/desligado | header VFENCE | marca retransmissão
+Transmissions | uint8_t | máximo 4 | fila confiável | controla tentativas temporárias
+ACK timeout | uint32_t | 5000 ms | configuração | agenda retransmissão
+Retry jitter | uint32_t | 0 a 2000 ms | random | evita retries simultâneos
+Last seen | uint32_t | milissegundos | millis | estado online/offline
+Offline timeout | uint32_t | 180000 ms | Gateway | marca coleira offline
+Packet length | size_t/uint8_t | máximo 64 bytes | protocolo | validação do pacote
+Telemetry interval | uint32_t | padrão 10 s, válido 1 a 60 s | parâmetros | periodicidade
+Jitter da telemetria | uint32_t | 0 a 3000 ms | coleira | distribui transmissões
+Battery | uint8_t | 0 a 100 ou 0xFF | coleira | leitura real não integrada
+Distance border | uint16_t | 0 a 65534 m ou 0xFFFF | geofencing | distância à cerca
+Satellites | uint8_t | 0 a 254 ou 0xFF | GNSS | qualidade do posicionamento
+HDOP | uint16_t | valor vezes 100 | GNSS | qualidade geométrica
+GPS valid | 1 bit | booleano | coleira | estado GNSS
+Inside/near/veryNear | 1 bit cada | booleano | geofencing | zona e atuadores
+PDR | inexistente | — | — | não calculado
+PER | inexistente | — | — | não calculado
+PLR | inexistente | — | — | não calculado
+ToA/airtime | inexistente | — | — | não calculado nem medido
+Sensibilidade RX | inexistente | — | — | não configurada ou armazenada
+Qualidade composta | inexistente | — | — | não existe link-quality score
+Distância do enlace | inexistente | — | — | não medida pelo firmware
+Consumo energético | inexistente em runtime | — | — | não participa da decisão
+Contador TX/RX | inexistente | — | — | não há totais agregados
+Contador ACK/NACK | inexistente | — | — | tratados, mas não contabilizados
+Contador de duplicatas | inexistente | — | — | detecção sem contador persistente
+
+Evidências principais:
+
+- gateway_config.h, aproximadamente linhas 10 a 34;
+- collar_config.h, aproximadamente linhas 17 a 31;
+- VFenceGateway.ino, initLoRa, aproximadamente linhas 216 a 232;
+- VFenceCollarLoRa.ino, initLoRa, aproximadamente linhas 123 a 139;
+- VFenceGateway.ino, pollLoRaReceive, aproximadamente linhas 1100 a 1135;
+- VFenceGateway.ino, processTelemetry, aproximadamente linhas 751 a 824;
+- VFenceCollarLoRa.ino, sendReliable/serviceReliableTx, linhas 173 a 259;
+- VFenceCollarLoRa.ino, sendTelemetryPacket, linhas 548 a 572.
+
+Persistência de RSSI e SNR:
+
+LoRa.packetRssi()/packetSnr()
+→ JSON [APP]
+→ ParsedPacket
+→ SQLite telemetry/collars
+→ central_outbox
+→ PostgreSQL telemetry/collars
+
+Limitações:
+
+- RSSI/SNR de eventos, ACKs e controles não são preservados como série histórica;
+- a coleira lê RSSI/SNR de downlinks, mas apenas imprime no log;
+- distanceBorderM chega à Base, mas não entra em ParsedPacket;
+- sequence é armazenada no SQLite, mas não segue para a Central;
+- battery_pct e fence_version seguem para a outbox, mas não têm colunas na telemetria SQLite local.
+
+============================================================
+4. ALGORITMO DE DECISÃO DO SF
+============================================================
+
+FATO VERIFICADO
+
+Não foi encontrado algoritmo de decisão, recomendação ou adaptação de SF.
+
+Comportamento real:
+
+1. O Gateway lê LORA_SPREADING_FACTOR = 7.
+2. A coleira lê LORA_SPREADING_FACTOR = 7.
+3. Ambos chamam LoRa.setSpreadingFactor(7) no startup.
+4. O Gateway mede RSSI e SNR.
+5. Esses valores são exibidos e armazenados.
+6. Nenhuma função compara RSSI/SNR com limiares.
+7. Nenhuma função calcula PDR/PER/PLR.
+8. Nenhuma função chama novamente setSpreadingFactor durante o loop.
+9. GET_RADIO apenas consulta o perfil.
+10. SET_PARAMETERS não altera o PHY.
+
+PSEUDOCÓDIGO FIEL AO CÓDIGO ATUAL
+
+ao iniciar:
+    sf = 7
+    configurar rádio com:
+        frequência = 915 MHz
+        sf = 7
+        bw = 125 kHz
+        cr = 4/5
+        potência = 14 dBm
+        preâmbulo = 8
+        sync_word = 0x12
+        crc = ligado
+
+durante a execução:
+    se chegou pacote LoRa:
+        obter RSSI
+        obter SNR
+        decodificar pacote
+        registrar/exibir métricas
+
+    processar ACK, NACK e retransmissões
+    processar Serial
+    manter rádio em recepção
+
+    // não existe cálculo de novo SF
+    // não existe mudança de perfil
+
+RESPOSTAS OBJETIVAS
+
+Variáveis usadas para selecionar SF: nenhuma.
+Comparações matemáticas: nenhuma.
+Limiares RSSI/SNR: não definidos.
+Novo SF escolhido: nunca; permanece 7.
+Método: perfil estático compilado.
+Histórico usado na decisão: nenhum.
+Anti-flapping: inexistente.
+Saídas possíveis: SF7 somente.
+Mudança coordenada Gateway/coleira: não implementada.
+Rollback: não implementado.
+
+A documentação menciona tuning futuro com RSSI, SNR, perda de pacotes e airtime, mas isso é
+planejado, não executável.
+
+============================================================
+5. FLUXO ATUAL DOS DADOS
+============================================================
+
+GNSS NEO-6M
+    ↓
+ESP32 coleira
+    ↓ geofencing local
+Pacote VFENCE binário
+    ↓ LoRa SX1276, SF7 fixo
+ESP32 Gateway
+    ↓ coleta RSSI/SNR
+Serial [APP] JSON
+    ↓
+Base Python / Raspberry
+    ├── SQLite
+    ├── WebSocket/dashboard
+    └── central_outbox
+            ↓ HTTPS
+        Central FastAPI
+            ↓
+        PostgreSQL
+
+Não existe uma saída desse fluxo que retorne RSSI/SNR para uma função de seleção de SF.
+
+Fluxo de cerca:
+
+Central
+→ Raspberry
+→ comando Serial
+→ Gateway
+→ FENCE_BEGIN/FENCE_CHUNK/FENCE_COMMIT
+→ LoRa
+→ Coleira
+→ validação CRC e persistência
+→ ACK/NACK
+
+IMPLEMENTADO
+
+- rádio real SX1276 nos dois ESP32;
+- perfil SF7/BW125/CR4/5;
+- medição de RSSI/SNR;
+- protocolo binário;
+- ACK/NACK/retry para mensagens confiáveis;
+- telemetria sem ACK;
+- transferência de cerca;
+- persistência SQLite/PostgreSQL;
+- dashboard e sincronização.
+
+PARCIAL
+
+- bateria: campo existe, sensor não integrado;
+- confiabilidade: estruturas temporárias existem, mas faltam contadores;
+- histórico RSSI/SNR: existe apenas para telemetria.
+
+PLANEJADO OU INEXISTENTE
+
+- algoritmo adaptativo;
+- comando SET_RADIO;
+- PROFILE_CHANGE/PROFILE_ACK;
+- mudança sincronizada de perfil;
+- FPGA, Nios II/e e Avalon-MM;
+- PDR/PER/PLR e ToA;
+- rollback automático.
+
+============================================================
+6. VIABILIDADE PARA IMPLEMENTAÇÃO EM FPGA
+============================================================
+
+DADO | REPRESENTAÇÃO RTL | BITS COMPROVÁVEIS | OBSERVAÇÃO
+
+Sequence | inteiro sem sinal | 16 | já é uint16_t
+Retry flag | bit | 1 | já existe no header
+Transmissões | contador | 3 mínimos para 0 a 4 | código usa uint8_t
+Timeout relativo | contador ms | 13 para 0 a 7000 | somente intervalo relativo
+Packet length | inteiro | 7 para 0 a 64 | máximo atual 64
+Battery | inteiro sem sinal | 8 | inclui 0xFF
+Satellites | inteiro sem sinal | 8 | inclui 0xFF
+HDOP x100 | inteiro sem sinal | 16 | inclui 0xFFFF
+Distance border | inteiro sem sinal | 16 | inclui 0xFFFF
+State flags | vetor | 8 | definido no protocolo
+SF | inteiro sem sinal | indefinido | somente SF7 comprovado
+RSSI | inteiro assinado | indefinido | código não impõe limites
+SNR | ponto fixo candidato | indefinido | escala precisa ser definida
+PDR/PER | contadores/razão | indefinido | janela não definida
+ToA | contador | indefinido | clock e máximo não definidos
+Histórico | RAM/registradores | indefinido | quantidade não definida
+
+Operações simples para RTL:
+
+- contadores;
+- somas e subtrações;
+- comparação com limiares;
+- mínimo, máximo e média acumulada;
+- saturação;
+- histerese;
+- amostras consecutivas;
+- máquinas de estados;
+- temporizadores;
+- seleção de perfil;
+- comparação cruzada para evitar divisão.
+
+Exemplo para evitar divisão:
+
+RX/TX < LIMITE_NUM/LIMITE_DEN
+
+pode ser calculado como:
+
+RX * LIMITE_DEN < TX * LIMITE_NUM
+
+Operações mais caras:
+
+- divisão geral;
+- ponto flutuante;
+- janela móvel grande;
+- otimização multiobjetivo;
+- aprendizado de máquina;
+- cálculo completo de ToA.
+
+Recomendação de representação:
+
+- converter RSSI e SNR para inteiros escalados no software;
+- não levar float diretamente ao primeiro RTL;
+- definir escalas depois dos ensaios de campo.
+
+============================================================
+7. OPÇÕES A, B E C
+============================================================
+
+Estas opções são sugestões novas. Nenhuma representa algoritmo já implementado.
+
+OPÇÃO A — RTL MÍNIMO
+
+Entradas:
+
+- RSSI escalado;
+- SF atual;
+- amostra válida;
+- limiares configuráveis;
+- quantidade mínima de amostras consecutivas.
+
+Operações:
+
+- comparar RSSI com limites inferior e superior;
+- contar amostras consecutivas;
+- recomendar subir, manter ou baixar um passo;
+- aplicar histerese simples.
+
+Saídas:
+
+- recommended_sf;
+- decision_valid;
+- reason_low_link;
+- reason_good_link.
+
+Hardware:
+
+- registradores;
+- comparadores;
+- contadores;
+- FSM pequena;
+- Avalon-MM simples.
+
+O software continua responsável por coleta, limites, mudança coordenada e rollback.
+
+Limitação: RSSI sozinho não mede entrega de pacotes.
+
+OPÇÃO B — RTL INTERMEDIÁRIO
+
+Entradas:
+
+- RSSI e SNR em ponto fixo;
+- SF atual;
+- TX total e RX válido;
+- ACK, NACK, retry e timeout;
+- tamanho da janela;
+- limiares e cooldown.
+
+Operações:
+
+- média ou soma de RSSI/SNR;
+- PDR por contadores;
+- taxa de retries/timeouts;
+- histerese;
+- janela de observação;
+- cooldown;
+- seleção de perfil adjacente.
+
+Saídas:
+
+- SF recomendado;
+- confiança;
+- motivo;
+- métricas agregadas;
+- interrupção para Nios.
+
+Limitação: primeiro é necessário instrumentar os contadores.
+
+OPÇÃO C — RTL COMPLETO
+
+Entradas:
+
+- métricas da opção B;
+- tipo e tamanho de pacote;
+- perfil PHY completo;
+- tempo de transmissão;
+- energia/bateria;
+- estado da aplicação remota;
+- histórico de janelas.
+
+Operações:
+
+- avaliação de confiabilidade, airtime e energia;
+- seleção de SF/BW/CR/TX;
+- negociação coordenada;
+- timeout e rollback;
+- histórico por coleira.
+
+Saídas:
+
+- perfil completo;
+- solicitação de troca;
+- versão do perfil;
+- estado da negociação;
+- alarmes e rollback.
+
+Limitações:
+
+- o VFence não possui algoritmo de referência;
+- maior risco de implementar política não validada;
+- exige protocolo novo de mudança de perfil.
+
+COMPARAÇÃO
+
+Critério | A | B | C
+Complexidade | baixa | média | alta
+Métricas | RSSI | RSSI, SNR e entrega | conjunto completo
+Memória | mínima | janela curta | histórico maior
+Divisões | nenhuma | evitáveis | possivelmente necessárias
+Risco | baixo | moderado | alto
+Primeira prova | adequada | após instrumentação | não recomendada
+
+============================================================
+8. ARQUITETURA RTL PRELIMINAR
+============================================================
+
+Nios II/e
+    ↕ Avalon-MM
+Interface Avalon-MM
+    ├── registradores de controle
+    ├── registradores de configuração
+    └── registradores de métricas
+             ↓
+      acumuladores/janela
+             ↓
+      bloco de decisão
+             ↓
+      registradores de saída
+             ├── recommended_sf
+             ├── decision_valid
+             ├── decision_reason
+             ├── metric_summary
+             └── IRQ
+
+ENTRADAS CANDIDATAS
+
+sample_valid | confirma nova amostra
+rssi_fixed | RSSI convertido em inteiro
+snr_fixed | SNR convertido em inteiro
+current_sf | perfil atual
+tx_count | ainda não implementado
+rx_count | ainda não implementado
+ack_count | ainda não implementado
+retry_count | ainda não implementado
+timeout_count | ainda não implementado
+window_size | configurável pelo Nios
+thresholds | configuráveis pelo Nios
+cooldown | ainda precisa ser definido
+enable/clear | controle do IP
+
+SAÍDAS CANDIDATAS
+
+recommended_sf | recomendação, não aplicação direta
+decision_valid | indica nova decisão
+decision_reason | informa qual métrica motivou a decisão
+confidence | opcional, ainda sem definição
+sample_count | quantidade processada
+metric_summary | médias e contadores
+busy | processamento em andamento
+error | entrada ou configuração inválida
+irq | interrupção para o Nios
+
+O IP inicial não deve controlar diretamente o SX1276.
+
+O Nios deve:
+
+1. ler a recomendação;
+2. validar o perfil;
+3. negociar a mudança com o outro dispositivo;
+4. aplicar o perfil nos dois lados;
+5. confirmar a comunicação;
+6. executar rollback se necessário.
+
+============================================================
+9. INFORMAÇÕES QUE AINDA PRECISAM SER DEFINIDAS
+============================================================
+
+1. Faixa autorizada de SF.
+2. Limites reais de RSSI e SNR.
+3. Escala de ponto fixo.
+4. Definição formal de pacote enviado, recebido, perdido e duplicado.
+5. Definição de PDR, PER e PLR.
+6. Tamanho e duração da janela.
+7. Tratamento do wrap de sequence.
+8. Separação entre telemetria, evento, ACK e controle.
+9. Quantidade de amostras antes de decidir.
+10. Limiares para subir e baixar SF.
+11. Histerese e cooldown.
+12. Prioridade entre confiabilidade, airtime e energia.
+13. Como estimar ou medir ToA.
+14. Como medir consumo energético.
+15. Protocolo PROFILE_CHANGE/PROFILE_ACK.
+16. Momento de ativação do perfil.
+17. Perfil seguro de recuperação.
+18. Rollback após perda de comunicação.
+19. Clock e reset do IP.
+20. Mapa de registradores Avalon-MM.
+21. Número de coleiras tratadas.
+22. Estado independente por coleira.
+23. Conformidade regulatória para 915 MHz.
+24. Validação física com diferentes distâncias e antenas.
+
+============================================================
+10. RECOMENDAÇÃO PARA A PRIMEIRA IMPLEMENTAÇÃO
+============================================================
+
+A primeira etapa não deve ser um seletor autônomo de SF. O repositório ainda não contém algoritmo
+ou métricas suficientes para validar uma decisão.
+
+Ordem recomendada:
+
+1. Instrumentar TX, RX, ACK, NACK, retry, timeout e duplicatas.
+2. Associar métricas por coleira, direção e tipo de pacote.
+3. Persistir RSSI, SNR e contadores em janelas.
+4. Executar testes controlados com SF7, SF8, SF9 e SF10, alterando os dois ESP32.
+5. Definir limiares usando dados reais.
+6. Formalizar o algoritmo em pseudocódigo e testes.
+7. Implementar a Opção A com limiares programáveis e saída de recomendação.
+8. Manter aplicação do perfil e rollback no Nios/software.
+9. Evoluir para a Opção B somente depois da validação de campo.
+
+Arquitetura recomendada:
+
+Gateway mede métricas
+→ Nios escreve amostras no IP
+→ RTL agrega e recomenda
+→ Nios lê a recomendação
+→ software coordena a mudança
+→ rádio só muda após confirmação
+
+Assim, a FPGA acelera a análise sem assumir imediatamente a responsabilidade crítica de alterar
+o perfil e potencialmente interromper o enlace.
+
+============================================================
+11. STATUS FINAL
+============================================================
+
+IMPLEMENTADO
+
+- perfil LoRa fixo SF7/BW125/CR4/5/TX14;
+- coleta de RSSI/SNR;
+- protocolo binário;
+- ACK/NACK/retry;
+- persistência de telemetria;
+- sincronização Base/Central;
+- transferência de cerca.
+
+PARCIAL
+
+- métricas de confiabilidade temporárias;
+- bateria no protocolo, mas sem sensor integrado;
+- histórico de RSSI/SNR somente em telemetria;
+- sequence local, sem envio à Central.
+
+PLANEJADO OU NÃO IMPLEMENTADO
+
+- algoritmo adaptativo de SF;
+- PDR/PER/PLR;
+- ToA;
+- medição energética em runtime;
+- SET_RADIO;
+- PROFILE_CHANGE/PROFILE_ACK;
+- controle FPGA;
+- Nios II/e;
+- Avalon-MM;
+- mudança coordenada e rollback.
+
+PONTOS NÃO COMPROVADOS PELO CÓDIGO
+
+- faixa de SF aceita pela versão instalada da biblioteca LoRa;
+- limites físicos reais de RSSI e SNR;
+- potência RF efetivamente entregue;
+- características das antenas;
+- alcance real de cada perfil;
+- limiares ideais de adaptação;
+- comportamento do futuro sistema FPGA.
+
+FIM DA ANÁLISE

@@ -1,12 +1,27 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 from contextlib import contextmanager
+from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 
+from app.metric_protocol import MetricSummary, validate_metric_summary
+from app.pdr_protocol import PdrSummary
 from app.protocol import ParsedPacket
+
+
+logger = logging.getLogger(__name__)
+
+
+class MetricSaveResult(Enum):
+    INSERTED = "inserted"
+    DUPLICATE = "duplicate"
+    CONFLICT = "conflict"
+    FAILED = "failed"
 
 
 class Database:
@@ -98,8 +113,159 @@ class Database:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (version, collar_id)
                 );
+                CREATE TABLE IF NOT EXISTS metric_summaries (
+                    id INTEGER PRIMARY KEY,
+                    kind TEXT NOT NULL CHECK (kind IN ('HDOP', 'RADIO')),
+                    producer_id TEXT NOT NULL CHECK (length(trim(producer_id)) > 0),
+                    collar_id INTEGER NOT NULL
+                        CHECK (typeof(collar_id) = 'integer' AND collar_id BETWEEN 1 AND 254),
+                    session_id TEXT NOT NULL
+                        CHECK (length(session_id) = 16 AND session_id NOT GLOB '*[^0-9a-f]*'),
+                    window_id TEXT NOT NULL
+                        CHECK (length(window_id) = 16 AND window_id NOT GLOB '*[^0-9a-f]*'
+                               AND window_id <> '0000000000000000'),
+                    started_at_ms INTEGER NOT NULL
+                        CHECK (typeof(started_at_ms) = 'integer' AND started_at_ms BETWEEN 0 AND 4294967295),
+                    duration_ms INTEGER NOT NULL CHECK (duration_ms = 60000),
+                    sample_count INTEGER NOT NULL CHECK (typeof(sample_count) = 'integer'),
+                    hdop_mean_x100 INTEGER,
+                    rssi_mean_x100 INTEGER,
+                    snr_mean_x100 INTEGER,
+                    hdop_mean_valid INTEGER,
+                    rssi_mean_valid INTEGER,
+                    snr_mean_valid INTEGER,
+                    gateway_session_id TEXT,
+                    gateway_received_at_ms INTEGER,
+                    persisted_at TEXT NOT NULL,
+                    UNIQUE (kind, producer_id, collar_id, session_id, window_id),
+                    CHECK (
+                        (gateway_session_id IS NULL AND gateway_received_at_ms IS NULL)
+                        OR (kind = 'HDOP' AND gateway_session_id IS NOT NULL
+                            AND length(gateway_session_id) = 16
+                            AND gateway_session_id NOT GLOB '*[^0-9a-f]*'
+                            AND typeof(gateway_received_at_ms) = 'integer'
+                            AND gateway_received_at_ms BETWEEN 0 AND 4294967295)
+                    ),
+                    CHECK (
+                        (kind = 'HDOP' AND rssi_mean_valid IS NULL AND snr_mean_valid IS NULL
+                         AND rssi_mean_x100 IS NULL AND snr_mean_x100 IS NULL
+                         AND (
+                             (hdop_mean_valid IS 0 AND sample_count = 0 AND hdop_mean_x100 IS NULL)
+                             OR (hdop_mean_valid IS 1 AND sample_count BETWEEN 1 AND 60
+                                 AND typeof(hdop_mean_x100) = 'integer' AND hdop_mean_x100 BETWEEN 0 AND 65534)
+                         ))
+                        OR (kind = 'RADIO' AND hdop_mean_valid IS NULL AND hdop_mean_x100 IS NULL
+                            AND (
+                                (rssi_mean_valid IS 0 AND snr_mean_valid IS 0 AND sample_count = 0
+                                 AND rssi_mean_x100 IS NULL AND snr_mean_x100 IS NULL)
+                                OR (rssi_mean_valid IS 1 AND snr_mean_valid IS 1
+                                    AND sample_count BETWEEN 1 AND 65535
+                                    AND typeof(rssi_mean_x100) = 'integer'
+                                    AND rssi_mean_x100 BETWEEN -32700 AND 32700
+                                    AND typeof(snr_mean_x100) = 'integer'
+                                    AND snr_mean_x100 BETWEEN -32768 AND 32767)
+                            ))
+                    )
+                );
+                CREATE INDEX IF NOT EXISTS idx_metric_summaries_collar_kind_persisted
+                    ON metric_summaries(collar_id, kind, persisted_at DESC);
+                CREATE TABLE IF NOT EXISTS pdr_windows (
+                    gateway_id TEXT NOT NULL,
+                    gateway_session_id TEXT NOT NULL,
+                    window_id TEXT NOT NULL,
+                    collar_id INTEGER NOT NULL CHECK (collar_id BETWEEN 1 AND 254),
+                    collar_session_id TEXT,
+                    started_at_ms INTEGER NOT NULL,
+                    duration_ms INTEGER NOT NULL CHECK (duration_ms = 60000),
+                    profile_id INTEGER CHECK (profile_id BETWEEN 0 AND 3),
+                    received_count INTEGER NOT NULL CHECK (received_count BETWEEN 0 AND 64),
+                    estimated_tx_count INTEGER,
+                    estimated_lost_count INTEGER,
+                    pdr_x100 INTEGER,
+                    valid INTEGER NOT NULL CHECK (valid IN (0, 1)),
+                    reason TEXT NOT NULL,
+                    persisted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (gateway_id, gateway_session_id, window_id, collar_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_pdr_windows_collar ON pdr_windows(collar_id, persisted_at DESC);
             """)
             db.execute("PRAGMA optimize")
+
+    def save_pdr_summary(self, gateway_id: str, summary: PdrSummary) -> MetricSaveResult:
+        identity = (gateway_id, summary.gateway_session_id, summary.window_id, summary.collar_id)
+        content = (
+            summary.collar_session_id, summary.started_at_ms, summary.duration_ms, summary.profile_id,
+            summary.received_count, summary.estimated_tx_count, summary.estimated_lost_count,
+            summary.pdr_x100, summary.valid, summary.reason,
+        )
+        try:
+            with self._lock, self.connect() as db:
+                cursor = db.execute("""
+                    INSERT INTO pdr_windows (
+                        gateway_id, gateway_session_id, window_id, collar_id,
+                        collar_session_id, started_at_ms, duration_ms, profile_id, received_count,
+                        estimated_tx_count, estimated_lost_count, pdr_x100, valid, reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (gateway_id, gateway_session_id, window_id, collar_id) DO NOTHING
+                    """, (*identity, *content))
+                if cursor.rowcount:
+                    return MetricSaveResult.INSERTED
+                row = db.execute("""
+                    SELECT collar_session_id, started_at_ms, duration_ms, profile_id, received_count,
+                           estimated_tx_count, estimated_lost_count, pdr_x100, valid, reason
+                    FROM pdr_windows
+                    WHERE gateway_id = ? AND gateway_session_id = ? AND window_id = ? AND collar_id = ?
+                    """, identity).fetchone()
+                return MetricSaveResult.DUPLICATE if row and tuple(row) == content else MetricSaveResult.CONFLICT
+        except sqlite3.Error:
+            logger.debug("PDR summary write failed", exc_info=True)
+            return MetricSaveResult.FAILED
+
+    def list_pdr(self, collar_id: int, limit: int) -> list[dict]:
+        with self._lock, self.connect() as db:
+            rows = db.execute("""
+                SELECT * FROM pdr_windows WHERE collar_id = ?
+                ORDER BY persisted_at DESC, rowid DESC LIMIT ?
+                """, (collar_id, limit)).fetchall()
+        return [{**dict(row), "valid": bool(row["valid"])} for row in rows]
+
+    def save_metric_summary(self, summary: MetricSummary) -> MetricSaveResult:
+        try:
+            validate_metric_summary(summary)
+            identity = (summary.kind, summary.producer_id, summary.collar_id, summary.session_id, summary.window_id)
+            content = (
+                summary.started_at_ms, summary.duration_ms, summary.sample_count,
+                summary.hdop_mean_x100, summary.rssi_mean_x100, summary.snr_mean_x100,
+                summary.hdop_mean_valid, summary.rssi_mean_valid, summary.snr_mean_valid,
+            )
+            with self._lock, self.connect() as db:
+                cursor = db.execute("""
+                    INSERT INTO metric_summaries (
+                        kind, producer_id, collar_id, session_id, window_id, started_at_ms, duration_ms,
+                        sample_count, hdop_mean_x100, rssi_mean_x100, snr_mean_x100, hdop_mean_valid,
+                        rssi_mean_valid, snr_mean_valid, gateway_session_id, gateway_received_at_ms, persisted_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (kind, producer_id, collar_id, session_id, window_id) DO NOTHING
+                    """, (*identity, *content, summary.gateway_session_id, summary.gateway_received_at_ms,
+                          datetime.now(timezone.utc).isoformat()))
+                if cursor.rowcount == 1:
+                    result = MetricSaveResult.INSERTED
+                else:
+                    # Recepcao e persistencia descrevem a primeira observacao da janela.
+                    row = db.execute("""
+                        SELECT started_at_ms, duration_ms, sample_count, hdop_mean_x100, rssi_mean_x100,
+                               snr_mean_x100, hdop_mean_valid, rssi_mean_valid, snr_mean_valid
+                        FROM metric_summaries
+                        WHERE kind = ? AND producer_id = ? AND collar_id = ? AND session_id = ? AND window_id = ?
+                        """, identity).fetchone()
+                    if row is None:
+                        result = MetricSaveResult.FAILED
+                    else:
+                        result = MetricSaveResult.DUPLICATE if tuple(row) == content else MetricSaveResult.CONFLICT
+        except (sqlite3.Error, TypeError, ValueError, OverflowError):
+            logger.debug("metric summary write failed", exc_info=True)
+            return MetricSaveResult.FAILED
+        return result
 
     @staticmethod
     def _queue(conn, item_type: str, data: dict, timestamp: str) -> int:

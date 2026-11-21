@@ -1,0 +1,930 @@
+VFENCE — FREQUÊNCIA DE TRANSMISSÃO LoRa E JANELAS DE MÉTRICAS
+Data: 10/11/2026
+Fonte: working tree atual do repositório VFence.
+Escopo: análise para definição futura das janelas do motor de decisão FPGA.
+
+CONCLUSÃO PRINCIPAL
+
+Com a configuração padrão, cada coleira transmite telemetria a cada 10 a 13 segundos, com média
+teórica de 11,5 segundos. Isso corresponde a aproximadamente 5,22 telemetrias por minuto, antes de
+considerar perdas, colisões, tempo no ar e atrasos de processamento.
+
+A proposta de agregar métricas durante 60 segundos e votar após cinco agregações é compatível com
+o sistema atual e resulta em uma decisão a cada cinco minutos. Entretanto, o PDR real ainda não pode
+ser calculado porque o Gateway não conhece o total efetivamente transmitido pela coleira.
+
+LEGENDA
+
+IMPLEMENTADO: existe caminho executável no código atual.
+PARCIAL: parte dos dados existe, mas falta instrumentação ou persistência.
+NÃO IMPLEMENTADO: não foi encontrado caminho executável.
+SUGESTÃO: proposta para ensaio futuro, ainda não validada.
+
+============================================================
+1. INTERVALOS REAIS ENCONTRADOS NA COLEIRA
+============================================================
+
+1.1 TELEMETRIA PERIÓDICA
+
+O valor padrão de telemetryIntervalS é 10 segundos.
+
+Arquivo:
+geofence/VFenceCollarLoRa/VFenceCollarLoRa.ino
+Linhas aproximadas: 34-40.
+
+O próximo envio é agendado por scheduleNextTelemetry():
+
+const uint32_t base = params.telemetryIntervalS * 1000UL;
+nextTelemetryAtMs = millis() + base + random(0, 3001);
+
+Arquivo:
+geofence/VFenceCollarLoRa/VFenceCollarLoRa.ino
+Linhas aproximadas: 543-546.
+
+Com telemetryIntervalS=10:
+
+- intervalo mínimo programado: 10 segundos;
+- intervalo máximo programado: 13 segundos;
+- jitter: inteiro entre 0 e 3000 ms;
+- jitter médio teórico: 1500 ms;
+- intervalo médio teórico: 11,5 segundos;
+- frequência média: aproximadamente 0,087 pacote/s;
+- frequência média: aproximadamente 5,22 pacotes/minuto.
+
+O intervalo físico real pode ser ligeiramente maior por causa de:
+
+- tempo no ar do pacote;
+- execução bloqueante de LoRa.endPacket();
+- tempo de processamento do loop;
+- logs Serial;
+- outras transmissões pendentes.
+
+A telemetria POSITION_STATUS não solicita ACK e não entra na fila de retransmissão.
+
+Função:
+sendTelemetryPacket()
+
+Arquivo:
+geofence/VFenceCollarLoRa/VFenceCollarLoRa.ino
+Linhas aproximadas: 548-573.
+
+1.2 O INTERVALO PODE SER ALTERADO
+
+O valor de 10 segundos é padrão, não garantia do valor existente em um dispositivo físico.
+
+O parâmetro:
+
+- é salvo na NVS;
+- é carregado durante o startup;
+- aceita valores entre 1 e 60 segundos;
+- pode ser alterado pelo comando SET_PARAMETERS;
+- reinicia o agendamento ao ser alterado.
+
+Evidências:
+
+loadParametersFromNvs(): linhas aproximadas 358-381.
+validParameters(): linhas aproximadas 579-588.
+processConfig/PARAMETERS: linhas aproximadas 676-695.
+
+Ao receber novos parâmetros, a função chama scheduleNextTelemetry(). Isso descarta o agendamento
+anterior e marca o próximo pacote para o novo intervalo mais o jitter.
+
+O Raspberry possui o padrão:
+
+COLLAR_TELEMETRY_SECONDS=10
+
+Arquivo:
+app/config.py, linha aproximada 38.
+
+Para um intervalo configurado I:
+
+intervalo programado mínimo = I segundos
+intervalo programado máximo = I + 3 segundos
+intervalo médio teórico = I + 1,5 segundo
+
+1.3 AQUISIÇÃO GNSS
+
+Não existe temporizador de aquisição GNSS no firmware VFence.
+
+O loop:
+
+1. drena continuamente a UART;
+2. entrega cada caractere para gps.encode();
+3. verifica gps.location.isUpdated();
+4. verifica gps.location.isValid();
+5. chama processNewGpsPosition() quando ambas forem verdadeiras.
+
+Arquivo:
+geofence/VFenceCollarLoRa/VFenceCollarLoRa.ino
+Linhas aproximadas: 938-946.
+
+Configuração da UART GNSS:
+
+- HardwareSerial UART1;
+- RX GPIO23;
+- 115200 baud;
+- 8N1;
+- somente recepção.
+
+A taxa com que o NEO-6M gera sentenças/posições não é configurada no código VFence. Ela depende da
+configuração interna do módulo físico.
+
+FREQUÊNCIA GNSS REAL: NÃO COMPROVADA PELO CÓDIGO.
+
+Uma nova posição GNSS atualiza:
+
+- latestPosition;
+- latestGeofence;
+- estado dos atuadores;
+- transições dentro/fora;
+- tempo do último fix.
+
+Ela não gera telemetria periódica imediatamente. A telemetria continua seguindo seu temporizador.
+
+1.4 TRANSMISSÕES POR EVENTOS
+
+Além da telemetria periódica, existem transmissões orientadas por eventos.
+
+MENSAGEM | CONDIÇÃO | PERIODICIDADE | ACK/RETRY
+
+DEVICE_STARTED | startup | uma vez por boot | sim
+OUTSIDE | transição de dentro para fora | sem período fixo | sim
+BACK_INSIDE | transição de fora para dentro | sem período fixo | sim
+GPS_LOST | ausência de fix durante timeout | uma vez ao entrar no estado perdido | sim
+GPS_RECOVERED | primeiro fix após perda | uma vez por recuperação | sim
+POSITION_STATUS | temporizador | 10-13 s por padrão | não
+
+Funções:
+
+- sendDeviceStartedEvent(), linhas aproximadas 510-520;
+- sendOutsideOrBackInside(), linhas aproximadas 467-483;
+- sendGpsLostEvent(), linhas aproximadas 485-496;
+- sendGpsRecoveredEvent(), linhas aproximadas 498-508.
+
+O timeout GNSS padrão é 60 segundos.
+
+Mesmo com GPS perdido, sendTelemetryPacket() continua sendo chamado periodicamente. O pacote é
+enviado com posição, satélites, HDOP e distância indisponíveis e com a flag GPS inválido.
+
+1.5 ACK, RETRANSMISSÃO E TIMEOUT
+
+Nos dois firmwares:
+
+- máximo de transmissões: 4;
+- uma transmissão original;
+- até três retransmissões;
+- timeout de ACK: 5000 ms;
+- jitter de retry: 0 a 2000 ms;
+- intervalo entre tentativas: aproximadamente 5 a 7 segundos.
+
+Gateway:
+gateway/VFenceGateway/gateway_config.h, linhas 32-34.
+
+Coleira:
+geofence/VFenceCollarLoRa/VFenceCollarLoRa.ino, linhas 69-71.
+
+Funções:
+
+- sendReliable();
+- scheduleRetryFromNow();
+- serviceReliableTx();
+- acknowledgeReliable();
+- rejectReliable().
+
+Em ausência completa de ACK:
+
+AÇÃO | INSTANTE APROXIMADO
+
+Transmissão original | 0 s
+Retry 1 | 5-7 s
+Retry 2 | 10-14 s
+Retry 3 | 15-21 s
+Falha definitiva detectada | 20-28 s
+
+A falha definitiva é detectada somente depois do timeout agendado após a quarta transmissão.
+
+1.6 SITUAÇÕES QUE ATRASAM OU SUPRIMEM TRANSMISSÃO
+
+- jitter intencional de até 3 segundos;
+- alteração de parâmetros reinicia o agendamento;
+- LoRa.endPacket() ocupa o rádio durante a transmissão;
+- SX1276 half-duplex deixa RX enquanto transmite;
+- processamento do loop e logs adicionam atraso;
+- falha em LoRa.begin() coloca o firmware em loop fatal;
+- falha em transportSend() perde a telemetria sem retry;
+- eventos confiáveis podem ocupar o rádio com retries;
+- transferência de cerca gera vários pacotes;
+- o firmware não recupera pacotes periódicos atrasados;
+- depois de um atraso, envia uma vez e agenda o próximo a partir daquele instante.
+
+Existe delay(1500) no startup dos dois firmwares. Não há delay no loop operacional normal.
+
+============================================================
+2. FREQUÊNCIA DE RECEPÇÃO E ENCAMINHAMENTO NO GATEWAY
+============================================================
+
+2.1 MODO DE RECEPÇÃO
+
+O Gateway chama LoRa.receive() após a inicialização.
+
+Arquivo:
+gateway/VFenceGateway/VFenceGateway.ino
+Linha aproximada: 231.
+
+O loop principal não contém delay:
+
+void loop() {
+  pollLoRaReceive();
+  serviceReliableTx();
+  serviceFenceTransfer();
+  serviceOfflineDetection();
+  pollSerialCommands();
+}
+
+Linhas aproximadas: 1712-1718.
+
+Isso significa:
+
+- consulta contínua de LoRa.parsePacket();
+- nenhuma frequência fixa de recepção;
+- recepções dependem dos pacotes que chegam;
+- RX é temporariamente interrompido durante TX;
+- depois do TX, LoRa.receive() é chamado novamente.
+
+Receptor ativo continuamente não significa um pacote recebido por segundo.
+
+2.2 PROCESSAMENTO DE PACOTE
+
+Fluxo:
+
+pollLoRaReceive()
+→ LoRa.parsePacket()
+→ LoRa.read()
+→ LoRa.packetRssi()
+→ LoRa.packetSnr()
+→ processIncomingPacket()
+→ processTelemetry/processEvent/processControl
+
+RSSI e SNR são lidos em:
+
+- VFenceGateway.ino:1115;
+- VFenceGateway.ino:1116.
+
+São medidas do pacote individual recém-recebido, não médias.
+
+2.3 ARMAZENAMENTO TEMPORÁRIO NO GATEWAY
+
+Para cada pacote aceito, markCollarSeen() atualiza:
+
+- seen;
+- online;
+- lastSeenMs;
+- lastRssi;
+- lastSnr.
+
+Arquivo:
+gateway/VFenceGateway/VFenceGateway.ino
+Linhas aproximadas: 677-696.
+
+O Gateway mantém apenas a última medição em RAM por coleira.
+
+Somente as telemetrias POSITION_STATUS incluem RSSI/SNR no JSON enviado ao Raspberry. Eventos,
+controles, ACKs e NACKs podem atualizar a última métrica em memória, mas não formam histórico no banco.
+
+2.4 ENCAMINHAMENTO AO RASPBERRY
+
+Não existe temporizador ou lote entre recepção LoRa e saída Serial.
+
+Para telemetria:
+
+pacote recebido
+→ decodificação
+→ Serial.print da linha [APP]
+→ Serial.println
+→ Raspberry
+
+Esse fluxo ocorre dentro de processTelemetry(), aproximadamente linhas 751-824.
+
+A frequência de encaminhamento é, portanto, a frequência dos pacotes recebidos e decodificados com
+sucesso. Não existe envio periódico separado de RSSI/SNR.
+
+2.5 FILAS E BUFFERS
+
+Recepção:
+
+- buffer local máximo de 64 bytes por pacote;
+- pacote é processado imediatamente;
+- não existe fila de múltiplos pacotes recebidos;
+- não existe batch LoRa→Serial.
+
+Transmissão confiável:
+
+- fila de até oito PendingReliableTx;
+- usada para mensagens que solicitam ACK;
+- não usada pela telemetria periódica.
+
+Transferência de cerca:
+
+- possui máquina de estados própria;
+- chunks são separados por FENCE_CHUNK_GAP_MS=120 ms;
+- BEGIN e COMMIT são confiáveis;
+- chunks faltantes podem ser reenviados seletivamente.
+
+2.6 MÚLTIPLAS COLEIRAS
+
+O Gateway mantém estado por collarId de 1 a 254.
+
+Por coleira são mantidos:
+
+- seen/online;
+- lastSeenMs;
+- último RSSI/SNR;
+- última sequence de telemetria;
+- histórico de até 16 sequências confiáveis recentes.
+
+Limitações:
+
+- canal LoRa compartilhado;
+- sem TDMA;
+- sem agendamento central de telemetria;
+- processamento sequencial;
+- transmissões simultâneas podem colidir;
+- jitter de 0-3 s reduz sincronização, mas não elimina colisões.
+
+2.7 DETECÇÃO OFFLINE
+
+O Gateway executa a varredura aproximadamente a cada segundo.
+
+A coleira é marcada offline após 180 segundos sem qualquer pacote.
+
+Arquivos:
+
+- gateway_config.h:29;
+- VFenceGateway.ino, serviceOfflineDetection(), linhas 698-716.
+
+============================================================
+3. FLUXO E ARMAZENAMENTO DAS MÉTRICAS NO RASPBERRY
+============================================================
+
+3.1 FREQUÊNCIA DE CHEGADA
+
+O Raspberry não consulta o Gateway periodicamente para buscar telemetria.
+
+Leitura real:
+
+line = await asyncio.to_thread(connection.readline)
+if line:
+    await self.process_line(line)
+
+Arquivo:
+app/serial_reader.py
+Linhas aproximadas: 118-121.
+
+A Serial possui timeout de leitura de 1 segundo, mas isso não é frequência de amostragem. O timeout
+apenas devolve controle ao loop quando nenhuma linha chega.
+
+Frequência de registros no Raspberry:
+
+frequência dos pacotes recebidos com sucesso pelo Gateway e encaminhados pela Serial.
+
+Com uma coleira no padrão atual, em condição ideal, são aproximadamente 4 a 6 telemetrias/minuto.
+
+3.2 MODO MOCK
+
+O modo mock gera uma mensagem a cada 3 segundos por padrão.
+
+Arquivos:
+
+- app/serial_reader.py, _run_mock(), linhas 61-79;
+- app/config.py: MOCK_INTERVAL_SECONDS padrão 3.
+
+Esse ritmo não representa o firmware real.
+
+3.3 PROCESSAMENTO
+
+Cada linha é processada imediatamente:
+
+readline()
+→ process_line()
+→ _parse_gateway_app()
+→ _process_gateway_app()
+→ _telemetry_packet()
+→ _save_and_broadcast()
+→ Database.save_packet()
+→ WebSocket
+
+Não existe agregação antes do SQLite.
+
+3.4 ARMAZENAMENTO
+
+Cada telemetria gera uma linha individual na tabela telemetry com:
+
+- collar_id;
+- timestamp;
+- latitude;
+- longitude;
+- zone;
+- satellites;
+- hdop;
+- rssi;
+- snr;
+- sequence;
+- raw_message.
+
+Arquivo:
+app/database.py
+Função: save_packet()
+Linhas aproximadas: 112-170.
+
+A tabela collars mantém somente o estado mais recente.
+
+Os dados estão organizados por collar_id, portanto médias por coleira são viáveis.
+
+3.5 TIMESTAMPS DISPONÍVEIS
+
+Existem:
+
+1. millis() na coleira para temporização local;
+2. lastSeenMs no Gateway;
+3. timestamp UTC criado pelo Raspberry;
+4. timestamp SQLite de recepção;
+5. timestamp de recepção na Central.
+
+Não existem na telemetria:
+
+- horário GNSS;
+- timestamp de transmissão da coleira;
+- timestamp absoluto de recepção do Gateway;
+- tempo no ar medido;
+- latência coleira→Gateway→Raspberry.
+
+O histórico local utiliza o horário de recepção/processamento do Raspberry.
+
+3.6 MÉDIAS E PDR
+
+Atualmente:
+
+- média RSSI: não calculada;
+- média SNR: não calculada;
+- PDR: não calculado;
+- janela temporal: não implementada;
+- sample_count por janela: não implementado.
+
+Com os dados já armazenados, o Raspberry pode calcular:
+
+- média RSSI dos pacotes recebidos;
+- média SNR dos pacotes recebidos;
+- mínimo e máximo;
+- desvio/variância;
+- quantidade de amostras;
+- tempo desde a última amostra;
+- métricas separadas por coleira.
+
+Ele ainda não consegue calcular PDR real de uplink.
+
+3.7 ENVIO À CENTRAL
+
+Quando a sincronização está ativa, cada telemetria entra na central_outbox.
+
+Parâmetros padrão:
+
+- sincronização: a cada 5 segundos;
+- retry da Central: 5 segundos;
+- máximo por lote: 100 itens.
+
+Arquivos:
+
+- app/config.py, linhas 30-32;
+- app/sync_service.py, run(), linhas 51-74;
+- app/sync_service.py, _flush_outbox(), linhas 188-195.
+
+Esse batch externo não altera o caminho local imediato Gateway→SQLite/WebSocket.
+
+============================================================
+4. QUANTIDADE DE PACOTES ESPERADOS POR PERÍODO
+============================================================
+
+TELEMETRIA PADRÃO: 10 s + JITTER DE 0 A 3 s
+
+A tabela considera uma janela iniciada imediatamente após uma telemetria. Uma janela de relógio em
+fase arbitrária pode variar em aproximadamente uma amostra.
+
+PERÍODO | MÍNIMO PROGRAMADO | MÁXIMO PROGRAMADO | MÉDIA TEÓRICA
+
+30 segundos | 2 | 3 | 2,61
+1 minuto | 4 | 6 | 5,22
+2 minutos | 9 | 12 | 10,43
+5 minutos | 23 | 30 | 26,09
+10 minutos | 46 | 60 | 52,17
+
+Esses números representam pacotes esperados da aplicação, não pacotes recebidos.
+
+Não incluem:
+
+- perdas;
+- colisões;
+- falha de transmissão;
+- tempo no ar;
+- reinicializações;
+- mudança de parâmetros;
+- eventos adicionais;
+- retransmissões.
+
+Fórmula para outro intervalo I:
+
+mínimo aproximado = floor(T / (I + 3))
+máximo aproximado = floor(T / I)
+média aproximada = T / (I + 1,5)
+
+T é o período em segundos e I é telemetryIntervalS.
+
+MENSAGENS SEM QUANTIDADE FIXA
+
+DEVICE_STARTED | um por boot
+OUTSIDE | depende de transição
+BACK_INSIDE | depende de transição
+GPS_LOST | depende de perda de fix
+GPS_RECOVERED | depende de recuperação
+ACK/NACK | depende de mensagem confiável
+PING/PONG | depende de comando
+PARAMETERS | depende de comando
+FENCE_* | depende de publicação de cerca
+
+TRANSFERÊNCIA DE CERCA
+
+Para V vértices, sem perdas:
+
+1 FENCE_BEGIN
++ ceil(V/2) FENCE_CHUNK
++ 1 FENCE_COMMIT
+
+Para 32 vértices:
+
+1 + 16 + 1 = 18 pacotes de aplicação.
+
+Chunks possuem intervalo mínimo de 120 ms. BEGIN e COMMIT podem sofrer retries.
+
+============================================================
+5. DISPONIBILIDADE DOS DADOS PARA MÉDIAS E PDR
+============================================================
+
+5.1 DADOS JÁ DISPONÍVEIS
+
+- RSSI individual;
+- SNR individual;
+- timestamp de recepção do Raspberry;
+- sequence de 16 bits;
+- collar_id;
+- tipo de telemetria;
+- perfil atual consultável por GET_RADIO;
+- último instante recebido;
+- quantidade de amostras recebidas;
+- status online/offline do Gateway.
+
+5.2 DADOS AUSENTES PARA PDR CORRETO
+
+- total de pacotes únicos transmitidos pela coleira;
+- contador TX por tipo;
+- contador TX por direção;
+- sessão/boot persistente;
+- total de tentativas físicas;
+- contador de duplicatas no Raspberry;
+- CRC PHY rejeitado;
+- sequência separada para telemetria;
+- perfil associado a cada amostra;
+- timestamp de transmissão.
+
+5.3 POR QUE SEQUENCE NÃO É SUFICIENTE
+
+A sequence:
+
+- é global por emissor;
+- é consumida por telemetria, evento e controle;
+- reinicia após boot;
+- retorna a zero após 65535;
+- pode ter lacunas legítimas entre telemetrias;
+- é repetida nos retries;
+- não segue atualmente para a Central.
+
+Logo, a diferença entre duas sequences de telemetria não equivale diretamente a perdas.
+
+5.4 CONTADORES NECESSÁRIOS
+
+Por coleira, direção e classe:
+
+UPLINK TELEMETRY
+
+- tx_unique_telemetry;
+- rx_unique_telemetry;
+- rx_duplicate_telemetry.
+
+UPLINK RELIABLE EVENT
+
+- tx_unique_event;
+- tx_attempts_event;
+- rx_unique_event;
+- rx_duplicate_event;
+- ack_sent;
+- ack_received;
+- timeout.
+
+DOWNLINK
+
+- os mesmos contadores, com origem e destino invertidos.
+
+5.5 WRAP E REBOOT
+
+Diferença modular:
+
+delta = (nova_sequence - sequence_anterior) mod 65536
+
+Isso trata wrap, mas não diferencia wrap de reboot.
+
+É necessário adicionar futuramente:
+
+- boot_id;
+- session_id;
+- ou contador persistente de sessão;
+- tratamento de DEVICE_STARTED;
+- estado por coleira.
+
+5.6 AUSÊNCIA COMPLETA DE PACOTES
+
+O Raspberry consegue identificar:
+
+- janela sem telemetria;
+- tempo desde a última telemetria;
+- offline emitido pelo Gateway após 180 s.
+
+Não consegue provar quantos pacotes foram transmitidos durante o silêncio.
+
+Uma janela vazia deve inicialmente ser representada como:
+
+sample_count = 0
+metrics_valid = false
+pdr_valid = false
+
+Não deve ser automaticamente convertida em PDR=0%, pois a coleira pode estar desligada e não ter
+transmitido nenhum pacote.
+
+============================================================
+6. PROBLEMAS E LIMITAÇÕES
+============================================================
+
+1. telemetryIntervalS pode ter sido alterado na NVS.
+2. Frequência GNSS real não está configurada no repositório.
+3. Telemetria não possui ACK.
+4. Gateway não registra TX/RX agregados.
+5. RSSI/SNR históricos existem somente para telemetria.
+6. Gateway suporta várias coleiras, mas não possui TDMA.
+7. Colisões LoRa não são contabilizadas.
+8. Não existe timestamp de transmissão.
+9. Perfil não é associado a cada linha histórica.
+10. Futuras mudanças de perfil precisarão ser registradas.
+11. Transferência de cerca ocupa temporariamente o canal.
+12. Eventos confiáveis podem gerar até três retries.
+13. SQLite permite médias, mas elas não estão implementadas.
+14. COLLAR_OFFLINE_SECONDS=30 existe no Python, mas não é consumido pela lógica atual.
+15. Timeout offline efetivo do Gateway é 180 s.
+16. Média RSSI/SNR usa somente pacotes recebidos e tem viés de sobrevivência.
+17. Pacotes completamente perdidos não possuem RSSI/SNR.
+
+============================================================
+7. ALTERNATIVAS DE AGREGAÇÃO E VOTAÇÃO
+============================================================
+
+Os valores abaixo são sugestões para teste, não parâmetros validados.
+
+7.1 ALTERNATIVA CURTA
+
+Tempo de agregação: 30 segundos.
+Telemetrias esperadas: 2-3.
+Média teórica: 2,61.
+Envio à FPGA: a cada 30 segundos.
+Avaliações por votação: 10.
+Janela total de decisão: 5 minutos.
+
+Vantagens:
+
+- reação rápida;
+- detecção inicial em poucos segundos;
+- decisão final ainda limitada a cinco minutos.
+
+Desvantagens:
+
+- somente 2-3 amostras;
+- média sensível a uma amostra;
+- muitas janelas vazias em enlace ruim;
+- maior frequência de acesso à FPGA;
+- maior tendência à oscilação.
+
+Janela vazia:
+
+- não gerar voto normal;
+- metrics_valid=0;
+- incrementar contador separado;
+- nunca usar RSSI/SNR zero como medição.
+
+7.2 ALTERNATIVA INTERMEDIÁRIA
+
+Tempo de agregação: 60 segundos.
+Telemetrias esperadas: 4-6.
+Média teórica: 5,22.
+Envio à FPGA: a cada 60 segundos.
+Avaliações por votação: 5.
+Janela total de decisão: 5 minutos.
+
+Vantagens:
+
+- equilíbrio entre velocidade e estabilidade;
+- cerca de cinco amostras por agregação;
+- cinco avaliações em cinco minutos;
+- menor sensibilidade a uma única amostra;
+- integração simples;
+- baixa carga Avalon-MM.
+
+Desvantagens:
+
+- ainda possui poucas amostras;
+- em PDR muito baixo pode haver janelas vazias;
+- PDR correto ainda exige contadores TX;
+- adaptação leva minutos.
+
+Janela vazia:
+
+- enviar avaliação inválida;
+- manter perfil atual;
+- registrar consecutive_empty_windows;
+- usar fail-safe separado depois de limite futuro.
+
+7.3 ALTERNATIVA LONGA
+
+Tempo de agregação: 120 segundos.
+Telemetrias esperadas: 9-12.
+Média teórica: 10,43.
+Envio à FPGA: a cada 120 segundos.
+Avaliações por votação: 5.
+Janela total de decisão: 10 minutos.
+
+Vantagens:
+
+- maior quantidade de amostras;
+- menor influência de variação instantânea;
+- menos janelas vazias;
+- boa estabilidade rural;
+- menor chance de trocas excessivas.
+
+Desvantagens:
+
+- adaptação lenta;
+- até dez minutos em perfil inadequado;
+- mudanças reais ficam diluídas;
+- recuperação lenta após deslocamento.
+
+Uma janela de dois minutos vazia é evidência forte de indisponibilidade, mas ainda não comprova
+PDR=0% sem total TX.
+
+7.4 COMPARAÇÃO
+
+CRITÉRIO | 30 s x 10 | 60 s x 5 | 120 s x 5
+
+Janela total | 5 min | 5 min | 10 min
+Amostras/avaliação | 2-3 | 4-6 | 9-12
+Reatividade | alta | média | baixa
+Estabilidade | baixa | média | alta
+Risco de janela vazia | alto | médio | menor
+Risco de oscilação | alto | moderado | baixo
+Uso inicial | teste secundário | melhor ponto inicial | cenário estável
+
+============================================================
+8. RECOMENDAÇÃO DE INTERVALO INICIAL
+============================================================
+
+SUGESTÃO INICIAL PARA ENSAIO
+
+Agregação: 60 segundos.
+Avaliações por votação: 5.
+Janela total: 5 minutos.
+
+Justificativa:
+
+- padrão atual produz cerca de cinco telemetrias/minuto;
+- 30 segundos possui amostragem pequena;
+- cinco minutos reduzem mudanças excessivas;
+- ainda reage em tempo razoável para ambiente rural;
+- facilita comparação entre ensaios;
+- baixa quantidade de transações com a FPGA;
+- T e K podem continuar programáveis.
+
+Precisa ser validado com:
+
+- múltiplas coleiras;
+- PDR alto e baixo;
+- deslocamento do animal;
+- obstáculos;
+- perda completa do enlace;
+- mudança de perfil;
+- transferência de cerca simultânea.
+
+============================================================
+9. IMPACTO NA ARQUITETURA RTL
+============================================================
+
+Se o Raspberry agregar durante 60 segundos, a FPGA não precisa receber cada pacote bruto.
+
+Entradas candidatas por avaliação:
+
+- collar_id;
+- window_id;
+- rssi_mean_magnitude;
+- snr_mean_x100;
+- pdr_x100;
+- sample_count;
+- current_profile;
+- rssi_valid;
+- snr_valid;
+- pdr_valid;
+- window_valid;
+- empty_window.
+
+Para cinco avaliações:
+
+- profile_id: 2 bits;
+- recommended_profile: 2 bits;
+- contador de avaliações: 3 bits para 0-5;
+- cada contador de votos P0-P3: 3 bits para 0-5;
+- sample_count: 8 ou 16 bits na interface;
+- window_id para rejeitar duplicação;
+- estado independente por coleira.
+
+Fluxo sugerido:
+
+Raspberry fecha janela de 60 s
+→ calcula métricas
+→ escreve registradores Avalon-MM
+→ sinaliza sample_valid
+→ FPGA avalia uma vez
+→ incrementa voto P0/P1/P2/P3
+→ após cinco avaliações produz resultado
+→ Nios lê recomendação
+→ software coordena eventual troca de perfil
+→ FPGA limpa contadores após confirmação
+
+A FPGA não deve interpretar uma janela inválida como qualidade ruim automaticamente.
+
+Estados candidatos:
+
+IDLE
+WAIT_SAMPLE
+EVALUATE
+ACCUMULATE_VOTE
+CHECK_WINDOW_END
+RESULT_READY
+WAIT_ACK_CLEAR
+
+Ainda precisam ser definidos:
+
+- maioria qualificada;
+- desempate;
+- política de janelas vazias;
+- quantidade máxima de coleiras;
+- armazenamento por coleira;
+- rollback;
+- perfil seguro;
+- limiares e pesos.
+
+============================================================
+10. CONCLUSÃO FINAL
+============================================================
+
+JÁ PODE SER DEFINIDO
+
+- telemetria padrão: 10-13 s;
+- intervalo médio teórico: 11,5 s;
+- aproximadamente 5,22 telemetrias/minuto;
+- RSSI/SNR individuais disponíveis no Raspberry;
+- agregação em software é viável;
+- intervalo candidato inicial: 60 s;
+- votação candidata: cinco avaliações;
+- janela candidata: cinco minutos;
+- entradas agregadas da futura FPGA;
+- necessidade de estado por coleira.
+
+AINDA PRECISA DE IMPLEMENTAÇÃO E TESTES
+
+- contadores TX/RX;
+- PDR real;
+- separação por direção e tipo;
+- contagem de duplicatas;
+- boot/session ID;
+- política de silêncio completo;
+- perfil associado a cada pacote;
+- limiares e pesos;
+- maioria qualificada;
+- mudança coordenada de perfil;
+- validação física dos intervalos.
+
+O arranjo 60 segundos x 5 avaliações é um bom ponto inicial de ensaio, mas não deve ser considerado
+parâmetro final antes da instrumentação e dos testes de campo.
+
+FIM DO RELATÓRIO

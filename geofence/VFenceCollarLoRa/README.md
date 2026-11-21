@@ -8,6 +8,7 @@ Instale pelo Library Manager:
 
 - TinyGPSPlus
 - LoRa by Sandeep Mistry
+- ESP32Servo
 
 `Preferences` e `SPI` fazem parte do core ESP32/Arduino.
 

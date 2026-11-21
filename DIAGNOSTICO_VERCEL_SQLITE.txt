@@ -1,0 +1,274 @@
+VFENCE — DIAGNÓSTICO DO ENVIO DE CERCA NO VERCEL
+=================================================
+
+Data do diagnóstico: 15/10/2026
+
+1. PROBLEMA OBSERVADO
+---------------------
+
+O VFence Central abre no Vercel e permite desenhar a cerca, mas não consegue
+salvar/publicar o polígono quando o produtor pressiona o botão de envio.
+
+O desenho e parte da validação podem funcionar porque são executados no
+navegador. A publicação, porém, depende do backend FastAPI gravar a cerca no
+banco de dados.
+
+
+2. CAUSA MAIS PROVÁVEL
+----------------------
+
+O backend atual do VFence Central utiliza SQLite.
+
+Configuração padrão:
+
+    DATA_DIR=./data
+
+Banco calculado pelo código:
+
+    web/data/vfence.db
+
+Arquivos envolvidos:
+
+    web/backend/config.py
+    web/backend/db.py
+    web/backend/schema.sql
+
+No arquivo web/backend/config.py, a propriedade db_path monta o caminho:
+
+    data_dir / "vfence.db"
+
+No arquivo web/backend/db.py, a classe Database abre esse arquivo com
+sqlite3.connect() e executa INSERTs e UPDATEs para salvar cercas, pontos,
+entregas, bases e telemetria.
+
+O Vercel executa o backend como funções serverless. O diretório contendo o
+código implantado não funciona como um disco permanente para o banco SQLite.
+Dependendo do ambiente, a tentativa de gravação pode falhar imediatamente ou
+os dados podem desaparecer quando a função for encerrada ou substituída.
+
+
+3. MOMENTO EM QUE O ERRO ACONTECE
+---------------------------------
+
+Fluxo da interface:
+
+    produtor desenha o polígono
+        -> JavaScript monta a requisição
+        -> POST /api/fences
+        -> backend valida a geometria
+        -> fence_service.create_fence()
+        -> SQLite tenta criar a nova versão
+        -> SQLite tenta gravar os vértices
+
+O problema deve acontecer na etapa de gravação no SQLite.
+
+Possíveis mensagens encontradas nos logs:
+
+    attempt to write a readonly database
+    unable to open database file
+    sqlite3.OperationalError
+    read-only file system
+    no such table
+    HTTP 500 Internal Server Error
+
+
+4. POR QUE A TELA ABRE, MAS NÃO SALVA
+-------------------------------------
+
+Os arquivos HTML, CSS e JavaScript são arquivos estáticos e podem ser servidos
+normalmente pelo Vercel.
+
+O editor também consegue desenhar o polígono no navegador sem gravar nada.
+
+Ao publicar, a situação muda: o endpoint POST /api/fences precisa escrever no
+banco. É nessa operação que a limitação do armazenamento local aparece.
+
+
+5. COMO CONFIRMAR O DIAGNÓSTICO
+-------------------------------
+
+No painel do Vercel:
+
+    1. Abrir o projeto VFence.
+    2. Entrar em Deployments.
+    3. Abrir o último deployment da branch main.
+    4. Abrir Functions ou Logs.
+    5. No site, tentar enviar novamente uma cerca.
+    6. Procurar erros contendo sqlite, readonly, database, DATA_DIR ou HTTP 500.
+
+No navegador também é possível verificar:
+
+    1. Pressionar F12.
+    2. Abrir a aba Network/Rede.
+    3. Clicar em Enviar cerca.
+    4. Selecionar a requisição POST /api/fences.
+    5. Conferir Status e Response/Resposta.
+
+Se a resposta for HTTP 500 e os logs indicarem falha de gravação do SQLite, o
+diagnóstico está confirmado.
+
+
+6. USAR /tmp NÃO É UMA SOLUÇÃO DEFINITIVA
+-----------------------------------------
+
+Configurar:
+
+    DATA_DIR=/tmp
+
+pode permitir gravações temporárias em algumas execuções. Entretanto, isso não
+transforma o SQLite em um banco persistente.
+
+Problemas desse caminho:
+
+    - os dados podem desaparecer quando a função for encerrada;
+    - uma nova instância pode iniciar com outro arquivo vazio;
+    - duas requisições podem ser atendidas por instâncias diferentes;
+    - um novo deployment elimina o estado temporário;
+    - o Raspberry pode consultar uma instância que não possui a cerca salva.
+
+Portanto, /tmp pode servir para diagnóstico, mas não para operação real.
+
+
+7. IMPACTO NA INTEGRAÇÃO COM O RASPBERRY
+----------------------------------------
+
+O cliente Python do Raspberry já implementa:
+
+    POST /api/edge/heartbeat
+    GET  /api/edge/fences/{version}
+    POST /api/edge/batch
+
+Entretanto, para o Raspberry baixar uma cerca, o Central precisa manter a nova
+versão salva em um banco persistente.
+
+Sem persistência confiável, podem acontecer estes casos:
+
+    - a publicação retorna erro e nenhuma versão é criada;
+    - a versão é criada temporariamente e desaparece depois;
+    - o heartbeat não encontra a versão publicada;
+    - o download GET /api/edge/fences/{version} retorna 404;
+    - a interface e o Raspberry enxergam estados diferentes.
+
+
+8. SOLUÇÃO RECOMENDADA PARA CONTINUAR NO VERCEL
+-----------------------------------------------
+
+Utilizar um banco PostgreSQL persistente, por exemplo:
+
+    - Neon;
+    - Supabase;
+    - outro PostgreSQL compatível com o Vercel.
+
+O Vercel deverá receber uma variável de ambiente semelhante a:
+
+    DATABASE_URL=postgresql://...
+
+Não colocar a URL real, usuário ou senha dentro do Git.
+
+A camada de banco do Central precisará ser adaptada de sqlite3 para PostgreSQL,
+preservando:
+
+    - as tabelas e relacionamentos atuais;
+    - os endpoints da API;
+    - o contrato E6;
+    - o CRC das cercas;
+    - as versões crescentes;
+    - a autenticação da Base;
+    - os estados de entrega;
+    - os testes existentes.
+
+
+9. ALTERNATIVAS
+---------------
+
+Alternativa A — Recomendada para o Vercel:
+
+    Vercel + PostgreSQL/Neon ou Supabase.
+
+Alternativa B — Manter SQLite:
+
+    Hospedar o Central em um serviço com disco persistente, como uma VPS,
+    Raspberry, servidor próprio ou plataforma que ofereça volume persistente.
+
+Alternativa C — Somente demonstração local:
+
+    Executar Central e Monitor no computador. Nesse cenário, o SQLite funciona
+    corretamente porque o arquivo permanece no disco local.
+
+
+10. CONFIGURAÇÕES NECESSÁRIAS DEPOIS DA CORREÇÃO
+------------------------------------------------
+
+No Central/Vercel:
+
+    BASE_ID=BASE01
+    BASE_TOKEN=<token-seguro>
+    DATABASE_URL=<conexao-do-banco-persistente>
+
+No Raspberry ou computador que executa o VFence Monitor:
+
+    VFENCE_MOCK_SERIAL=true
+    CENTRAL_SYNC_ENABLED=true
+    CENTRAL_BASE_URL=https://endereco-do-projeto.vercel.app
+    BASE_ID=BASE01
+    BASE_TOKEN=<mesmo-token-do-central>
+
+O BASE_TOKEN precisa ser igual nos dois lados.
+
+
+11. FLUXO ESPERADO APÓS A CORREÇÃO
+----------------------------------
+
+    Produtor desenha a cerca no Vercel
+        -> POST /api/fences
+        -> PostgreSQL salva a nova versão
+        -> Raspberry envia heartbeat
+        -> Central informa desired_fence_version
+        -> Raspberry baixa a cerca
+        -> CRC é validado
+        -> pontos são salvos no SQLite local do Raspberry
+        -> WebSocket atualiza o VFence Monitor
+        -> o mesmo polígono aparece no mapa local
+
+
+12. STATUS ATUAL
+----------------
+
+IMPLEMENTADO:
+
+    - editor de cerca;
+    - validação do polígono;
+    - criação de versões no Central quando executado localmente;
+    - endpoints para a Base;
+    - CentralClient no Raspberry;
+    - heartbeat e download de cerca;
+    - validação de CRC;
+    - persistência local no Raspberry;
+    - exibição da cerca no mapa local;
+    - modo mock sem Gateway físico.
+
+PROBLEMA:
+
+    - o SQLite do Central não é armazenamento persistente adequado para o
+      ambiente serverless do Vercel.
+
+PENDENTE:
+
+    - configurar um banco persistente;
+    - adaptar a camada de persistência do Central;
+    - configurar DATABASE_URL e segredos no Vercel;
+    - repetir o teste Vercel -> Raspberry -> mapa local.
+
+
+CONCLUSÃO
+---------
+
+O problema não está no desenho do mapa nem no código Python do Raspberry.
+
+O bloqueio está na persistência do VFence Central hospedado no Vercel. O
+Central atual foi construído sobre SQLite, enquanto a hospedagem serverless
+precisa de um banco externo persistente para armazenar as cercas de maneira
+confiável.
+
+A correção recomendada é migrar a persistência do Central para PostgreSQL,
+mantendo intactos os endpoints e o restante da arquitetura VFence.

@@ -39,6 +39,10 @@ class Settings:
     collar_gps_timeout_seconds: int = int(os.getenv("COLLAR_GPS_TIMEOUT_SECONDS", "60"))
     collar_low_battery_pct: int = int(os.getenv("COLLAR_LOW_BATTERY_PCT", "20"))
     collar_critical_battery_pct: int = int(os.getenv("COLLAR_CRITICAL_BATTERY_PCT", "5"))
+    metrics_installation_id: str = os.getenv("METRICS_INSTALLATION_ID", "").strip()
+    metrics_gateway_id: str = os.getenv("METRICS_GATEWAY_ID", "").strip()
+    metrics_serial_ack_enabled: bool = _as_bool(os.getenv("METRICS_SERIAL_ACK_ENABLED"), False)
+    terminal_detail: bool = _as_bool(os.getenv("VFENCE_TERMINAL_DETAIL"), False)
 
 
 settings = Settings()

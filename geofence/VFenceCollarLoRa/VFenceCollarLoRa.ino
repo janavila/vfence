@@ -4,8 +4,11 @@
 #include <SPI.h>
 #include <LoRa.h>
 #include <ESP32Servo.h>
+#include <esp_random.h>
 
 #include "collar_config.h"
+#include "counted_position.h"
+#include "terminal_serial.h"
 
 #include "vfence_protocol.h"
 #include "vfence_geofence.h"
@@ -58,6 +61,9 @@ bool secondActuatorActive = false;
 
 uint16_t nextSequence = 0;
 uint32_t nextTelemetryAtMs = 0;
+static uint32_t lastLoRaTxMs = 0;
+static uint32_t lastConfigRxMs = 0;
+static bool hdopConfigGuard = false;
 
 // Bateria ainda nao integrada ao hardware.
 // 0xFF = indisponivel, conforme o protocolo.
@@ -98,6 +104,10 @@ void printHexPacket(const uint8_t* data, size_t len) {
     if (i + 1 < len) Serial.print(' ');
   }
 }
+
+static const bool COLLAR_TERMINAL_DETAIL = false;
+static TerminalSerial collarTerminal;
+static uint32_t countedPositionOrdinal = 0;
 
 void printRadioConfig() {
   Serial.println("--- RADIO CONFIG ---");
@@ -141,14 +151,14 @@ bool initLoRa() {
   return true;
 }
 
-bool transportSend(const uint8_t* data, size_t len) {
+bool transportSend(const uint8_t* data, size_t len, bool logPacket = true) {
   if (!data || len == 0 || len > MAX_PACKET_SIZE) return false;
 
-  Serial.print("[TX LoRa ");
-  Serial.print(len);
-  Serial.print(" bytes] ");
-  printHexPacket(data, len);
-  Serial.println();
+  if (logPacket && COLLAR_TERMINAL_DETAIL) {
+    char hex[MAX_PACKET_SIZE * 3];
+    terminalHex(data, len, hex);
+    collarTerminal.print(Serial, "[TX LoRa %u bytes] %s\n", unsigned(len), hex);
+  }
 
   // SX1276 e half-duplex: sai de RX, transmite e volta imediatamente a RX.
   LoRa.idle();
@@ -160,6 +170,7 @@ bool transportSend(const uint8_t* data, size_t len) {
   const size_t written = LoRa.write(data, len);
   const int result = LoRa.endPacket();
   LoRa.receive();
+  lastLoRaTxMs = millis();
 
   return written == len && result == 1;
 }
@@ -207,9 +218,7 @@ void acknowledgeReliable(uint16_t sequence) {
   for (uint8_t i = 0; i < MAX_PENDING_RELIABLE; ++i) {
     if (pendingTx[i].active && pendingTx[i].sequence == sequence) {
       pendingTx[i].active = false;
-      Serial.print("[ACK] mensagem ");
-      Serial.print(sequence);
-      Serial.println(" confirmada");
+      collarTerminal.print(Serial, "[ACK LoRa] [COL %03u] confirmado seq=%u\n", unsigned(COLLAR_ID), unsigned(sequence));
       return;
     }
   }
@@ -223,12 +232,8 @@ void rejectReliable(uint16_t sequence, ErrorCode errorCode, uint16_t detail) {
     }
   }
 
-  Serial.print("[NACK] seq=");
-  Serial.print(sequence);
-  Serial.print(" erro=0x");
-  Serial.print(static_cast<uint8_t>(errorCode), HEX);
-  Serial.print(" detail=0x");
-  Serial.println(detail, HEX);
+  collarTerminal.print(Serial, "[NACK LoRa] [COL %03u] seq=%u erro=0x%02X detalhe=0x%04X\n",
+                unsigned(COLLAR_ID), unsigned(sequence), unsigned(errorCode), unsigned(detail));
 }
 
 void serviceReliableTx() {
@@ -241,8 +246,8 @@ void serviceReliableTx() {
     if (static_cast<int32_t>(now - tx.nextActionMs) < 0) continue;
 
     if (tx.transmissions >= MAX_TRANSMISSIONS) {
-      Serial.print("[PROTO] falha definitiva de entrega seq=");
-      Serial.println(tx.sequence);
+      collarTerminal.print(Serial, "[ERRO] [COL %03u] ENTREGA LoRa ESGOTADA seq=%u tentativas=%u\n",
+                    unsigned(COLLAR_ID), unsigned(tx.sequence), unsigned(tx.transmissions));
       tx.active = false;
       continue;
     }
@@ -251,10 +256,8 @@ void serviceReliableTx() {
     tx.packet[0] |= FLAG_RETRY;
     ++tx.transmissions;
 
-    Serial.print("[RETRY] seq=");
-    Serial.print(tx.sequence);
-    Serial.print(" tentativa=");
-    Serial.println(tx.transmissions);
+    collarTerminal.print(Serial, "[RETRY LoRa] [COL %03u] seq=%u tentativa=%u\n",
+                  unsigned(COLLAR_ID), unsigned(tx.sequence), unsigned(tx.transmissions));
 
     transportSend(tx.packet, tx.length);
     tx.nextActionMs = scheduleRetryFromNow();
@@ -435,7 +438,8 @@ void setBuzzer(bool on) {
   digitalWrite(BUZZER_PIN, level);
 
   buzzerActive = on;
-  Serial.println(on ? "[ATUADOR] buzzer ON" : "[ATUADOR] buzzer OFF");
+  if (COLLAR_TERMINAL_DETAIL)
+    collarTerminal.print(Serial, "[DIAG] [COL %03u] buzzer=%s\n", unsigned(COLLAR_ID), on ? "ON" : "OFF");
 }
 
 void setSecondActuator(bool on) {
@@ -445,10 +449,8 @@ void setSecondActuator(bool on) {
   secondActuatorServo.write(angle);
 
   secondActuatorActive = on;
-  Serial.print(on ? "[ATUADOR] microservo ATIVO -> "
-                  : "[ATUADOR] microservo REPOUSO -> ");
-  Serial.print(angle);
-  Serial.println(" deg");
+  if (COLLAR_TERMINAL_DETAIL)
+    collarTerminal.print(Serial, "[DIAG] [COL %03u] atuador2=%s\n", unsigned(COLLAR_ID), on ? "ON" : "OFF");
 }
 
 void applyActuators(const GeofenceResult& result) {
@@ -477,6 +479,212 @@ uint16_t currentHdopX100() {
   return static_cast<uint16_t>(lround(v));
 }
 
+static const uint32_t HDOP_SAMPLE_INTERVAL_MS = 1000UL;
+static const uint32_t HDOP_WINDOW_MS = 60000UL;
+static const uint8_t HDOP_SLOTS_PER_WINDOW = HDOP_WINDOW_MS / HDOP_SAMPLE_INTERVAL_MS;
+static const uint8_t HDOP_SUMMARY_CAPACITY = 4;
+static_assert(HDOP_WINDOW_MS == HDOP_SUMMARY_WINDOW_MS, "HDOP window differs from wire contract");
+static_assert(HDOP_SLOTS_PER_WINDOW == HDOP_SUMMARY_MAX_SAMPLES, "HDOP sample limit differs from wire contract");
+
+static uint32_t hdopWindowStartMs = 0;
+static uint32_t hdopWindowSumX100 = 0;
+static uint8_t hdopWindowSampleCount = 0;
+static uint8_t hdopLastSampleSlot = HDOP_SLOTS_PER_WINDOW;
+
+// Resultado da ultima janela fechada, separado dos acumuladores em andamento.
+static uint16_t hdopMeanX100 = U16_UNAVAILABLE;
+static uint8_t hdopSampleCount = 0;
+static bool hdopMeanValid = false;
+
+struct HdopWindowSummary {
+  uint64_t sessionId;
+  uint64_t windowId;
+  uint32_t startedAtMs;
+  uint32_t durationMs;
+  uint16_t hdopMeanX100;
+  uint8_t collarId;
+  uint8_t hdopSampleCount;
+  bool hdopMeanValid;
+};
+
+static uint64_t hdopSessionId = 0;
+static uint64_t hdopNextWindowId = 1;
+static HdopWindowSummary hdopSummaries[HDOP_SUMMARY_CAPACITY];
+static uint8_t hdopSummaryHead = 0;
+static uint8_t hdopSummaryCount = 0;
+static uint64_t hdopDroppedSummaries = 0;
+
+static bool peekPendingHdopSummary(HdopWindowSummary& out);
+
+static bool peekPendingHdopSummary(HdopWindowSummary& out) {
+  if (hdopSummaryCount == 0) return false;
+  out = hdopSummaries[hdopSummaryHead];
+  return true;
+}
+
+static bool consumePendingHdopSummary(uint64_t sessionId, uint64_t windowId) {
+  if (hdopSummaryCount == 0) return false;
+  const HdopWindowSummary& head = hdopSummaries[hdopSummaryHead];
+  if (head.sessionId != sessionId || head.windowId != windowId) return false;
+  hdopSummaryHead = (hdopSummaryHead + 1) % HDOP_SUMMARY_CAPACITY;
+  --hdopSummaryCount;
+  return true;
+}
+
+static void enqueueHdopSummary(uint32_t startedAtMs) {
+  const bool overwritten = hdopSummaryCount == HDOP_SUMMARY_CAPACITY;
+  const uint64_t previous = overwritten ? hdopSummaries[hdopSummaryHead].windowId : 0;
+  if (hdopSummaryCount == HDOP_SUMMARY_CAPACITY) {
+    hdopSummaryHead = (hdopSummaryHead + 1) % HDOP_SUMMARY_CAPACITY;
+    --hdopSummaryCount;
+    ++hdopDroppedSummaries;
+  }
+  const uint8_t tail = (hdopSummaryHead + hdopSummaryCount) % HDOP_SUMMARY_CAPACITY;
+  hdopSummaries[tail] = {hdopSessionId, hdopNextWindowId++, startedAtMs, HDOP_WINDOW_MS,
+                         hdopMeanX100, COLLAR_ID, hdopSampleCount, hdopMeanValid};
+  ++hdopSummaryCount;
+  const auto& summary = hdopSummaries[tail];
+  char mean[12] = "N/A";
+  if (summary.hdopMeanValid) snprintf(mean, sizeof(mean), "%.2f", summary.hdopMeanX100 / 100.0);
+  const bool expanded = Serial.availableForWrite() >= 240;
+  collarTerminal.print(Serial,
+      expanded ? "==== VFENCE | COLEIRA %03u | HDOP 60s ====\n"
+                 " sessao=%016llx janela=%016llx inicioColeira=%lu ms duracao=%lu ms\n"
+                 " amostras=%u HDOP=%s validade=%s | fila=RETIDA PARA TX LoRa\n"
+               : "[HDOP] [COL %03u] s=%016llx j=%016llx t=%lu d=%lu n=%u HDOP=%s %s RETIDA\n",
+      unsigned(COLLAR_ID), static_cast<unsigned long long>(summary.sessionId),
+      static_cast<unsigned long long>(summary.windowId), static_cast<unsigned long>(summary.startedAtMs),
+      static_cast<unsigned long>(summary.durationMs), unsigned(summary.hdopSampleCount), mean,
+      summary.hdopMeanValid ? (expanded ? "VALIDA" : "V") : (expanded ? "INVALIDA" : "INV"));
+  if (overwritten)
+    collarTerminal.print(Serial, "[AVISO] [COL %03u] fila HDOP cheia: janela=%016llx sobrescrita\n",
+                  unsigned(COLLAR_ID), static_cast<unsigned long long>(previous));
+}
+
+static void serviceHdopWindow(uint32_t now) {
+  const uint32_t elapsed = now - hdopWindowStartMs;
+  if (elapsed < HDOP_WINDOW_MS) return;
+
+  const uint32_t completedWindows = elapsed / HDOP_WINDOW_MS;
+  // Em atrasos longos, avancar os IDs e materializar so o que cabe na fila.
+  const uint32_t skipped = completedWindows > HDOP_SUMMARY_CAPACITY
+      ? completedWindows - HDOP_SUMMARY_CAPACITY : 0;
+  hdopNextWindowId += skipped;
+  hdopDroppedSummaries += skipped;
+  if (skipped)
+    collarTerminal.print(Serial, "[AVISO] [COL %03u] HDOP janelas omitidas por atraso=%lu\n",
+                  unsigned(COLLAR_ID), static_cast<unsigned long>(skipped));
+  for (uint32_t offset = skipped; offset < completedWindows; ++offset) {
+    hdopSampleCount = offset == 0 ? hdopWindowSampleCount : 0;
+    hdopMeanValid = hdopSampleCount != 0;
+    hdopMeanX100 = hdopMeanValid
+        ? static_cast<uint16_t>((hdopWindowSumX100 + hdopSampleCount / 2U) / hdopSampleCount)
+        : U16_UNAVAILABLE;
+    enqueueHdopSummary(hdopWindowStartMs + offset * HDOP_WINDOW_MS);
+  }
+
+  hdopWindowStartMs += completedWindows * HDOP_WINDOW_MS;
+  hdopWindowSumX100 = 0;
+  hdopWindowSampleCount = 0;
+  hdopLastSampleSlot = HDOP_SLOTS_PER_WINDOW;
+
+}
+
+static bool hasValidGgaHdopFields(char byte) {
+  // A TinyGPSPlus pode sinalizar HDOP atualizado mesmo com o campo GGA vazio.
+  // Acompanhar qualidade do fix (6) e HDOP (8) ate o checksum da mesma GGA.
+  static uint8_t field = 0;
+  static uint8_t integerDigits = 0;
+  static bool hasDigit = false;
+  static bool hasDot = false;
+  static bool malformed = false;
+  static bool fixQualitySeen = false;
+  static bool gnssFix = false;
+  static bool checksumStarted = false;
+
+  if (byte == '$') {
+    field = 0;
+    integerDigits = 0;
+    hasDigit = hasDot = malformed = false;
+    fixQualitySeen = gnssFix = checksumStarted = false;
+  } else if (!checksumStarted && (byte == ',' || byte == '*')) {
+    if (field <= 8) ++field;
+    checksumStarted = byte == '*';
+  } else if (!checksumStarted && field == 6) {
+    gnssFix = !fixQualitySeen && (byte == '1' || byte == '2' || byte == '4' || byte == '5');
+    fixQualitySeen = true;
+  } else if (!checksumStarted && field == 8) {
+    if (byte >= '0' && byte <= '9') {
+      hasDigit = true;
+      if (!hasDot && ++integerDigits > 3) malformed = true;
+    } else if (byte == '.' && !hasDot) {
+      hasDot = true;
+    } else {
+      malformed = true;
+    }
+  }
+  return checksumStarted && field > 8 && gnssFix && hasDigit && !malformed;
+}
+
+static void sampleUpdatedHdop(uint32_t now, bool eligibleGga) {
+  if (!gps.hdop.isValid()) return;
+  // value() ja retorna HDOP x100 e consome a flag isUpdated().
+  const int32_t hdopX100 = gps.hdop.value();
+  if (!eligibleGga || hdopX100 < 0 || hdopX100 >= U16_UNAVAILABLE) return;
+
+  serviceHdopWindow(now);
+  const uint8_t slot = (now - hdopWindowStartMs) / HDOP_SAMPLE_INTERVAL_MS;
+  // Usar a primeira amostra valida de cada segundo. As demais sao descartadas.
+  if (slot == hdopLastSampleSlot) return;
+  hdopLastSampleSlot = slot;
+  hdopWindowSumX100 += static_cast<uint32_t>(hdopX100);
+  ++hdopWindowSampleCount;
+}
+
+static void serviceHdopSummaryTx(uint32_t now) {
+  static bool scheduled = false;
+  static uint64_t scheduledWindowId = 0;
+  static uint32_t dueAtMs = 0;
+  if (hdopConfigGuard && now - lastConfigRxMs >= 8000UL) hdopConfigGuard = false;
+
+  HdopWindowSummary summary;
+  if (!peekPendingHdopSummary(summary)) {
+    scheduled = false;
+    return;
+  }
+  if (!scheduled || scheduledWindowId != summary.windowId) {
+    scheduled = true;
+    scheduledWindowId = summary.windowId;
+    dueAtMs = now + random(500, 5001);
+    return;
+  }
+  if (static_cast<int32_t>(now - dueAtMs) < 0 || hdopConfigGuard ||
+      now - lastLoRaTxMs < 500UL ||
+      static_cast<int32_t>(nextTelemetryAtMs - now) <= 1250) return;
+  for (const PendingReliableTx& tx : pendingTx) {
+    if (tx.active) return;
+  }
+
+  const HdopSummaryPayload payload{summary.sessionId, summary.windowId, summary.startedAtMs,
+                                   static_cast<uint16_t>(summary.durationMs), summary.hdopMeanX100,
+                                   summary.hdopSampleCount, summary.hdopMeanValid};
+  uint8_t packet[MAX_PACKET_SIZE];
+  const size_t len = encodeHdopSummary(packet, sizeof(packet), summary.collarId,
+                                      allocateSequence(), payload);
+  if (!len || !transportSend(packet, len, COLLAR_TERMINAL_DETAIL)) {
+    dueAtMs = millis() + random(5000, 8001);
+    collarTerminal.print(Serial, "[ERRO] [COL %03u] HDOP 60s sessao=%016llx janela=%016llx falha de TX local\n",
+                  unsigned(COLLAR_ID), static_cast<unsigned long long>(summary.sessionId),
+                  static_cast<unsigned long long>(summary.windowId));
+    return;
+  }
+  consumePendingHdopSummary(summary.sessionId, summary.windowId);
+  scheduled = false;
+  collarTerminal.print(Serial, "[TX LoRa] [COL %03u] HDOP_WINDOW_SUMMARY sessao=%016llx janela=%016llx TX local aceito\n",
+                unsigned(COLLAR_ID), static_cast<unsigned long long>(summary.sessionId),
+                static_cast<unsigned long long>(summary.windowId));
+}
+
 uint8_t currentSatellites() {
   if (!gps.satellites.isValid()) return U8_UNAVAILABLE;
   const uint32_t s = gps.satellites.value();
@@ -499,6 +707,15 @@ uint16_t positionAgeSeconds() {
 // EVENTOS E TELEMETRIA
 // ============================================================
 
+static void printCollarEvent(const char* name, uint16_t seq, bool alert, bool sent) {
+  const char* rule = "";
+  if (Serial.availableForWrite() >= 200)
+    rule = alert ? "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n" : "----------------------------------------\n";
+  collarTerminal.print(Serial, "%s[%s] [COL %03u] %s seq=%u cerca=v%u TX=%s\n%s", rule, alert ? "ALERTA" : "EVENTO",
+                unsigned(COLLAR_ID), name, unsigned(seq), unsigned(activeFenceVersion),
+                sent ? "LOCAL ACEITO" : "FALHA INICIAL", rule);
+}
+
 void sendOutsideOrBackInside(EventSubtype subtype) {
   if (!latestGeofence.valid) return;
 
@@ -511,10 +728,13 @@ void sendOutsideOrBackInside(EventSubtype subtype) {
   eventData.hdopX100 = currentHdopX100();
 
   uint8_t packet[MAX_PACKET_SIZE];
+  const uint16_t seq = allocateSequence();
   const size_t len = encodePositionEvent(packet, sizeof(packet), COLLAR_ID,
-                                         allocateSequence(), false,
+                                         seq, false,
                                          subtype, eventData);
-  if (len) sendReliable(packet, len);
+  const bool outside = subtype == EventSubtype::OUTSIDE;
+  const bool sent = len && sendReliable(packet, len);
+  printCollarEvent(outside ? "OUTSIDE" : "BACK_INSIDE", seq, outside, sent);
 }
 
 void sendGpsLostEvent() {
@@ -525,9 +745,11 @@ void sendGpsLostEvent() {
   d.positionAgeS = positionAgeSeconds();
 
   uint8_t packet[MAX_PACKET_SIZE];
+  const uint16_t seq = allocateSequence();
   const size_t len = encodeGpsLost(packet, sizeof(packet), COLLAR_ID,
-                                   allocateSequence(), false, d);
-  if (len) sendReliable(packet, len);
+                                   seq, false, d);
+  const bool sent = len && sendReliable(packet, len);
+  printCollarEvent("GPS_LOST", seq, true, sent);
 }
 
 void sendGpsRecoveredEvent() {
@@ -537,9 +759,11 @@ void sendGpsRecoveredEvent() {
   d.hdopX100 = currentHdopX100();
 
   uint8_t packet[MAX_PACKET_SIZE];
+  const uint16_t seq = allocateSequence();
   const size_t len = encodeGpsRecovered(packet, sizeof(packet), COLLAR_ID,
-                                        allocateSequence(), false, d);
-  if (len) sendReliable(packet, len);
+                                        seq, false, d);
+  const bool sent = len && sendReliable(packet, len);
+  printCollarEvent("GPS_RECOVERED", seq, false, sent);
 }
 
 void sendDeviceStartedEvent() {
@@ -549,9 +773,11 @@ void sendDeviceStartedEvent() {
   d.batteryPct = batteryPct;
 
   uint8_t packet[MAX_PACKET_SIZE];
+  const uint16_t seq = allocateSequence();
   const size_t len = encodeDeviceStarted(packet, sizeof(packet), COLLAR_ID,
-                                         allocateSequence(), false, d);
-  if (len) sendReliable(packet, len);
+                                         seq, false, d);
+  const bool sent = len && sendReliable(packet, len);
+  printCollarEvent("DEVICE_STARTED", seq, false, sent);
 }
 
 uint8_t buildStateFlags() {
@@ -602,9 +828,39 @@ void sendTelemetryPacket() {
   d.fenceVersion = activeFenceVersion;
 
   uint8_t packet[MAX_PACKET_SIZE];
-  const size_t len = encodeTelemetry(packet, sizeof(packet), COLLAR_ID,
-                                     allocateSequence(), d);
-  if (len) transportSend(packet, len);
+  const uint16_t seq = allocateSequence();
+  const size_t len = COUNTED_POSITION_ENABLED
+      ? encodeCountedPosition(packet, sizeof(packet), COLLAR_ID, seq, d,
+                              {hdopSessionId, countedPositionOrdinal + 1U, INITIAL_LORA_PROFILE})
+      : encodeTelemetry(packet, sizeof(packet), COLLAR_ID, seq, d);
+  const bool sent = len && transportSend(packet, len);
+  if (COUNTED_POSITION_ENABLED && sent) ++countedPositionOrdinal;
+  const bool gpsValid = (d.stateFlags & STATE_GPS_VALID) != 0;
+  const char* zone = "N/A";
+  if (gpsValid) {
+    if (!(d.stateFlags & STATE_INSIDE)) zone = "FORA";
+    else if (d.stateFlags & STATE_VERY_NEAR) zone = "CRITICO";
+    else if (d.stateFlags & STATE_NEAR) zone = "ATENCAO";
+    else zone = "SEGURO";
+  }
+  char hdop[12] = "N/A";
+  if (gpsValid && d.hdopX100 != U16_UNAVAILABLE) snprintf(hdop, sizeof(hdop), "%.2f", d.hdopX100 / 100.0);
+  collarTerminal.print(Serial, "[%s] [COL %03u] POSITION_STATUS seq=%u GPS=%s HDOP=%s ZONA=%s\n",
+                sent ? "TX LoRa" : "ERRO TX LoRa", unsigned(COLLAR_ID), unsigned(seq),
+                gpsValid ? "VALIDO" : "INVALIDO", hdop, zone);
+  if (COLLAR_TERMINAL_DETAIL) {
+    char lat[24] = "N/A", lon[24] = "N/A", sats[8] = "N/A", border[16] = "N/A", battery[8] = "N/A";
+    if (d.position.lat != COORD_UNAVAILABLE) snprintf(lat, sizeof(lat), "%.7f", e7ToDegrees(d.position.lat));
+    if (d.position.lon != COORD_UNAVAILABLE) snprintf(lon, sizeof(lon), "%.7f", e7ToDegrees(d.position.lon));
+    if (d.satellites != U8_UNAVAILABLE) snprintf(sats, sizeof(sats), "%u", unsigned(d.satellites));
+    if (d.distanceBorderM != U16_UNAVAILABLE) snprintf(border, sizeof(border), "%um", unsigned(d.distanceBorderM));
+    if (d.batteryPct != U8_UNAVAILABLE) snprintf(battery, sizeof(battery), "%u%%", unsigned(d.batteryPct));
+    collarTerminal.print(Serial, "[DIAG] [COL %03u] seq=%u lat=%s lon=%s sat=%s borda=%s bateria=%s cerca=v%u flags=0x%02X buzzer=%s atuador2=%s\n",
+                  unsigned(COLLAR_ID), unsigned(seq), lat, lon, sats, border, battery,
+                  unsigned(d.fenceVersion), unsigned(d.stateFlags),
+                  (d.stateFlags & STATE_BUZZER_ACTIVE) ? "ON" : "OFF",
+                  (d.stateFlags & STATE_SECOND_ACTUATOR_ACTIVE) ? "ON" : "OFF");
+  }
 }
 
 // ============================================================
@@ -646,7 +902,10 @@ void processConfig(const PacketView& packet) {
     }
 
     ackIncoming(packet);
-    Serial.println("[FENCE] inicio de nova cerca aceito");
+    collarTerminal.print(Serial, "==== VFENCE | COLEIRA %03u | CERCA ====\n"
+                  "[OK] inicio v%u vertices=%u chunks=%u CRC32=0x%08lX\n",
+                  unsigned(COLLAR_ID), unsigned(version), unsigned(vertexCount), unsigned(chunkCount),
+                  static_cast<unsigned long>(crc));
     return;
   }
 
@@ -667,8 +926,9 @@ void processConfig(const PacketView& packet) {
       return;
     }
 
-    Serial.print("[FENCE] chunk recebido: ");
-    Serial.println(chunkIndex);
+    if (COLLAR_TERMINAL_DETAIL)
+      collarTerminal.print(Serial, "[DIAG] [COL %03u] CERCA v%u chunk=%u recebido\n",
+                    unsigned(COLLAR_ID), unsigned(version), unsigned(chunkIndex));
     return;
   }
 
@@ -704,7 +964,7 @@ void processConfig(const PacketView& packet) {
 
     pendingFence.clear();
     ackIncoming(packet);
-    Serial.println("[FENCE] nova cerca ativada e persistida");
+    collarTerminal.print(Serial, "[OK] [COL %03u] CERCA v%u ativada e persistida\n", unsigned(COLLAR_ID), unsigned(version));
     return;
   }
 
@@ -770,7 +1030,7 @@ void processControl(const PacketView& packet) {
 void processIncomingPacket(const uint8_t* data, size_t len) {
   PacketView packet;
   if (!decodePacket(data, len, packet)) {
-    Serial.println("[RX] pacote invalido: tamanho/cabecalho");
+    collarTerminal.print(Serial, "[RX] pacote invalido: tamanho/cabecalho\n");
     return;
   }
 
@@ -787,6 +1047,8 @@ void processIncomingPacket(const uint8_t* data, size_t len) {
 
   switch (packet.header.type) {
     case MessageType::CONFIG:
+      lastConfigRxMs = millis();
+      hdopConfigGuard = true;
       processConfig(packet);
       break;
     case MessageType::CONTROL:
@@ -794,7 +1056,7 @@ void processIncomingPacket(const uint8_t* data, size_t len) {
       break;
     case MessageType::EVENT:
     case MessageType::TELEMETRY:
-      Serial.println("[RX] tipo nao esperado na coleira");
+      collarTerminal.print(Serial, "[RX] tipo nao esperado na coleira\n");
       break;
   }
 }
@@ -818,21 +1080,16 @@ void pollLoRaReceive() {
   const float snr = LoRa.packetSnr();
 
   if (oversized) {
-    Serial.print("[RX LoRa] pacote maior que MAX_PACKET_SIZE: ");
-    Serial.println(packetSize);
+    collarTerminal.print(Serial, "[RX LoRa] pacote maior que MAX_PACKET_SIZE: %d\n", packetSize);
     return;
   }
 
-  Serial.println();
-  Serial.print("[RX LoRa ");
-  Serial.print(count);
-  Serial.print(" bytes | RSSI=");
-  Serial.print(rssi);
-  Serial.print(" dBm | SNR=");
-  Serial.print(snr, 2);
-  Serial.println(" dB]");
-  printHexPacket(data, count);
-  Serial.println();
+  if (COLLAR_TERMINAL_DETAIL) {
+    char hex[MAX_PACKET_SIZE * 3];
+    terminalHex(data, count, hex);
+    collarTerminal.print(Serial, "[RX LoRa] [COL %03u] bytes=%u RSSI=%ddBm SNR=%.2fdB\n%s\n",
+                         unsigned(COLLAR_ID), unsigned(count), rssi, static_cast<double>(snr), hex);
+  }
 
   processIncomingPacket(data, count);
 }
@@ -886,6 +1143,7 @@ void processNewGpsPosition() {
   latestPosition.lon = degreesToE7(gps.location.lng());
 
   const bool wasLost = gpsLostState;
+  const bool firstFix = !gpsEverValid;
   gpsEverValid = true;
   gpsLostState = false;
   lastValidGpsMs = millis();
@@ -909,6 +1167,10 @@ void processNewGpsPosition() {
           : EventSubtype::OUTSIDE);
     }
   }
+  if (firstFix) {
+    collarTerminal.print(Serial, "[GPS] [COL %03u] FIX ADQUIRIDO lat=%.7f lon=%.7f\n",
+                  unsigned(COLLAR_ID), e7ToDegrees(latestPosition.lat), e7ToDegrees(latestPosition.lon));
+  }
 }
 
 void serviceGpsTimeout() {
@@ -920,7 +1182,6 @@ void serviceGpsTimeout() {
   if (millis() - reference >= timeoutMs) {
     gpsLostState = true;
     sendGpsLostEvent();
-    Serial.println("[GPS] estado GPS_LOST ativado");
   }
 }
 
@@ -930,6 +1191,7 @@ void serviceGpsTimeout() {
 
 void setup() {
   Serial.begin(115200);
+  esp_fill_random(&hdopSessionId, sizeof(hdopSessionId));
   delay(1500);
 
   randomSeed(static_cast<uint32_t>(micros()));
@@ -940,7 +1202,7 @@ void setup() {
   GPSserial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, -1);
 
   if (!initLoRa()) {
-    Serial.println("[FATAL] Falha ao iniciar LoRa.");
+    Serial.printf("[FATAL] [COL %03u] falha ao iniciar LoRa\n", unsigned(COLLAR_ID));
     Serial.println("Verifique placa, pinos, antena e frequencia.");
     while (true) delay(1000);
   }
@@ -957,7 +1219,7 @@ void setup() {
 
   Serial.println();
   Serial.println("========================================");
-  Serial.println(" VFENCE BETA - PROTOCOL v1 + GEOFENCE");
+  Serial.printf(" VFENCE | COLEIRA %03u | INICIALIZACAO\n", unsigned(COLLAR_ID));
   Serial.println("========================================");
   Serial.print("Collar ID: 0x");
   Serial.println(COLLAR_ID, HEX);
@@ -965,18 +1227,36 @@ void setup() {
   Serial.println(activeFenceVersion);
   Serial.print("Vertices: ");
   Serial.println(activeFenceCount);
-  Serial.println("Transporte atual: LoRa SX1276");
   printRadioConfig();
-  Serial.println();
+  Serial.printf("[INFO] GNSS UART=%lu baud, aguardando fix\n", static_cast<unsigned long>(GPS_BAUD));
+  Serial.println("[OK] Inicializacao concluida");
+  Serial.println("============================================================");
 
   // Como nextSequence inicia em zero, DEVICE_STARTED usa sequence 0.
   sendDeviceStartedEvent();
+  hdopWindowStartMs = millis();
+}
+
+static void serviceCollarTerminalSummary(uint32_t now) {
+  static uint32_t attemptedAt = 0, reported = 0;
+  if (now - attemptedAt < 60000UL || reported == collarTerminal.omitted() || GPSserial.available()) return;
+  for (const auto& tx : pendingTx) {
+    if (tx.active) return;
+  }
+  attemptedAt = now;
+  if (collarTerminal.tryPrint(Serial, "[AVISO] [COL %03u] logsOmitidos=%lu descartesHDOP=%llu\n",
+      unsigned(COLLAR_ID), static_cast<unsigned long>(collarTerminal.omitted()),
+      static_cast<unsigned long long>(hdopDroppedSummaries))) reported = collarTerminal.omitted();
 }
 
 void loop() {
   // GPS deve ser drenado continuamente.
   while (GPSserial.available() > 0) {
-    gps.encode(GPSserial.read());
+    const char byte = static_cast<char>(GPSserial.read());
+    const bool eligibleGga = hasValidGgaHdopFields(byte);
+    if (gps.encode(byte) && gps.hdop.isUpdated()) {
+      sampleUpdatedHdop(millis(), eligibleGga);
+    }
   }
 
   if (gps.location.isUpdated() && gps.location.isValid()) {
@@ -992,4 +1272,8 @@ void loop() {
     sendTelemetryPacket();
     scheduleNextTelemetry();
   }
+
+  serviceHdopWindow(millis());
+  serviceHdopSummaryTx(millis());
+  serviceCollarTerminalSummary(millis());
 }

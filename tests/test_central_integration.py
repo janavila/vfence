@@ -1,4 +1,5 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
 import httpx
@@ -144,14 +145,40 @@ class FakeConnection:
         self.writes = []
 
     def write(self, data):
-        self.writes.append(data.decode("ascii").strip())
+        self.writes.append(data.decode("utf-8").strip())
         return len(data)
 
     def flush(self):
         return None
 
 
-async def test_serial_fence_commands_are_ordered_and_wait_for_real_success_line():
+def parse_serial_command(line):
+    assert line.startswith("[CMD] ")
+    return json.loads(line[6:])
+
+
+async def answer_serial_commands(reader, connection, *, stop_at):
+    answered = 0
+    commands = []
+    for _ in range(300):
+        while answered < len(connection.writes):
+            command = parse_serial_command(connection.writes[answered])
+            answered += 1
+            commands.append(command)
+            await reader.process_line("[APP] " + json.dumps({
+                "schema": "vfence.gateway.serial.v1",
+                "kind": "command_response",
+                "requestId": command["requestId"],
+                "command": command["command"],
+                "ok": True,
+            }))
+            if command["command"] == stop_at:
+                return commands
+        await asyncio.sleep(0.005)
+    raise AssertionError(f"command {stop_at} was not sent")
+
+
+async def test_serial_fence_commands_are_json_ordered_and_wait_for_confirmation():
     config = base_config()
     db = Database("sqlite:///:memory:")
     db.initialize()
@@ -160,34 +187,63 @@ async def test_serial_fence_commands_are_ordered_and_wait_for_real_success_line(
     reader._connection = connection
 
     task = asyncio.create_task(reader.send_fence("COL01", contract_fence()))
-    for _ in range(100):
-        if connection.writes and connection.writes[-1] == "FENCE_SEND":
-            break
-        await asyncio.sleep(0.01)
-    assert connection.writes[0].startswith("PARAM 1 ")
-    assert connection.writes[1] == "FENCE_NEW 1 1 4"
-    assert connection.writes[2].startswith("FENCE_POINT 0 -31.3060000 -54.0642000")
-    assert connection.writes[-1] == "FENCE_SEND"
+    commands = await answer_serial_commands(reader, connection, stop_at="FENCE_SEND")
+    assert [item["command"] for item in commands] == [
+        "SET_PARAMETERS", "FENCE_NEW",
+        "FENCE_POINT", "FENCE_POINT", "FENCE_POINT", "FENCE_POINT",
+        "FENCE_SEND",
+    ]
+    assert [item["requestId"] for item in commands] == list(range(1, 8))
+    assert commands[1]["collarId"] == 1
+    assert commands[1]["fenceVersion"] == 1
+    assert commands[2]["latitude"] == -31.306
+    assert commands[2]["longitude"] == -54.0642
     assert not task.done()
-    await reader.process_line("[FENCE TX] SUCESSO: nova cerca confirmada pela coleira.")
+    await reader.process_line('[APP] {"schema":"vfence.gateway.serial.v1",'
+                              '"kind":"fence_transfer","requestId":7,'
+                              '"collarId":1,"fenceVersion":1,"state":"started"}')
+    assert not task.done()
+    await reader.process_line('[APP] {"schema":"vfence.gateway.serial.v1",'
+                              '"kind":"fence_transfer","requestId":7,'
+                              '"collarId":1,"fenceVersion":1,"state":"confirmed"}')
     assert await task == (True, "collar_confirmed")
 
 
-async def test_serial_fence_nack_keeps_result_as_failure():
+async def test_serial_fence_structured_failure_keeps_result_as_failure():
     config = base_config()
     db = Database("sqlite:///:memory:")
     db.initialize()
     reader = SerialReader(config, db, Hub())
-    reader._connection = FakeConnection()
+    connection = FakeConnection()
+    reader._connection = connection
     task = asyncio.create_task(reader.send_fence("COL01", contract_fence()))
-    for _ in range(100):
-        if reader._connection.writes and reader._connection.writes[-1] == "FENCE_SEND":
-            break
-        await asyncio.sleep(0.01)
-    await reader.process_line(
-        "[FENCE TX] transferencia abortada: FENCE_COMMIT rejeitado"
+    commands = await answer_serial_commands(reader, connection, stop_at="FENCE_SEND")
+    request_id = commands[-1]["requestId"]
+    await reader.process_line("[APP] " + json.dumps({
+        "schema": "vfence.gateway.serial.v1",
+        "kind": "fence_transfer",
+        "requestId": request_id,
+        "collarId": 1,
+        "fenceVersion": 1,
+        "state": "failed",
+        "detail": "CRC_ERROR",
+    }))
+    assert await task == (False, "CRC_ERROR")
+
+
+async def test_serial_fence_confirmation_timeout_is_reported():
+    config = base_config()
+    db = Database("sqlite:///:memory:")
+    db.initialize()
+    reader = SerialReader(config, db, Hub())
+    connection = FakeConnection()
+    reader._connection = connection
+
+    task = asyncio.create_task(
+        reader.send_fence("COL01", contract_fence(), timeout_seconds=0.01)
     )
-    assert await task == (False, "FENCE_COMMIT rejeitado")
+    await answer_serial_commands(reader, connection, stop_at="FENCE_SEND")
+    assert await task == (False, "gateway_confirmation_timeout")
 
 
 async def test_gateway_app_telemetry_enters_database_and_outbox():

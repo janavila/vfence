@@ -1,33 +1,152 @@
 from __future__ import annotations
 
 import asyncio
-from fastapi import WebSocket
+import logging
+from collections import Counter
+from dataclasses import dataclass
+
+from fastapi import WebSocket, WebSocketDisconnect
+
+
+logger = logging.getLogger("realtime")
+_MAX_CLIENTS = 16
+_CLIENT_QUEUE_CAPACITY = 32
+_CLIENT_IO_TIMEOUT_SECONDS = 1.0
+_UPDATE_TYPES = {"telemetry", "gateway", "gateway_event", "central", "fence", "fence_transfer"}
+
+
+@dataclass(slots=True)
+class _Client:
+    queue: asyncio.Queue[dict | None]
+    done: asyncio.Future[None]
+    closing: bool = False
+    close_code: int | None = None
 
 
 class RealtimeHub:
     def __init__(self) -> None:
-        self._connections: set[WebSocket] = set()
-        self._lock = asyncio.Lock()
+        self._connections: dict[WebSocket, _Client] = {}
+        self._closed = False
+        self.dropped_updates: Counter[str] = Counter()
+        self.full_queues = 0
+        self.send_timeouts = 0
 
-    async def connect(self, websocket: WebSocket) -> None:
-        await websocket.accept()
-        async with self._lock:
-            self._connections.add(websocket)
-
-    async def disconnect(self, websocket: WebSocket) -> None:
-        async with self._lock:
-            self._connections.discard(websocket)
+    def start(self) -> None:
+        self._closed = False
 
     async def broadcast(self, message: dict) -> None:
-        async with self._lock:
-            connections = list(self._connections)
-        dead = []
-        for websocket in connections:
+        # Todos os chamadores usam o mesmo loop ASGI. Enfileirar aqui nao faz I/O.
+        for client in self._connections.values():
+            if client.closing:
+                continue
             try:
-                await websocket.send_json(message)
+                client.queue.put_nowait(message)
+            except asyncio.QueueFull:
+                self.full_queues += 1
+                self._record_drop(message)
+                dropped = self._stop_client(client, 1013)
+                logger.warning("websocket backlog full (%d updates discarded)", dropped + 1)
+
+    async def serve(self, websocket: WebSocket, initial: tuple[dict, ...]) -> None:
+        if self._closed or len(self._connections) >= _MAX_CLIENTS:
+            logger.warning("websocket connection refused (hub closed or at capacity)")
+            await self._close_socket(websocket, 1013)
+            return
+
+        client = _Client(asyncio.Queue(maxsize=_CLIENT_QUEUE_CAPACITY),
+                         asyncio.get_running_loop().create_future())
+        for message in initial:
+            client.queue.put_nowait(message)
+        self._connections[websocket] = client
+        try:
+            await asyncio.wait_for(websocket.accept(), timeout=_CLIENT_IO_TIMEOUT_SECONDS)
+            writer = asyncio.create_task(self._write_client(websocket, client), name="vfence-websocket-writer")
+            receiver = asyncio.create_task(self._read_client(websocket), name="vfence-websocket-reader")
+            try:
+                await asyncio.wait((writer, receiver), return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                self._stop_client(client, None if receiver.done() else 1001)
+                receiver.cancel()
+                for result in await asyncio.gather(writer, receiver, return_exceptions=True):
+                    if isinstance(result, Exception) and not isinstance(result, WebSocketDisconnect):
+                        logger.error("websocket client failed", exc_info=(type(result), result, result.__traceback__))
+        except asyncio.TimeoutError:
+            logger.warning("websocket handshake timed out")
+            await self._close_socket(websocket, 1013)
+        finally:
+            self._discard_pending(client)
+            self._connections.pop(websocket, None)
+            client.done.set_result(None)
+
+    async def close(self) -> None:
+        self._closed = True
+        clients = tuple(self._connections.values())
+        dropped = sum(self._stop_client(client, 1001) for client in clients)
+        if dropped:
+            logger.info("websocket shutdown (%d queued updates discarded)", dropped)
+        await asyncio.gather(*(asyncio.shield(client.done) for client in clients))
+
+    @staticmethod
+    async def _read_client(websocket: WebSocket) -> None:
+        while True:
+            await websocket.receive_text()
+
+    async def _write_client(self, websocket: WebSocket, client: _Client) -> None:
+        while (message := await client.queue.get()) is not None:
+            try:
+                await asyncio.wait_for(websocket.send_json(message), timeout=_CLIENT_IO_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                self.send_timeouts += 1
+                self._record_drop(message)
+                dropped = self._stop_client(client, 1013)
+                logger.warning("websocket send timed out (%d updates discarded)", dropped + 1)
+                break
+            except asyncio.CancelledError:
+                self._record_drop(message)
+                raise
+            except (WebSocketDisconnect, OSError):
+                self._record_drop(message)
+                self._stop_client(client, None)
+                logger.debug("websocket already disconnected", exc_info=True)
+                break
             except Exception:
-                dead.append(websocket)
-        if dead:
-            async with self._lock:
-                for websocket in dead:
-                    self._connections.discard(websocket)
+                self._record_drop(message)
+                dropped = self._stop_client(client, 1011)
+                logger.exception("websocket send failed (%d updates discarded)", dropped + 1)
+                break
+        if client.close_code is not None:
+            await self._close_socket(websocket, client.close_code)
+
+    @staticmethod
+    async def _close_socket(websocket: WebSocket, code: int) -> None:
+        try:
+            await asyncio.wait_for(websocket.close(code=code), timeout=_CLIENT_IO_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning("websocket close timed out")
+        except (WebSocketDisconnect, OSError):
+            logger.debug("websocket already disconnected", exc_info=True)
+        except Exception:
+            logger.warning("websocket close failed", exc_info=True)
+
+    def _stop_client(self, client: _Client, code: int | None) -> int:
+        if client.closing:
+            return 0
+        client.closing = True
+        client.close_code = code
+        dropped = self._discard_pending(client)
+        client.queue.put_nowait(None)
+        return dropped
+
+    def _discard_pending(self, client: _Client) -> int:
+        dropped = 0
+        while not client.queue.empty():
+            message = client.queue.get_nowait()
+            if message is not None:
+                self._record_drop(message)
+                dropped += 1
+        return dropped
+
+    def _record_drop(self, message: dict) -> None:
+        update_type = message.get("type")
+        key = update_type if isinstance(update_type, str) and update_type in _UPDATE_TYPES else "other"
+        self.dropped_updates[key] += 1

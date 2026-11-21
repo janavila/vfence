@@ -1,0 +1,813 @@
+VFENCE — LEVANTAMENTO DOS VALORES ATUAIS PARA DEFINIÇÃO DOS QUATRO PERFIS LoRa
+Data: 10/11/2026
+Fonte principal: working tree atual do repositório VFence.
+Objetivo: reunir valores reais antes da definição futura dos perfis P0, P1, P2 e P3.
+
+IMPORTANTE
+
+- Este documento não define os quatro perfis finais.
+- Este documento não cria algoritmo de seleção.
+- Configurações atuais, históricas, valores fornecidos pelo relatório IP1 e sugestões são separados.
+- Nenhum valor experimental ausente foi estimado.
+- A versão e o código-fonte da biblioteca LoRa instalada não estão no repositório.
+
+LEGENDA
+
+ATUAL: está no firmware ativo.
+HISTÓRICO: está em protótipo/teste antigo ou no relato IP1.
+OBSERVADO EM TESTE DE SOFTWARE: aparece em teste automatizado ou exemplo; não prova medição física.
+FORNECIDO PELO PROMPT/IP1: valor informado para o ensaio, sem dados brutos encontrados.
+NÃO COMPROVADO: não há evidência suficiente no repositório.
+SUGESTÃO: orientação para trabalho futuro; não é comportamento atual.
+
+============================================================
+1. CONFIGURAÇÕES LoRa ATUAIS DO GATEWAY
+============================================================
+
+Firmware ativo:
+
+- gateway/VFenceGateway/gateway_config.h
+- gateway/VFenceGateway/VFenceGateway.ino
+
+PARÂMETRO | GATEWAY ATUAL | PADRÃO DA BIBLIOTECA | ARQUIVO/LINHA | OBSERVAÇÃO
+
+SF | 7 | não confirmado localmente | gateway_config.h:21; VFenceGateway.ino:224 | explicitamente configurado
+BW | 125000 Hz | não confirmado localmente | gateway_config.h:22; VFenceGateway.ino:225 | explicitamente configurado
+CR | 4/5 | não confirmado localmente | gateway_config.h:23; VFenceGateway.ino:226 | setCodingRate4(5)
+TX Power | 14 dBm solicitados | não confirmado localmente | gateway_config.h:26; VFenceGateway.ino:229 | valor pedido à biblioteca
+Preâmbulo | 8 símbolos | não confirmado localmente | gateway_config.h:24; VFenceGateway.ino:227 | explicitamente configurado
+Frequência | 915000000 Hz | não aplicável | gateway_config.h:10; VFenceGateway.ino:220 | passada a LoRa.begin
+Sync Word | 0x12 | não confirmado localmente | gateway_config.h:25; VFenceGateway.ino:228 | explicitamente configurado
+CRC PHY | ligado | não confirmado localmente | VFenceGateway.ino:230 | LoRa.enableCrc
+Modo RX | contínuo após init/TX | não aplicável | VFenceGateway.ino:231,252 | LoRa.receive
+Header implícito/explícito | não configurado pelo projeto | não confirmado | nenhuma chamada encontrada | depende da biblioteca
+IQ inversion | não configurado | não confirmado | nenhuma chamada encontrada | depende da biblioteca
+Ganho/LNA | não configurado | não confirmado | nenhuma chamada setGain encontrada | depende da biblioteca/chip
+AGC | não configurado diretamente | não confirmado | nenhuma escrita de registrador | depende da biblioteca/chip
+Low Data Rate Optimization | não configurado diretamente | não confirmado | nenhuma chamada/registro local | pode depender da biblioteca
+SPI clock | não configurado diretamente | não confirmado | biblioteca externa | não comprovado
+Current limit/OCP | não configurado diretamente | não confirmado | nenhuma chamada local | depende da biblioteca/chip
+Frequency hopping | não configurado | não confirmado | nenhuma chamada local | não usado explicitamente
+
+Pinagem do Gateway, gateway_config.h:12-17:
+
+SCK=5
+MISO=19
+MOSI=27
+NSS/SS=18
+RESET=14
+DIO0=26
+
+Inicialização real, VFenceGateway.ino, initLoRa, aproximadamente linhas 216-232:
+
+SPI.begin(SCK,MISO,MOSI,SS)
+→ LoRa.setPins(SS,RST,DIO0)
+→ LoRa.begin(915000000)
+→ LoRa.setSpreadingFactor(7)
+→ LoRa.setSignalBandwidth(125000)
+→ LoRa.setCodingRate4(5)
+→ LoRa.setPreambleLength(8)
+→ LoRa.setSyncWord(0x12)
+→ LoRa.setTxPower(14)
+→ LoRa.enableCrc()
+→ LoRa.receive()
+
+============================================================
+2. CONFIGURAÇÕES LoRa ATUAIS DA COLEIRA
+============================================================
+
+Firmware ativo:
+
+- geofence/VFenceCollarLoRa/collar_config.h
+- geofence/VFenceCollarLoRa/VFenceCollarLoRa.ino
+
+PARÂMETRO | COLEIRA ATUAL | PADRÃO DA BIBLIOTECA | ARQUIVO/LINHA | OBSERVAÇÃO
+
+SF | 7 | não confirmado localmente | collar_config.h:26; VFenceCollarLoRa.ino:131 | explícito
+BW | 125000 Hz | não confirmado localmente | collar_config.h:27; VFenceCollarLoRa.ino:132 | explícito
+CR | 4/5 | não confirmado localmente | collar_config.h:28; VFenceCollarLoRa.ino:133 | setCodingRate4(5)
+TX Power | 14 dBm solicitados | não confirmado localmente | collar_config.h:31; VFenceCollarLoRa.ino:136 | explícito
+Preâmbulo | 8 símbolos | não confirmado localmente | collar_config.h:29; VFenceCollarLoRa.ino:134 | explícito
+Frequência | 915000000 Hz | não aplicável | collar_config.h:17; VFenceCollarLoRa.ino:127 | LoRa.begin
+Sync Word | 0x12 | não confirmado localmente | collar_config.h:30; VFenceCollarLoRa.ino:135 | explícito
+CRC PHY | ligado | não confirmado localmente | VFenceCollarLoRa.ino:137 | LoRa.enableCrc
+Modo RX | contínuo após init/TX | não aplicável | VFenceCollarLoRa.ino:138,160 | LoRa.receive
+Header implícito/explícito | não configurado | não confirmado | nenhuma chamada encontrada | depende da biblioteca
+IQ inversion | não configurado | não confirmado | nenhuma chamada encontrada | depende da biblioteca
+Ganho/LNA | não configurado | não confirmado | nenhuma chamada encontrada | depende da biblioteca/chip
+AGC | não configurado diretamente | não confirmado | nenhuma escrita local | depende da biblioteca/chip
+Low Data Rate Optimization | não configurado diretamente | não confirmado | nenhuma chamada local | depende da biblioteca
+
+Pinagem da coleira, collar_config.h:19-24:
+
+SCK=5
+MISO=19
+MOSI=27
+NSS/SS=18
+RESET=14
+DIO0=26
+
+Gateway e coleira utilizam os mesmos parâmetros PHY explícitos.
+
+============================================================
+3. COMPARAÇÃO ENTRE FIRMWARE ATUAL E TESTES ANTIGOS
+============================================================
+
+Teste histórico:
+
+- Testelora/sender/sender.ino
+- Testelora/receiver/receiver.ino
+
+O sender histórico configura explicitamente:
+
+- frequência 915 MHz em Testelora/sender/sender.ino:24;
+- TX Power 5 dBm em Testelora/sender/sender.ino:29;
+- intervalo de 2 segundos em sender.ino:46;
+- payload textual VFENCE_TESTE_N.
+
+O receiver histórico configura explicitamente:
+
+- frequência 915 MHz em Testelora/receiver/receiver.ino:22;
+- leitura individual de RSSI em receiver.ino:44-45;
+- leitura individual de SNR em receiver.ino:47-48.
+
+O código histórico NÃO chama explicitamente:
+
+- setSpreadingFactor;
+- setSignalBandwidth;
+- setCodingRate4;
+- setPreambleLength;
+- setSyncWord;
+- enableCrc.
+
+Portanto, no firmware histórico salvo no repositório, SF, BW, CR, preâmbulo, sync word e CRC
+dependiam dos defaults da versão da biblioteca utilizada naquele ensaio.
+
+O relatório IP1 é descrito no prompt como tendo usado:
+
+- SF7;
+- BW 125 kHz;
+- CR 4/5;
+- TX Power 5 dBm;
+- frequência 915 MHz.
+
+Classificação desses valores:
+
+915 MHz | comprovado no código histórico
+TX5 dBm | comprovado no código histórico
+SF7 | fornecido pelo relatório IP1; não explicitado no código histórico
+BW125 | fornecido pelo relatório IP1; não explicitado no código histórico
+CR4/5 | fornecido pelo relatório IP1; não explicitado no código histórico
+Preâmbulo | não informado no trecho fornecido e não explicitado no código histórico
+Sync word | não explicitado no código histórico
+CRC | não habilitado explicitamente no código histórico
+
+Mudanças do teste histórico para o firmware ativo:
+
+PARÂMETRO | TESTE HISTÓRICO | FIRMWARE ATIVO | DIFERENÇA
+
+Frequência | 915 MHz explícitos | 915 MHz explícitos | mantida
+TX Power | 5 dBm explícitos | 14 dBm explícitos | aumentou 9 dB na configuração solicitada
+SF | relatório diz SF7, código usa default | SF7 explícito | valor preservado, agora explícito
+BW | relatório diz 125 kHz, código usa default | 125 kHz explícitos | valor preservado, agora explícito
+CR | relatório diz 4/5, código usa default | 4/5 explícito | valor preservado, agora explícito
+Preâmbulo | default não identificado | 8 explícito | atual passou a ser determinístico
+Sync word | default não identificado | 0x12 explícito | atual passou a ser determinístico
+CRC PHY | não explicitamente habilitado | explicitamente ligado | proteção atual explícita
+Payload | texto VFENCE_TESTE_N | binário VFENCE v1 | protocolo substituído
+ACK/retry | inexistente | implementado para mensagens confiáveis | funcionalidade nova
+
+O valor atual de TX Power é 14 dBm nos dois firmwares ativos.
+
+Não é possível afirmar apenas pelo código que a potência RF física entregue seja exatamente 14 dBm.
+O valor é o solicitado à biblioteca e depende do módulo, alimentação, caminho de RF e biblioteca.
+
+============================================================
+4. INVENTÁRIO DAS MÉTRICAS E VALORES
+============================================================
+
+4.1 RSSI
+
+Tipo no Gateway: int.
+Tipo na coleira para downlink: int local.
+Tipo em ParsedPacket: float ou None.
+SQLite local: REAL.
+PostgreSQL Central: INTEGER.
+Unidade: dBm.
+Origem: LoRa.packetRssi().
+Gateway: VFenceGateway.ino:1115.
+Coleira: VFenceCollarLoRa.ino:782.
+
+Uso atual:
+
+- log por pacote recebido;
+- último RSSI por coleira em CollarState.lastRssi;
+- JSON de telemetria;
+- SQLite e PostgreSQL;
+- dashboard/status.
+
+Natureza: valor individual do último pacote, não média.
+Limiar no código: nenhum.
+Intervalo validado pelo projeto: nenhum.
+Intervalo do hardware: não deve ser inferido sem datasheet/versão da biblioteca.
+
+Valores encontrados em exemplos/testes de software:
+
+- -103 dBm em README.md e tests/test_protocol.py;
+- -90 dBm em tests/test_gateway_serial.py e tests/test_central_integration.py;
+- -83 dBm em tests/test_gateway_serial.py;
+- -92 dBm em testes da Central.
+
+Esses números validam parsers e APIs; não são necessariamente medições físicas.
+
+Valores físicos fornecidos pelo prompt/IP1:
+
+- aproximadamente -110 a -115 dBm em condições difíceis.
+
+Sem dados brutos não é possível calcular mínimo, máximo e média por distância.
+
+4.2 SNR
+
+Tipo no Gateway: float.
+Tipo na coleira para downlink: float local.
+SQLite/PostgreSQL: REAL/DOUBLE PRECISION.
+Unidade: dB.
+Origem: LoRa.packetSnr().
+Gateway: VFenceGateway.ino:1116.
+Coleira: VFenceCollarLoRa.ino:783.
+
+Uso atual:
+
+- log por pacote;
+- último SNR por coleira;
+- JSON de telemetria;
+- persistência local e Central.
+
+Natureza: valor individual, não média.
+Limiar no código: nenhum.
+Intervalo validado pelo projeto: nenhum.
+
+Valores encontrados em exemplos/testes de software:
+
+- 6,50 dB em README.md/tests/test_protocol.py;
+- 7,5 dB em testes Serial/Central;
+- 8,5 dB em test_gateway_serial.py.
+
+Valores físicos fornecidos pelo prompt/IP1:
+
+- aproximadamente -11 dB nas condições mais difíceis.
+
+Sem dados brutos não é possível calcular mínimo, máximo e média por distância.
+
+4.3 PDR
+
+Tipo atual no código: inexistente.
+Unidade pretendida: percentual.
+Origem atual: inexistente.
+Persistência atual: inexistente.
+Limiar atual: inexistente.
+
+O firmware não mantém contadores totais de TX e RX por janela. Portanto não calcula PDR.
+
+Valores fornecidos pelo prompt/IP1:
+
+DISTÂNCIA | PDR INFORMADO
+
+10 m | 100%
+50 m | 100%
+100 m | 78%
+200 m | 88%
+280 m | 34%
+330 m | 8%
+410 m | 8%
+
+Observação importante: PDR de 200 m maior que o de 100 m não é impossível em campo, mas mostra
+que distância não foi a única variável relevante. Orientação, obstáculos, antenas, altura, ruído,
+tamanho da amostra e condições do ensaio podem ter influenciado. O repositório não contém dados
+suficientes para determinar a causa.
+
+4.4 SF atual
+
+Tipo: int.
+Valor: 7.
+Natureza: constante compilada.
+Intervalo validado pelo projeto: somente o valor 7 é comprovado no firmware ativo.
+Histórico: relatório IP1 também registra SF7.
+Limiar: não aplicável.
+Mudança em runtime: não implementada.
+
+4.5 Sequência de pacotes
+
+Tipo wire: uint16_t.
+Intervalo: 0 a 65535, seguido de wrap natural.
+Arquivo: vfence_protocol.h:84-92.
+Coleira: nextSequence e allocateSequence.
+Gateway: nextGatewaySequence e allocateSequence.
+
+A sequência é global por emissor e compartilhada entre telemetria, evento e controle. Saltos entre
+duas telemetrias não provam perda, pois uma sequência intermediária pode ter sido usada por evento.
+
+SQLite local guarda sequence na tabela telemetry. A Central atual não recebe esse campo no batch.
+
+4.6 Quantidade de transmissões e retransmissões
+
+Tipo: uint8_t em PendingReliableTx.transmissions.
+Inicial: 1.
+Máximo: 4 transmissões, sendo uma original e até três retries.
+
+Gateway:
+
+- gateway_config.h:32;
+- VFenceGateway.ino:43-50, 265-374.
+
+Coleira:
+
+- VFenceCollarLoRa.ino:69-79, 173-259.
+
+Natureza: estado temporário de uma mensagem pendente.
+Persistência: nenhuma.
+Contador agregado: inexistente.
+
+A telemetria POSITION_STATUS não pede ACK e não entra nessa fila. Eventos e comandos confiáveis
+podem usar ACK/retry.
+
+4.7 ACK e NACK
+
+Representação: pacotes CONTROL do protocolo VFENCE.
+ACK identifica a sequência confirmada.
+NACK identifica sequência, código de erro e detail.
+
+Há processamento real de ACK/NACK, mas não existem contadores agregados ou séries históricas.
+
+4.8 Timeout e jitter
+
+ACK timeout: 5000 ms.
+Retry jitter: 0 a 2000 ms inclusive.
+Próxima ação: aproximadamente 5000 a 7000 ms após transmissão.
+Tipo: uint32_t.
+
+Gateway: gateway_config.h:33-34.
+Coleira: VFenceCollarLoRa.ino:70-71 e scheduleRetryFromNow:169-170.
+
+Timeouts finais não são acumulados como métrica de enlace.
+
+4.9 Duplicatas
+
+O Gateway mantém até 16 sequências confiáveis recentes por coleira:
+
+- MAX_RECENT_RELIABLE=16 em VFenceGateway.ino:18;
+- isDuplicateReliable, aproximadamente linhas 658-664;
+- rememberReliable, aproximadamente linhas 666-674.
+
+Existe detecção, mas não contador agregado/persistido.
+
+============================================================
+5. FAIXAS OBSERVADAS DE RSSI, SNR E PDR
+============================================================
+
+5.1 Dados brutos dos ensaios IP1
+
+Não foram encontrados no repositório:
+
+- CSV por pacote;
+- planilha de amostras;
+- log Serial completo por distância;
+- JSONL de recepção;
+- contagem bruta TX/RX por ensaio;
+- timestamp por pacote;
+- identificação individual de perdas.
+
+O repositório contém o PDF Relatorio_Teste_Comunicacao_LoRa_VFence_IP1.pdf, mas não foi encontrada
+uma base bruta separada que permita recalcular estatísticas.
+
+Consequência:
+
+- RSSI mínimo por distância: indisponível;
+- RSSI máximo por distância: indisponível;
+- RSSI médio por distância: indisponível;
+- SNR mínimo por distância: indisponível;
+- SNR máximo por distância: indisponível;
+- SNR médio por distância: indisponível;
+- quantidade exata de amostras: indisponível;
+- enviados/recebidos exatos por distância: indisponíveis;
+- recálculo independente do PDR: impossível com os arquivos atuais.
+
+5.2 Valores resumidos disponíveis no prompt/IP1
+
+DISTÂNCIA | PDR | RSSI | SNR | AMOSTRAS | CONFIGURAÇÃO
+
+10 m | 100% | detalhe bruto indisponível | detalhe bruto indisponível | indisponível | SF7/BW125/CR4/5/TX5/915 MHz informado
+50 m | 100% | detalhe bruto indisponível | detalhe bruto indisponível | indisponível | mesma configuração informada
+100 m | 78% | detalhe bruto indisponível | detalhe bruto indisponível | indisponível | mesma configuração informada
+200 m | 88% | detalhe bruto indisponível | detalhe bruto indisponível | indisponível | mesma configuração informada
+280 m | 34% | detalhe bruto indisponível | detalhe bruto indisponível | indisponível | mesma configuração informada
+330 m | 8% | detalhe bruto indisponível | detalhe bruto indisponível | indisponível | mesma configuração informada
+410 m | 8% | detalhe bruto indisponível | detalhe bruto indisponível | indisponível | mesma configuração informada
+
+Faixa física resumida fornecida:
+
+- RSSI difícil: aproximadamente -110 a -115 dBm;
+- SNR difícil: aproximadamente -11 dB.
+
+Esses valores não permitem calcular médias por distância.
+
+============================================================
+6. POSSIBILIDADES E RESTRIÇÕES DOS PARÂMETROS DE PERFIL
+============================================================
+
+6.1 Funções utilizadas
+
+PARÂMETRO | FUNÇÃO ATUAL
+
+SF | LoRa.setSpreadingFactor(valor)
+BW | LoRa.setSignalBandwidth(valor_hz)
+CR | LoRa.setCodingRate4(denominador)
+TX Power | LoRa.setTxPower(dbm)
+Preâmbulo | LoRa.setPreambleLength(simbolos)
+Frequência | LoRa.begin(frequencia_hz)
+Sync word | LoRa.setSyncWord(valor)
+CRC | LoRa.enableCrc()
+
+6.2 Valores aceitos
+
+A versão exata da biblioteca LoRa e seu código-fonte não estão versionados no repositório.
+
+Portanto, as faixas formais aceitas por:
+
+- setSpreadingFactor;
+- setSignalBandwidth;
+- setCodingRate4;
+- setTxPower;
+- setPreambleLength
+
+não podem ser atribuídas com segurança à instalação usada pelo grupo somente com o repositório.
+
+Valores comprovadamente usados nos arquivos:
+
+- SF7 no firmware ativo;
+- BW125 kHz no firmware ativo;
+- CR4/5 no firmware ativo;
+- preâmbulo 8 no firmware ativo;
+- TX14 no firmware ativo;
+- TX5 no teste histórico;
+- 915 MHz em ambos.
+
+SF8, SF9, SF10 ou outros valores ainda não têm validação experimental armazenada no repositório.
+
+6.3 Dependências
+
+Gateway e coleira precisam estar coordenados em pelo menos:
+
+- frequência;
+- SF;
+- BW;
+- CR;
+- sync word;
+- CRC;
+- modo de header/IQ, mesmo que atualmente dependam de defaults compatíveis.
+
+O TX Power pode diferir por direção sem alterar a modulação, mas muda o orçamento de enlace.
+
+Uma alteração de SF somente em um lado pode interromper uplink e downlink. O VFence atual não possui
+PROFILE_CHANGE, PROFILE_ACK ou rollback automático.
+
+6.4 Heltec WiFi LoRa 32 V2/SX1276
+
+Comprovado pelo repositório:
+
+- placa identificada como Heltec WiFi LoRa 32 V2;
+- transceptor identificado como SX1276;
+- pinagem SPI igual nos dois firmwares;
+- operação configurada em 915 MHz.
+
+Não comprovado pelo repositório:
+
+- versão/revisão exata dos módulos físicos;
+- modelo, ganho e eficiência das antenas;
+- casamento de impedância;
+- potência efetivamente entregue;
+- alimentação durante TX;
+- limites regulatórios aplicáveis ao local;
+- registradores finais do SX1276;
+- faixas aceitas pela biblioteca instalada.
+
+============================================================
+7. TABELA CONSOLIDADA PARA O PROJETO RTL
+============================================================
+
+VARIÁVEL | VALOR ATUAL | INTERVALO IDENTIFICADO | REPRESENTAÇÃO CANDIDATA | EVIDÊNCIA | LIMITAÇÃO
+
+RSSI | valor por pacote, exemplos -83 a -103 e IP1 ~-110/-115 | código não valida faixa | magnitude uint8 | packetRssi | perde sinal e exige valid flag
+SNR | float por pacote, exemplos 6,5/7,5/8,5 e IP1 ~-11 | código não valida faixa | int16 SNRx100 | packetSnr | validar/saturar antes do RTL
+PDR | não calculado; IP1 8% a 100% | 0 a 100% por definição futura | uint16 PDRx100 | valores IP1 fornecidos | falta TX/RX/janela
+SF atual | 7 | apenas 7 validado no projeto | 2-bit profile_id + registro SF | config ativa | P0-P3 ainda não definidos
+Perfil atual | inexistente hoje | P0 a P3 propostos | 2 bits | proposta | precisa mapear perfil→PHY
+Perfil recomendado | inexistente | P0 a P3 propostos | 2 bits | proposta | algoritmo ainda não existe
+Sequence | uint16 | 0 a 65535 | 16 bits | vfence_protocol.h | global por tipo, wrap
+Transmissions | inicial 1, máximo 4 | 0 a 4 útil | 3 bits ou uint8 no barramento | PendingReliableTx | temporário, não agregado
+Retry flag | 0/1 | booleano | 1 bit | header VFENCE | não conta retries
+ACK recebido | evento | 0/1 por pacote | pulso + contador | processControl | contador ainda não existe
+NACK recebido | evento + erro/detail | tipos do protocolo | pulso + códigos | processControl | contador ainda não existe
+Timeout ACK | 5000 ms | fixo atual | 13 bits para relativo até 7000 ms | constantes | deadline millis usa 32 bits
+Retry jitter | 0 a 2000 ms | inclusivo | 11 bits para 0 a 2000 | random | origem do jitter fica em software
+TX count | inexistente | a definir por janela | largura = ceil(log2(N+1)) | ausente | N precisa ser definido
+RX count | inexistente | a definir por janela | largura = ceil(log2(N+1)) | ausente | N precisa ser definido
+Duplicate count | inexistente | a definir | contador | detecção atual | sem agregação
+Packet type | TELEMETRY/EVENT/CONTROL/CONFIG | 4 tipos | 2 bits | protocolo | decidir quais entram no PDR
+Packet length | até 64 bytes | 0 a 64 | 7 bits | MAX_PACKET_SIZE | ToA não calculado
+
+============================================================
+8. AVALIAÇÃO DAS REPRESENTAÇÕES PROPOSTAS
+============================================================
+
+8.1 RSSI como magnitude sem sinal de 8 bits
+
+Representação proposta:
+
+rssi_magnitude = valor absoluto do RSSI em dBm.
+
+Exemplos:
+
+-83 dBm  → 83
+-103 dBm → 103
+-110 dBm → 110
+-115 dBm → 115
+
+Todos os valores encontrados cabem em 8 bits sem sinal, intervalo 0 a 255.
+
+Riscos:
+
+- o sinal negativo é perdido por definição;
+- software e RTL precisam concordar que valor maior significa RSSI mais fraco;
+- entradas positivas ou menores que -255 dBm não são representáveis corretamente;
+- é necessário sinal valid separado ou sentinela reservada;
+- reservar 0xFF como inválido reduz a magnitude válida máxima para 254;
+- o código atual não valida faixa antes de persistir/enviar.
+
+Conclusão: 8 bits acomodam todos os valores observados, desde que a conversão e a validade sejam
+formalizadas.
+
+8.2 SNR inteiro com sinal multiplicado por 100 em 16 bits
+
+Representação:
+
+snr_x100 = arredondar(SNR_dB * 100)
+
+Exemplos:
+
+6,50 dB → 650
+8,50 dB → 850
+-11,00 dB → -1100
+
+int16 permite -32768 a 32767, equivalentes a -327,68 até 327,67 dB.
+
+Todos os valores encontrados cabem. O Gateway já imprime SNR com duas casas nos JSONs e logs,
+então x100 preserva a resolução exposta pela interface Serial atual.
+
+Riscos:
+
+- é necessário arredondamento determinístico;
+- NaN/infinito não cabem e precisam ser rejeitados no software;
+- valores fora da faixa devem causar invalid flag ou saturação definida;
+- reservar -32768 como inválido deixa -32767 como mínimo válido.
+
+8.3 PDR percentual multiplicado por 100 em 16 bits
+
+Representação:
+
+pdr_x100 = PDR_percentual * 100
+
+Exemplos IP1:
+
+100% → 10000
+88% → 8800
+78% → 7800
+34% → 3400
+8% → 800
+
+Todos cabem em uint16, que suporta 0 a 65535.
+
+Faixa válida recomendada para a interface: 0 a 10000.
+Valores maiores que 10000 devem ser inválidos.
+
+Riscos:
+
+- o firmware ainda não fornece os contadores necessários;
+- é necessário definir a janela e o denominador;
+- retries podem ser contados como nova transmissão ou como tentativa do mesmo pacote;
+- falta definir como tratar broadcast, telemetria sem ACK e pacotes duplicados;
+- deve existir pdr_valid quando TX=0.
+
+8.4 Perfil atual e recomendado P0-P3
+
+Quatro perfis cabem exatamente em 2 bits:
+
+00=P0
+01=P1
+10=P2
+11=P3
+
+Isso representa a identidade do perfil, não os parâmetros PHY. A tabela de configuração precisa
+mapear cada profile_id para SF/BW/CR/TX/preâmbulo.
+
+O mapeamento ainda não deve ser fixado porque os perfis não foram validados.
+
+============================================================
+9. PARÂMETROS QUE JÁ PODEMOS DEFINIR COM SEGURANÇA
+============================================================
+
+1. O baseline executável atual é:
+
+- 915 MHz;
+- SF7;
+- BW125 kHz;
+- CR4/5;
+- TX14 dBm solicitados;
+- preâmbulo 8;
+- sync word 0x12;
+- CRC ligado.
+
+2. A configuração histórica IP1 usou TX5 dBm e 915 MHz comprovados pelo código de teste.
+
+3. O relatório IP1 informa SF7/BW125/CR4/5 para o mesmo ensaio.
+
+4. RSSI é coletado como valor individual em dBm no Gateway.
+
+5. SNR é coletado como valor individual em dB no Gateway.
+
+6. Sequence tem 16 bits.
+
+7. Mensagens confiáveis possuem até quatro transmissões.
+
+8. ACK timeout é 5 segundos e jitter de retry é de até 2 segundos.
+
+9. RSSI em magnitude uint8 comporta os valores encontrados.
+
+10. SNRx100 em int16 comporta os valores encontrados.
+
+11. PDRx100 em uint16 comporta 0,00% a 100,00% usando 0 a 10000.
+
+12. P0-P3 e perfil recomendado cabem em 2 bits cada.
+
+============================================================
+10. PARÂMETROS QUE AINDA PRECISAM DE VALIDAÇÃO
+============================================================
+
+1. Valores finais de SF, BW, CR, TX e preâmbulo de P0-P3.
+2. Faixas realmente aceitas pela versão instalada da biblioteca LoRa.
+3. Combinações aceitas/estáveis na Heltec V2/SX1276 do grupo.
+4. Potência RF efetivamente entregue em TX5 e TX14.
+5. Alcance e confiabilidade do perfil atual TX14.
+6. Resultados experimentais de SF8/SF9/SF10 ou outros.
+7. RSSI/SNR mínimo, máximo, médio, desvio e percentis por distância.
+8. Quantidade de amostras de cada ensaio IP1.
+9. TX e RX brutos usados nos PDRs publicados.
+10. Definição do PDR para telemetria sem ACK.
+11. Janela temporal ou número de pacotes da decisão.
+12. Tratamento de retries e duplicatas no denominador/numerador.
+13. Limiares de mudança de perfil.
+14. Histerese, votação e cooldown.
+15. Perfil de recuperação e rollback.
+16. Protocolo de mudança coordenada Gateway/coleira.
+17. Influência do tamanho do payload e ToA.
+18. Consumo energético de cada perfil.
+19. Regulamentação e duty cycle aplicáveis.
+20. Comportamento após reboot e perda completa do enlace.
+
+============================================================
+11. RECOMENDAÇÕES TÉCNICAS PARA FUNDAMENTAR OS PERFIS
+============================================================
+
+Estas recomendações não definem P0-P3.
+
+1. Versionar a biblioteca LoRa
+
+Registrar no projeto:
+
+- nome;
+- versão;
+- commit ou pacote instalado;
+- placa selecionada;
+- core ESP32 utilizado.
+
+Isso permite conhecer as faixas e defaults reais.
+
+2. Preservar o baseline atual
+
+Usar SF7/BW125/CR4/5/TX14/preâmbulo8 como referência inicial, pois é o único perfil completo e
+explícito do firmware ativo.
+
+3. Repetir o perfil histórico
+
+Reproduzir SF7/BW125/CR4/5/TX5 com todos os parâmetros explicitados, para tornar o novo ensaio
+comparável ao IP1 sem depender de defaults.
+
+4. Testar uma variável por vez
+
+Antes de combinar perfis, testar separadamente:
+
+- mudança de SF mantendo BW/CR/TX/preâmbulo;
+- mudança de TX mantendo SF/BW/CR/preâmbulo;
+- depois BW/CR/preâmbulo.
+
+5. Registrar dados brutos
+
+Para cada pacote:
+
+- test_id;
+- timestamp;
+- distância;
+- collar_id;
+- sequence;
+- packet_type;
+- payload_length;
+- profile_id;
+- SF/BW/CR/TX/preâmbulo;
+- RSSI;
+- SNR;
+- recebido/perdido;
+- retry;
+- ACK/NACK/timeout;
+- posição e condições do teste.
+
+6. Definir PDR formalmente
+
+Exemplo conceitual, ainda sujeito à aprovação:
+
+PDR = pacotes únicos recebidos / pacotes de aplicação enviados.
+
+É necessário decidir se retries contam como transmissões físicas separadas e qual PDR será usado
+pelo motor: aplicação, PHY, uplink, downlink ou mensagens confiáveis.
+
+7. Converter métricas antes da FPGA
+
+O software/Nios pode validar e converter:
+
+RSSI dBm → magnitude uint8 + valid
+SNR float → int16 x100 + valid
+PDR → uint16 x100 + valid
+perfil → 2 bits
+
+8. Não alterar o rádio diretamente no primeiro RTL
+
+O primeiro IP deve recomendar P0-P3. O Nios deve coordenar mudança, confirmação e rollback.
+
+9. Usar validade explícita
+
+Entradas candidatas:
+
+rssi_valid
+snr_valid
+pdr_valid
+window_complete
+current_profile_valid
+
+Isso evita interpretar zero como medição válida quando não existem pacotes.
+
+10. Não derivar os quatro perfis apenas dos sete PDRs resumidos
+
+Os valores IP1 são úteis como evidência de degradação, mas faltam dados brutos, amostras, dispersão,
+controle ambiental e comparação entre configurações.
+
+============================================================
+12. RESUMO FINAL
+============================================================
+
+CONFIGURAÇÃO ATUAL
+
+Gateway e coleira: 915 MHz, SF7, BW125 kHz, CR4/5, TX14 dBm solicitados, preâmbulo8,
+sync word 0x12 e CRC ligado.
+
+CONFIGURAÇÃO HISTÓRICA
+
+O teste antigo explicita 915 MHz e TX5 dBm. O relatório IP1 informa SF7/BW125/CR4/5. O código
+histórico dependia dos defaults da biblioteca para esses parâmetros e não habilitava CRC explicitamente.
+
+MÉTRICAS DISPONÍVEIS
+
+RSSI e SNR individuais por pacote, sequence uint16, ACK/NACK/retry temporários e último estado.
+
+MÉTRICAS AUSENTES
+
+PDR/PER/PLR em runtime, TX/RX agregados, ToA, contadores de ACK/NACK/retry/timeout/duplicata e
+consumo energético por perfil.
+
+DADOS IP1 DISPONÍVEIS
+
+PDR resumido por sete distâncias e referências aproximadas de RSSI/SNR. Não foram encontrados dados
+brutos para calcular médias ou recálculo independente.
+
+INTERFACE FPGA
+
+- RSSI magnitude uint8: comporta os valores encontrados, exige valid e convenção de magnitude;
+- SNRx100 int16: comporta os valores encontrados;
+- PDRx100 uint16: usar faixa válida 0 a 10000;
+- perfil atual/recomendado: 2 bits cada;
+- P0-P3 ainda não devem ser definidos.
+
+PRÓXIMO PASSO RECOMENDADO
+
+Instrumentar e registrar métricas brutas, repetir o baseline atual e o perfil histórico, testar uma
+variável por vez e somente então definir os quatro perfis e os limiares do motor FPGA.
+
+FIM DO LEVANTAMENTO

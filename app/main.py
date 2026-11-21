@@ -5,7 +5,7 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Path as RoutePath, Query, WebSocket
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -14,6 +14,7 @@ from app.database import Database
 from app.realtime import RealtimeHub
 from app.serial_reader import SerialReader
 from app.sync_service import CentralSyncService
+from app.terminal import RULE
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,23 +33,31 @@ sync_service = CentralSyncService(settings, database, reader, hub)
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     database.initialize()
-    logger.info("service started")
+    hub.start()
+    logger.info(
+        "\n%s\n VFENCE | BASE LOCAL | INICIALIZACAO\n%s\n"
+        "[OK] Servidor iniciado | SQLite inicializado\n"
+        "[INFO] Fonte=%s | ACK de medias=%s | Terminal=%s\n%s",
+        RULE, RULE, "mock" if settings.mock_serial else "Serial USB",
+        "HABILITADO" if settings.metrics_serial_ack_enabled and not settings.mock_serial else "DESATIVADO",
+        "DETALHADO" if settings.terminal_detail else "NORMAL", RULE,
+    )
     task = asyncio.create_task(reader.run(), name="vfence-serial-reader")
     sync_task = asyncio.create_task(sync_service.run(), name="vfence-central-sync")
-    yield
-    logger.info("service stopping")
-    await reader.stop()
-    await sync_service.stop()
-    task.cancel()
-    sync_task.cancel()
     try:
-        await task
-    except asyncio.CancelledError:
-        pass
-    try:
-        await sync_task
-    except asyncio.CancelledError:
-        pass
+        yield
+    finally:
+        logger.info("service stopping")
+        await reader.stop()
+        await sync_service.stop()
+        task.cancel()
+        sync_task.cancel()
+        try:
+            await hub.close()
+        finally:
+            for result in await asyncio.gather(task, sync_task, return_exceptions=True):
+                if isinstance(result, Exception):
+                    logger.error("background service failed", exc_info=(type(result), result, result.__traceback__))
 
 
 app = FastAPI(title="VFence Monitor API", version="1.0.0", lifespan=lifespan)
@@ -77,6 +86,27 @@ async def health():
 @app.get("/api/gateway")
 async def gateway():
     return reader.as_dict()
+
+
+@app.get("/api/gateway/profile")
+async def gateway_profile():
+    if settings.mock_serial or reader.state.status != "online":
+        raise HTTPException(status_code=503, detail="gateway_unavailable")
+    try:
+        result = await reader.send_gateway_command("GET_PROFILE")
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="gateway_profile_timeout") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="gateway_unavailable") from exc
+    if (result.get("command") != "GET_PROFILE" or result.get("profileControlVersion") != 1
+            or not result.get("ok")):
+        raise HTTPException(status_code=501, detail="gateway_profile_unsupported")
+    return result
+
+
+@app.get("/api/collars/{collar_id}/pdr")
+async def collar_pdr(collar_id: int = RoutePath(ge=1, le=254), limit: int = Query(60, ge=1, le=120)):
+    return await asyncio.to_thread(database.list_pdr, collar_id, limit)
 
 
 @app.get("/api/central")
@@ -116,14 +146,9 @@ async def events(limit: int = Query(100, ge=1, le=1000)):
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    await hub.connect(websocket)
-    try:
-        await websocket.send_json({"type": "gateway", "data": reader.as_dict()})
-        await websocket.send_json({
-            "type": "fence",
-            "data": await asyncio.to_thread(database.fence_snapshot),
-        })
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        await hub.disconnect(websocket)
+    gateway_state = reader.as_dict()
+    fence = await asyncio.to_thread(database.fence_snapshot)
+    await hub.serve(websocket, (
+        {"type": "gateway", "data": gateway_state},
+        {"type": "fence", "data": fence},
+    ))

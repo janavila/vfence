@@ -323,6 +323,42 @@ size_t encodeTelemetry(uint8_t* out, size_t capacity,
   return total;
 }
 
+static void writeU64BE(uint8_t* p, uint64_t value) {
+  writeU32BE(p, static_cast<uint32_t>(value >> 32));
+  writeU32BE(p + 4, static_cast<uint32_t>(value));
+}
+
+static uint64_t readU64BE(const uint8_t* p) {
+  return (static_cast<uint64_t>(readU32BE(p)) << 32) | readU32BE(p + 4);
+}
+
+static bool validHdopSummary(const HdopSummaryPayload& d) {
+  if (d.windowId == 0 || d.durationMs != HDOP_SUMMARY_WINDOW_MS ||
+      d.hdopSampleCount > HDOP_SUMMARY_MAX_SAMPLES) return false;
+  if (d.hdopMeanValid) return d.hdopSampleCount != 0 && d.hdopMeanX100 != U16_UNAVAILABLE;
+  return d.hdopSampleCount == 0 && d.hdopMeanX100 == U16_UNAVAILABLE;
+}
+
+size_t encodeHdopSummary(uint8_t* out, size_t capacity,
+                         uint8_t collarId, uint16_t sequence,
+                         const HdopSummaryPayload& d) {
+  if (collarId == 0 || collarId == 0xFF || !validHdopSummary(d)) return 0;
+  const size_t total = beginPacket(out, capacity, MessageType::TELEMETRY,
+                                   false, false, false, collarId, sequence,
+                                   HDOP_SUMMARY_PAYLOAD_SIZE);
+  if (!total) return 0;
+  uint8_t* p = out + HEADER_SIZE;
+  p[0] = static_cast<uint8_t>(TelemetrySubtype::HDOP_WINDOW_SUMMARY);
+  writeU64BE(p + 1, d.sessionId);
+  writeU64BE(p + 9, d.windowId);
+  writeU32BE(p + 17, d.startedAtMs);
+  writeU16BE(p + 21, d.durationMs);
+  writeU16BE(p + 23, d.hdopMeanX100);
+  p[25] = d.hdopSampleCount;
+  p[26] = d.hdopMeanValid ? 1 : 0;
+  return total;
+}
+
 size_t encodeAck(uint8_t* out, size_t capacity,
                  uint8_t collarId, uint16_t sequence,
                  uint16_t ackedSequence, uint8_t status) {
@@ -498,6 +534,23 @@ bool decodeTelemetry(const PacketView& packet, TelemetryPayload& out) {
   out.hdopX100 = readU16BE(packet.payload + 13);
   out.stateFlags = packet.payload[15];
   out.fenceVersion = readU16BE(packet.payload + 16);
+  return true;
+}
+
+bool decodeHdopSummary(const PacketView& packet, HdopSummaryPayload& out) {
+  if (!checkSubtype(packet, MessageType::TELEMETRY,
+                    static_cast<uint8_t>(TelemetrySubtype::HDOP_WINDOW_SUMMARY),
+                    HDOP_SUMMARY_PAYLOAD_SIZE)) return false;
+  if (packet.header.version != PROTOCOL_VERSION || packet.header.collarId == 0 ||
+      packet.header.collarId == 0xFF || packet.header.ackReq ||
+      packet.header.retry || packet.header.urgent || packet.payload[26] > 1) return false;
+
+  const uint8_t* p = packet.payload;
+  const HdopSummaryPayload decoded{readU64BE(p + 1), readU64BE(p + 9),
+                                   readU32BE(p + 17), readU16BE(p + 21),
+                                   readU16BE(p + 23), p[25], p[26] == 1};
+  if (!validHdopSummary(decoded)) return false;
+  out = decoded;
   return true;
 }
 
