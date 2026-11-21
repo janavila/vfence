@@ -37,28 +37,30 @@ class PositionPdr {
  public:
   // True means that the frame contributed evidence to this window.
   bool observe(const PositionDeliveryTag& tag, uint32_t now, uint8_t appliedProfile) {
-    if (known_ && tag.sessionId != session_ && isRetired(tag.sessionId)) return false;
-    if (known_ && tag.sessionId != session_) {
-      retired_[retiredCursor_++ % 2] = session_;
-      if (retiredCount_ < 2) ++retiredCount_;
-      if (window_.received) {
-        window_.hasSession = false;
-        window_.reason = PdrReason::SESSION_CHANGED;
-      }
-      anchored_ = false;
-      hasFrontier_ = false;
+    if (!known_) {
+      known_ = true;
+      session_ = tag.sessionId;
     }
-    known_ = true;
-    session_ = tag.sessionId;
+    if (tag.sessionId != session_) {
+      considerSession(tag, now, appliedProfile);
+      return false;
+    }
 
+    const uint32_t advance = tag.ordinal - frontier_;
+    const bool forward = !hasFrontier_ || (advance != 0 && advance < 0x80000000UL);
+    if (sessionUncertain_) {
+      if (forward) advanceFrontier(tag.ordinal, now);
+      return false;
+    }
     if (hasFrontier_ && now - lastAdvanceAt_ >= PDR_REFERENCE_TIMEOUT_MS) {
-      hasFrontier_ = false;
+      // A long gap may re-anchor on forward progress, never on a duplicate or
+      // a delayed ordinal at or behind the last known frontier.
+      if (!forward) return false;
       if (anchored_) markDiscontinuity();
       anchored_ = false;
     }
 
-    const uint32_t advance = tag.ordinal - frontier_;
-    if (hasFrontier_ && (advance == 0 || advance >= 0x80000000UL)) {
+    if (!forward) {
       if (!anchored_) return false;
       const uint32_t offset = tag.ordinal - anchor_;
       if (offset >= PDR_MAX_SPAN || (seen_ & (UINT64_C(1) << offset))) return false;
@@ -68,9 +70,7 @@ class PositionPdr {
       return true;
     }
 
-    frontier_ = tag.ordinal;
-    lastAdvanceAt_ = now;
-    hasFrontier_ = true;
+    advanceFrontier(tag.ordinal, now);
     if (!anchored_) {
       if (!window_.received) {
         window_.collarSession = tag.sessionId;
@@ -123,14 +123,75 @@ class PositionPdr {
     }
     window_ = {};
     anchored_ = false;
+    sessionUncertain_ = false;
     return result;
   }
 
  private:
+  void considerSession(const PositionDeliveryTag& tag, uint32_t now, uint8_t appliedProfile) {
+    if (isRetired(tag.sessionId)) return;
+    // Random IDs carry no chronology. Do not count observations from either
+    // session in the rest of a window with an unrecognized foreign session.
+    sessionUncertain_ = true;
+    window_.hasSession = false;
+    if (window_.reason != PdrReason::PROFILE_CHANGED) window_.reason = PdrReason::SESSION_CHANGED;
+
+    // An uninterrupted incumbent wins over an unsolicited switch. After a
+    // quiet period, require two forward observations in the same profile.
+    if (tag.profileId != appliedProfile || now - lastAdvanceAt_ < PDR_REFERENCE_TIMEOUT_MS) return;
+    if (!candidatePending_ || candidate_ != tag.sessionId || candidateProfile_ != tag.profileId ||
+        now - candidateSeenAt_ >= PDR_REFERENCE_TIMEOUT_MS) {
+      candidate_ = tag.sessionId;
+      candidateOrdinal_ = tag.ordinal;
+      candidateSeenAt_ = now;
+      candidateProfile_ = tag.profileId;
+      candidatePending_ = true;
+      return;
+    }
+    const uint32_t advance = tag.ordinal - candidateOrdinal_;
+    if (advance == 0 || advance >= 0x80000000UL) return;
+    if (advance >= PDR_MAX_SPAN) {
+      candidateOrdinal_ = tag.ordinal;
+      candidateSeenAt_ = now;
+      return;
+    }
+
+    retire(session_);
+    session_ = tag.sessionId;
+    anchored_ = false;
+    // The new session only contributes to the next window. Keep the confirmed
+    // ordinal as a frontier so the probation packets cannot be counted again.
+    advanceFrontier(tag.ordinal, now);
+  }
+
+  void advanceFrontier(uint32_t ordinal, uint32_t now) {
+    frontier_ = ordinal;
+    lastAdvanceAt_ = now;
+    hasFrontier_ = true;
+    candidatePending_ = false;
+  }
+
+  // Three indexes in a 128-bit Bloom filter. Bits are never cleared during
+  // this Gateway boot: retired IDs remain rejected, with possible false positives.
+  static uint64_t sessionHash(uint64_t id) {
+    id ^= id >> 33;
+    id *= UINT64_C(0xff51afd7ed558ccd);
+    return id ^ (id >> 33);
+  }
+
   bool isRetired(uint64_t session) const {
-    for (uint8_t i = 0; i < retiredCount_; ++i)
-      if (retired_[i] == session) return true;
-    return false;
+    uint64_t hash = sessionHash(session);
+    for (uint8_t i = 0; i < 3; ++i, hash >>= 7) {
+      if (!(retired_[((hash >> 6) & 1)] & (UINT64_C(1) << (hash & 63)))) return false;
+    }
+    return true;
+  }
+
+  void retire(uint64_t session) {
+    uint64_t hash = sessionHash(session);
+    for (uint8_t i = 0; i < 3; ++i, hash >>= 7) {
+      retired_[((hash >> 6) & 1)] |= UINT64_C(1) << (hash & 63);
+    }
   }
 
   void noteProfile(uint8_t reported, uint8_t applied) {
@@ -149,15 +210,19 @@ class PositionPdr {
   uint64_t session_ = 0;
   uint64_t retired_[2]{};
   uint64_t seen_ = 0;
+  uint64_t candidate_ = 0;
   uint32_t frontier_ = 0;
   uint32_t anchor_ = 0;
   uint32_t lastAdvanceAt_ = 0;
+  uint32_t candidateOrdinal_ = 0;
+  uint32_t candidateSeenAt_ = 0;
   PdrWindowResult window_;
-  uint8_t retiredCursor_ = 0;
-  uint8_t retiredCount_ = 0;
+  uint8_t candidateProfile_ = PDR_UNKNOWN_PROFILE;
   bool known_ = false;
   bool hasFrontier_ = false;
   bool anchored_ = false;
+  bool candidatePending_ = false;
+  bool sessionUncertain_ = false;
 };
 
 }  // namespace vfence

@@ -1,5 +1,7 @@
 import asyncio
 import json
+import logging
+import sqlite3
 from types import SimpleNamespace
 
 import httpx
@@ -231,7 +233,7 @@ async def test_serial_fence_structured_failure_keeps_result_as_failure():
     assert await task == (False, "CRC_ERROR")
 
 
-async def test_serial_fence_confirmation_timeout_is_reported():
+async def test_serial_fence_confirmation_timeout_is_reported(caplog):
     config = base_config()
     db = Database("sqlite:///:memory:")
     db.initialize()
@@ -242,8 +244,18 @@ async def test_serial_fence_confirmation_timeout_is_reported():
     task = asyncio.create_task(
         reader.send_fence("COL01", contract_fence(), timeout_seconds=0.01)
     )
-    await answer_serial_commands(reader, connection, stop_at="FENCE_SEND")
+    commands = await answer_serial_commands(reader, connection, stop_at="FENCE_SEND")
     assert await task == (False, "gateway_confirmation_timeout")
+    # A report arriving after timeout cannot resurrect the previous operation.
+    with caplog.at_level(logging.INFO, logger="serial_reader"):
+        await reader.process_line("[APP] " + json.dumps({
+            "schema": "vfence.gateway.serial.v1", "kind": "fence_transfer",
+            "requestId": commands[-1]["requestId"], "collarId": 1, "fenceVersion": 1,
+            "state": "failed", "detail": "ACK_TIMEOUT",
+        }))
+    assert "CERCA | RELATO SEM CORRELACAO" in caplog.text
+    assert caplog.records[-1].levelno == logging.INFO
+    assert reader._fence_result is None
 
 
 async def test_gateway_app_telemetry_enters_database_and_outbox():
@@ -278,9 +290,9 @@ class FakeCentral:
         self.downloads += 1
         return self.fence
 
-    async def send_batch(self, base_id, items):
+    async def send_batch_confirmed(self, base_id, generation, items):
         self.batches.extend(items)
-        return max(item["edge_seq"] for item in items)
+        return [item["edge_seq"] for item in items]
 
 
 class FakeSerial:
@@ -293,19 +305,25 @@ class FakeSerial:
         return True, "confirmed"
 
 
-async def test_sync_downloads_delivers_to_multiple_collars_and_clears_outbox():
-    config = base_config()
+async def test_sync_downloads_delivers_to_multiple_collars_and_clears_outbox(caplog):
+    config = base_config(terminal_detail=True)
     db = Database("sqlite:///:memory:")
     db.initialize()
     serial = FakeSerial()
     central = FakeCentral()
     service = CentralSyncService(config, db, serial, Hub(), client=central)
-    await service.sync_once()
+    with caplog.at_level(logging.INFO, logger="central_sync"):
+        await service.sync_once()
     state = db.fence_state()
     assert state["downloaded_version"] == 1
     assert state["confirmed_version"] == 1
     assert serial.sent == [("COL01", 1), ("COL02", 1)]
     assert db.outbox_size() == 0
+    logs = caplog.text
+    assert logs.index("PUBLICACAO DETECTADA") < logs.index("Download validado") < logs.index("SQLite: SALVA NA BASE")
+    assert logs.index("SQLite: SALVA NA BASE") < logs.index("CONFIRMADA PARA AS COLEIRAS CONFIGURADAS")
+    assert logs.index("ACK de lote recebido") < logs.index("LOTE CONFIRMADO PELA CENTRAL") < logs.index("Outbox: ATUALIZADA")
+    assert "ATIVADA" not in logs
 
 
 async def test_same_local_version_is_not_downloaded_or_delivered_again():
@@ -409,7 +427,11 @@ async def test_invalid_new_fence_does_not_replace_valid_local_fence():
     assert snapshot["point_count"] == 4
 
 
-async def test_failed_new_fence_preserves_previous_confirmed_version():
+@pytest.mark.parametrize(("failure", "status"), [
+    ("FENCE_COMMIT rejeitado", "FALHA REGISTRADA NA BASE"),
+    ("gateway_confirmation_timeout", "CONFIRMACAO NAO RECEBIDA"),
+])
+async def test_failed_new_fence_preserves_previous_confirmed_version(caplog, failure, status):
     config = base_config(known_collar_ids=("COL01",))
     db = Database("sqlite:///:memory:")
     db.initialize()
@@ -439,7 +461,7 @@ async def test_failed_new_fence_preserves_previous_confirmed_version():
     class FailingSerial(FakeSerial):
         async def send_fence(self, collar_id, fence):
             self.sent.append((collar_id, fence["version"]))
-            return False, "FENCE_COMMIT rejeitado"
+            return False, failure
 
     service = CentralSyncService(
         config, db, FailingSerial(), Hub(), client=CentralV2()
@@ -449,4 +471,171 @@ async def test_failed_new_fence_preserves_previous_confirmed_version():
     assert state["downloaded_version"] == 2
     assert state["pending_version"] == 2
     assert state["confirmed_version"] == 1
-    assert "FENCE_COMMIT rejeitado" in state["last_error"]
+    assert failure in state["last_error"] and status in caplog.text
+    assert "[BASE][COL 001] CERCA | VERSAO 2" in caplog.text
+
+
+@pytest.mark.parametrize(("error_type", "reason"), [
+    (CentralAuthenticationError, "AUTENTICACAO RECUSADA"),
+    (CentralClientError, "ERRO CENTRAL"),
+])
+async def test_central_failure_log_redacts_response_and_preserves_pending_outbox(caplog, error_type, reason):
+    db = Database("sqlite:///:memory:")
+    db.initialize()
+    db.enqueue_event("test", timestamp="2026-10-09T00:00:00Z")
+    service = CentralSyncService(base_config(), db, FakeSerial(), Hub(), client=FakeCentral())
+
+    async def fail():
+        await service.stop()
+        raise error_type("simulated sensitive response")
+
+    service.sync_once = fail
+    await service.run()
+    assert "CICLO INDISPONIVEL" in caplog.text and reason in caplog.text
+    assert "simulated sensitive response" not in caplog.text
+    assert "LOTE CONFIRMADO PELA CENTRAL" not in caplog.text
+    assert db.outbox_size() == 2
+
+
+@pytest.mark.parametrize(("scenario", "reason", "technical"), [
+    ("timeout", "TIMEOUT", "CentralClientError | Causa: ReadTimeout"),
+    ("connection", "FALHA DE CONEXAO", "CentralClientError | Causa: ConnectError"),
+    (429, "ERRO HTTP | HTTP 429", "CentralClientError | Causa: HTTPStatusError"),
+    (503, "ERRO HTTP | HTTP 503", "CentralClientError | Causa: HTTPStatusError"),
+    (401, "AUTENTICACAO RECUSADA | HTTP 401", "CentralAuthenticationError"),
+    (403, "AUTENTICACAO RECUSADA | HTTP 403", "CentralAuthenticationError"),
+    ("heartbeat", "ERRO DE VALIDACAO", "CentralClientError"),
+    ("fence", "ERRO DE VALIDACAO", "InvalidFenceError"),
+])
+@pytest.mark.parametrize("detail", [False, True])
+async def test_central_terminal_uses_safe_details_from_actual_client(caplog, scenario, reason, technical,
+                                                              detail, monkeypatch):
+    from app import main  # Loads the same logger configuration used by the Base.
+
+    config = base_config(terminal_detail=detail, base_token="example-header-omit")
+    db = Database("sqlite:///:memory:")
+    db.initialize()
+    hub = Hub()
+
+    async def respond(request):
+        assert request.url.params["diagnostic"] == "example-query-omit"
+        assert request.headers["authorization"] == "Bearer example-header-omit"
+        if scenario == "fence" and request.url.path.endswith("/heartbeat"):
+            return httpx.Response(200, json={"desired_fence_version": 1, "server_time": "test"})
+        await service.stop()
+        if scenario == "timeout":
+            raise httpx.ReadTimeout("example-timeout-omit", request=request)
+        if scenario == "connection":
+            raise httpx.ConnectError("example-connection-omit", request=request)
+        if scenario == "fence":
+            return httpx.Response(200, json={**contract_fence(), "crc32": "example-crc-omit"})
+        if scenario == "heartbeat":
+            return httpx.Response(200, json={"password": "example-json-omit"})
+        return httpx.Response(scenario, text="example-body-omit", headers={"Set-Cookie": "example-cookie-omit"})
+
+    client = CentralClient(config.central_base_url, config.base_token, 1, httpx.MockTransport(respond))
+    request = client._request
+
+    async def request_with_query(method, path, **kwargs):
+        return await request(method, path, params={"diagnostic": "example-query-omit"}, **kwargs)
+
+    monkeypatch.setattr(client, "_request", request_with_query)
+    service = CentralSyncService(config, db, FakeSerial(), hub, client=client)
+    with caplog.at_level(logging.INFO):
+        await service.run()
+    assert f"Motivo: {reason}" in caplog.text
+    assert (f"Tipo: {technical}" in caplog.text) is detail
+    assert "example-" not in caplog.text and "example-header-omit" not in caplog.text
+    assert "EXAMPLE-CRC-OMIT" not in caplog.text and config.central_base_url not in caplog.text
+    assert service.status == "offline" and service.last_error
+    assert hub.messages[-1]["data"]["last_error"] == service.last_error
+
+
+async def test_central_sqlite_failure_is_reported_and_retry_recovers(caplog, monkeypatch):
+    config = base_config(terminal_detail=True)
+    db = Database("sqlite:///:memory:")
+    db.initialize()
+    service = CentralSyncService(config, db, FakeSerial(), Hub(), client=FakeCentral())
+    original = db.fence_state
+    seen = 0
+
+    def unavailable():
+        nonlocal seen
+        seen += 1
+        if seen == 1:
+            with sqlite3.connect(":memory:") as connection:
+                connection.execute("SELECT * FROM example_private_table")
+        return original()
+
+    monkeypatch.setattr(db, "fence_state", unavailable)
+    run = service._set_online
+
+    async def stop_after_recovery():
+        await run()
+        await service.stop()
+
+    monkeypatch.setattr(service, "_set_online", stop_after_recovery)
+    await asyncio.wait_for(service.run(), 2)
+    assert "Motivo: FALHA SQLITE" in caplog.text and "Tipo: OperationalError | Codigo SQLite: 1" in caplog.text
+    assert "example_private_table" not in caplog.text
+    assert service.status == "online" and service.last_error is None and seen == 2
+    assert any(message["data"].get("status") == "storage_unavailable" for message in service.hub.messages
+               if message["type"] == "central")
+
+
+async def test_fence_resume_skips_only_recipients_with_confirmed_version_and_crc(tmp_path):
+    path = tmp_path / "base.db"
+    db = Database(f"sqlite:///{path}")
+    db.initialize()
+    fence = contract_fence()
+    db.enqueue_delivery("COL01", fence["version"], "confirmed", "2026-10-09T00:00:00Z",
+                        crc32=fence["crc32"])
+    reopened = Database(f"sqlite:///{path}")
+    reopened.initialize()
+    serial = FakeSerial()
+    service = CentralSyncService(base_config(), reopened, serial, Hub(), client=FakeCentral())
+    await service._deliver_fence(fence)
+    assert serial.sent == [("COL02", 1)]
+    assert reopened.confirmed_recipients(1, fence["crc32"]) == {"COL01", "COL02"}
+
+
+@pytest.mark.parametrize("reply", [
+    {"acked_up_to": 999},
+    {"generation": "different", "acked_sequences": [1]},
+    {"acked_sequences": [True]},
+    {"acked_sequences": [1, 2]},
+    {"acked_sequences": []},
+])
+async def test_bad_commit_response_preserves_outbox(reply):
+    db = Database("sqlite:///:memory:")
+    db.initialize()
+    db.enqueue_event("outside", collar_id="COL01", timestamp="2026-10-09T00:00:00Z")
+    generation = db.outbox_generation()
+    config = base_config()
+
+    def respond(request):
+        assert json.loads(request.content)["generation"] == generation
+        return httpx.Response(200, json={"generation": generation, **reply})
+
+    client = CentralClient(config.central_base_url, "token", 1, httpx.MockTransport(respond))
+    service = CentralSyncService(config, db, FakeSerial(), Hub(), client=client)
+    with pytest.raises(CentralClientError, match="confirmação de lote incompatível"):
+        await service._flush_outbox()
+    assert [item["edge_seq"] for item in db.outbox_batch()] == [1]
+
+
+def test_outbox_generation_survives_reopen_and_prevents_ack_across_recreation(tmp_path):
+    path = tmp_path / "base.db"
+    db = Database(f"sqlite:///{path}")
+    db.initialize()
+    generation = db.outbox_generation()
+    reopened = Database(f"sqlite:///{path}")
+    reopened.initialize()
+    assert reopened.outbox_generation() == generation
+    other = Database(f"sqlite:///{tmp_path / 'replacement.db'}")
+    other.initialize()
+    assert other.outbox_generation() != generation
+    other.enqueue_event("outside", timestamp="2026-10-09T00:00:00Z")
+    with pytest.raises(ValueError, match="generation changed"):
+        other.acknowledge_confirmed_batch(generation, [1])
+    assert other.outbox_size() == 1

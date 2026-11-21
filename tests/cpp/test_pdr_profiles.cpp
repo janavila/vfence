@@ -49,12 +49,12 @@ static void pdrCases() {
   assert(rx(12, 151));
   check(collars[12].closeWindow(), 2, 2, 10000);
 
-  assert(rx(13, 800, 91) && rx(13, 802, 91) && rx(13, 1, 92));
-  assert(!rx(13, 803, 91));
+  assert(rx(13, 800, 91) && rx(13, 802, 91) && !rx(13, 1, 92));
+  assert(!rx(13, 803, 91));  // Track incumbent liveness without using an ambiguous window.
   bad = collars[13].closeWindow();
-  assert(bad.reason == PdrReason::SESSION_CHANGED && !bad.hasSession && bad.received == 3);
-  assert(rx(13, 2, 92) && rx(13, 3, 92));
-  check(collars[13].closeWindow(), 2, 2, 10000);
+  assert(bad.reason == PdrReason::SESSION_CHANGED && !bad.hasSession && bad.received == 2);
+  assert(rx(13, 804, 91) && rx(13, 806, 91));
+  check(collars[13].closeWindow(), 2, 3, 6667);
 
   assert(rx(14, 1));
   assert(collars[14].observe({9, 2, 1}, 20, 1));
@@ -63,6 +63,63 @@ static void pdrCases() {
   collars[14].profileChanged();
   assert(rx(14, 3) && rx(14, 4));
   assert(collars[14].closeWindow().reason == PdrReason::PROFILE_CHANGED);
+}
+
+static void sessionCases() {
+  PositionPdr pdr;
+  const auto rx = [&](uint64_t id, uint32_t ordinal, uint32_t now) {
+    return pdr.observe({id, ordinal, 0}, now, 0);
+  };
+  assert(rx(900, 30, 1) && rx(900, 31, 2));
+  check(pdr.closeWindow(), 2, 2, 10000);
+  assert(!rx(900, 31, 120002) && !rx(900, 30, 120003));
+  assert(pdr.closeWindow().reason == PdrReason::NO_SAMPLES);
+
+  uint32_t now = 120004;
+  // IDs deliberately have no numeric boot ordering. Exercise more changes
+  // than the formerly retained two IDs, and confirm only after silence.
+  for (const uint64_t session : {44, 1000, 7, 63}) {
+    assert(!rx(session, 1, now));
+    assert(!rx(session, 1, now + 1));   // Candidate duplicate is not proof.
+    assert(!rx(session, 0, now + 2));   // Nor is an older ordinal.
+    assert(!rx(session, 2, now + 3));   // Confirmation window is still invalid.
+    assert(!rx(session, 3, now + 4));   // No mixed or provisional observations.
+    const auto transition = pdr.closeWindow();
+    assert(transition.reason == PdrReason::SESSION_CHANGED && !transition.hasSession);
+    assert(transition.received == 0 && transition.estimatedTx == 0);
+    assert(!rx(session, 3, now + 5));
+    assert(rx(session, 4, now + 6) && rx(session, 6, now + 7));
+    const auto measured = pdr.closeWindow();
+    check(measured, 2, 3, 6667);
+    assert(measured.collarSession == session);
+    now += PDR_REFERENCE_TIMEOUT_MS + 10;
+  }
+
+  // Replaying an old boot, even with increasing ordinals after silence,
+  // neither promotes it nor invalidates the proven incumbent.
+  assert(!rx(900, 601, now) && !rx(900, 602, now + 1));
+  assert(!rx(44, 500, now + 2) && !rx(1000, 505, now + 3) && !rx(7, 509, now + 4));
+  assert(pdr.closeWindow().reason == PdrReason::NO_SAMPLES);
+  assert(rx(63, 7, now + 5) && rx(63, 8, now + 6));
+  check(pdr.closeWindow(), 2, 2, 10000);
+
+  // A lone unknown boot never displaces a progressing incumbent.
+  assert(!rx(1234, 1, now + 7));
+  assert(!rx(63, 9, now + 8));
+  assert(pdr.closeWindow().reason == PdrReason::SESSION_CHANGED);
+  assert(rx(63, 10, now + 9) && rx(63, 11, now + 10));
+  check(pdr.closeWindow(), 2, 2, 10000);
+
+  PositionPdr wrapped;
+  assert(wrapped.observe({81, 1, 0}, UINT32_MAX - 500, 0));
+  assert(wrapped.closeWindow().reason == PdrReason::ONE_SAMPLE);
+  assert(!wrapped.observe({88, UINT32_MAX, 0}, 120000, 0));
+  assert(!wrapped.observe({88, 0, 1}, 120001, 0));
+  assert(!wrapped.observe({88, 0, 0}, 120002, 0));
+  assert(wrapped.closeWindow().reason == PdrReason::SESSION_CHANGED);
+  assert(wrapped.observe({88, 1, 0}, 120010, 0));
+  assert(wrapped.observe({88, 2, 0}, 120015, 0));
+  check(wrapped.closeWindow(), 2, 2, 10000);
 }
 
 static void codecCase() {
@@ -164,6 +221,7 @@ static void profileCases() {
 
 int main() {
   pdrCases();
+  sessionCases();
   codecCase();
   profileCases();
   PositionPdr sample;

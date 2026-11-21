@@ -8,11 +8,13 @@
 
 #include "collar_config.h"
 #include "counted_position.h"
+#include "fence_storage.h"
 #include "terminal_serial.h"
 
 #include "vfence_protocol.h"
 #include "vfence_geofence.h"
 #include "vfence_fence_transfer.h"
+#include "../../firmware_common/profile_transition.h"
 
 using namespace vfence;
 
@@ -31,10 +33,13 @@ Servo secondActuatorServo;
 
 GeofenceEngine geofence;
 FenceAssembler pendingFence;
+FenceStorage fenceStorage;
+CollarProfileTransition radioProfile;
 
 CoordinateE7 activeFence[MAX_VERTICES];
 uint8_t activeFenceCount = 0;
 uint16_t activeFenceVersion = 0;
+bool activeFenceDevelopment = false;
 
 ParametersPayload params = {
   10,   // muitoPertoM
@@ -309,59 +314,73 @@ void sendPong(uint16_t token) {
 // PERSISTENCIA
 // ============================================================
 
-bool saveFenceToNvs() {
-  if (activeFenceCount < 3 || activeFenceCount > MAX_VERTICES) return false;
+static const CoordinateE7 DEVELOPMENT_FENCE[] = {
+  {-313131703, -540868848}, {-313131703, -540867535},
+  {-313133945, -540867535}, {-313133945, -540868848},
+};
 
-  prefs.begin("vfence", false);
-  bool ok = true;
-  ok &= prefs.putUShort("fver", activeFenceVersion) > 0;
-  ok &= prefs.putUChar("fcnt", activeFenceCount) > 0;
-  ok &= prefs.putBytes("fpts", activeFence,
-                       activeFenceCount * sizeof(CoordinateE7)) ==
-        activeFenceCount * sizeof(CoordinateE7);
+bool saveFenceToNvs(const FenceConfiguration& fence) {
+  if (!prefs.begin("vfence", false)) return false;
+  const bool ok = fenceStorage.commit(prefs, fence);
   prefs.end();
   return ok;
 }
 
-bool loadFenceFromNvs() {
-  prefs.begin("vfence", true);
-  const uint8_t count = prefs.getUChar("fcnt", 0);
-  const uint16_t version = prefs.getUShort("fver", 0);
-  const size_t storedBytes = prefs.getBytesLength("fpts");
-
-  if (count < 3 || count > MAX_VERTICES ||
-      storedBytes != count * sizeof(CoordinateE7)) {
-    prefs.end();
-    return false;
-  }
-
-  CoordinateE7 temp[MAX_VERTICES];
-  const size_t readBytes = prefs.getBytes("fpts", temp,
-                                          count * sizeof(CoordinateE7));
-  prefs.end();
-
-  if (readBytes != count * sizeof(CoordinateE7)) return false;
-  if (!geofence.setFence(temp, count, version)) return false;
-
-  memcpy(activeFence, temp, count * sizeof(CoordinateE7));
-  activeFenceCount = count;
-  activeFenceVersion = version;
+bool activateFenceConfiguration(const FenceConfiguration& fence, bool store) {
+  if (!validStoredFence(fence)) return false;
+  GeofenceEngine next = geofence;
+  if (!next.setFence(fence.points, fence.count, fence.version) ||
+      !next.setThresholds(fence.parameters.muitoPertoM, fence.parameters.pertoM)) return false;
+  if (store && !saveFenceToNvs(fence)) return false;
+  geofence = next;
+  memcpy(activeFence, fence.points, fence.count * sizeof(CoordinateE7));
+  activeFenceCount = fence.count;
+  activeFenceVersion = fence.version;
+  activeFenceDevelopment = fence.development;
+  params = fence.parameters;
+  if (gpsEverValid && !gpsLostState) latestGeofence = geofence.analyze(latestPosition);
   return true;
 }
 
-void saveParametersToNvs() {
-  prefs.begin("vfence", false);
-  prefs.putUShort("vnear", params.muitoPertoM);
-  prefs.putUShort("near", params.pertoM);
-  prefs.putUInt("tint", params.telemetryIntervalS);
-  prefs.putUShort("gtmo", params.gpsTimeoutS);
-  prefs.putUChar("blow", params.lowBatteryPct);
-  prefs.putUChar("bcrit", params.criticalBatteryPct);
-  prefs.end();
+bool loadFenceFromNvs() {
+  FenceConfiguration fence{};
+  if (prefs.begin("vfence", true)) {
+    if (fenceStorage.load(prefs, fence)) {
+      prefs.end();
+      return activateFenceConfiguration(fence, false);
+    }
+    if (fenceStorage.hasActivationMarker(prefs)) {
+      prefs.end();
+      return false;
+    }
+
+    fence.count = prefs.getUChar("fcnt", 0);
+    fence.version = prefs.getUShort("fver", 0);
+    const size_t storedBytes = prefs.getBytesLength("fpts");
+    if (fence.count || fence.version || storedBytes) {
+      const bool shape = fence.count >= 3 && fence.count <= MAX_VERTICES &&
+          storedBytes == fence.count * sizeof(CoordinateE7);
+      const bool read = shape && prefs.getBytes("fpts", fence.points, storedBytes) == storedBytes;
+      prefs.end();
+      if (!read) return false;
+      fence.parameters = params;
+      fence.development = fence.version == 1 && storedBytes == sizeof(DEVELOPMENT_FENCE) &&
+          memcmp(fence.points, DEVELOPMENT_FENCE, sizeof(DEVELOPMENT_FENCE)) == 0;
+      return activateFenceConfiguration(fence, true);
+    }
+    prefs.end();
+  }
+
+  fence.parameters = params;
+  fence.version = 1;
+  fence.count = sizeof(DEVELOPMENT_FENCE) / sizeof(DEVELOPMENT_FENCE[0]);
+  fence.development = true;
+  memcpy(fence.points, DEVELOPMENT_FENCE, sizeof(DEVELOPMENT_FENCE));
+  return activateFenceConfiguration(fence, true);
 }
 
 void loadParametersFromNvs() {
-  prefs.begin("vfence", true);
+  if (!prefs.begin("vfence", true)) return;
   params.muitoPertoM = prefs.getUShort("vnear", params.muitoPertoM);
   params.pertoM = prefs.getUShort("near", params.pertoM);
   params.telemetryIntervalS = prefs.getUInt("tint", params.telemetryIntervalS);
@@ -383,24 +402,6 @@ void loadParametersFromNvs() {
   if (params.criticalBatteryPct > params.lowBatteryPct) params.criticalBatteryPct = 5;
 
   geofence.setThresholds(params.muitoPertoM, params.pertoM);
-}
-
-// Cerca usada somente quando ainda nao existe cerca persistida.
-void loadDevelopmentFence() {
-  const CoordinateE7 testFence[] = {
-    {-313131703, -540868848},
-    {-313131703, -540867535},
-    {-313133945, -540867535},
-    {-313133945, -540868848}
-  };
-
-  activeFenceCount = 4;
-  activeFenceVersion = 1;
-  memcpy(activeFence, testFence, sizeof(testFence));
-  geofence.setFence(activeFence, activeFenceCount, activeFenceVersion);
-  saveFenceToNvs();
-
-  Serial.println("[FENCE] nenhuma cerca persistida; cerca de desenvolvimento carregada");
 }
 
 // ============================================================
@@ -831,7 +832,7 @@ void sendTelemetryPacket() {
   const uint16_t seq = allocateSequence();
   const size_t len = COUNTED_POSITION_ENABLED
       ? encodeCountedPosition(packet, sizeof(packet), COLLAR_ID, seq, d,
-                              {hdopSessionId, countedPositionOrdinal + 1U, INITIAL_LORA_PROFILE})
+                              {hdopSessionId, countedPositionOrdinal + 1U, radioProfile.active})
       : encodeTelemetry(packet, sizeof(packet), COLLAR_ID, seq, d);
   const bool sent = len && transportSend(packet, len);
   if (COUNTED_POSITION_ENABLED && sent) ++countedPositionOrdinal;
@@ -895,6 +896,12 @@ void processConfig(const PacketView& packet) {
       nackIncoming(packet, ErrorCode::INVALID_LENGTH);
       return;
     }
+    if (!version || version < activeFenceVersion ||
+        (version == activeFenceVersion && !activeFenceDevelopment &&
+         crc != computeFenceCrc32(activeFenceVersion, activeFence, activeFenceCount))) {
+      nackIncoming(packet, ErrorCode::INVALID_FENCE_VERSION);
+      return;
+    }
 
     if (!pendingFence.begin(version, vertexCount, chunkCount, crc)) {
       nackIncoming(packet, ErrorCode::INVALID_PARAMETER);
@@ -939,6 +946,15 @@ void processConfig(const PacketView& packet) {
       nackIncoming(packet, ErrorCode::INVALID_LENGTH);
       return;
     }
+    if (activeFenceCount && version == activeFenceVersion && !activeFenceDevelopment &&
+        crc == computeFenceCrc32(activeFenceVersion, activeFence, activeFenceCount)) {
+      ackIncoming(packet);
+      return;
+    }
+    if (!version || version < activeFenceVersion || (version == activeFenceVersion && !activeFenceDevelopment)) {
+      nackIncoming(packet, ErrorCode::INVALID_FENCE_VERSION);
+      return;
+    }
 
     ErrorCode error = ErrorCode::COMMIT_REJECTED;
     uint16_t detail = 0;
@@ -947,17 +963,17 @@ void processConfig(const PacketView& packet) {
       return;
     }
 
-    if (!geofence.setFence(pendingFence.points(), pendingFence.vertexCount(), version)) {
+    FenceConfiguration next{};
+    next.parameters = params;
+    next.count = pendingFence.vertexCount();
+    next.version = version;
+    memcpy(next.points, pendingFence.points(), next.count * sizeof(CoordinateE7));
+    if (!validStoredFence(next)) {
       nackIncoming(packet, ErrorCode::COMMIT_REJECTED);
       return;
     }
 
-    memcpy(activeFence, pendingFence.points(),
-           pendingFence.vertexCount() * sizeof(CoordinateE7));
-    activeFenceCount = pendingFence.vertexCount();
-    activeFenceVersion = version;
-
-    if (!saveFenceToNvs()) {
+    if (!activateFenceConfiguration(next, true)) {
       nackIncoming(packet, ErrorCode::PERSISTENCE_ERROR);
       return;
     }
@@ -981,9 +997,20 @@ void processConfig(const PacketView& packet) {
       return;
     }
 
-    params = p;
-    geofence.setThresholds(params.muitoPertoM, params.pertoM);
-    saveParametersToNvs();
+    if (params.muitoPertoM != p.muitoPertoM || params.pertoM != p.pertoM ||
+        params.telemetryIntervalS != p.telemetryIntervalS || params.gpsTimeoutS != p.gpsTimeoutS ||
+        params.lowBatteryPct != p.lowBatteryPct || params.criticalBatteryPct != p.criticalBatteryPct) {
+      FenceConfiguration next{};
+      next.parameters = p;
+      next.version = activeFenceVersion;
+      next.count = activeFenceCount;
+      next.development = activeFenceDevelopment;
+      memcpy(next.points, activeFence, next.count * sizeof(CoordinateE7));
+      if (!activateFenceConfiguration(next, true)) {
+        nackIncoming(packet, ErrorCode::PERSISTENCE_ERROR);
+        return;
+      }
+    }
     scheduleNextTelemetry();
     ackIncoming(packet);
     Serial.println("[CONFIG] parametros atualizados");
@@ -996,6 +1023,28 @@ void processConfig(const PacketView& packet) {
 void processControl(const PacketView& packet) {
   if (packet.payloadLength < 1) return;
   const uint8_t subtype = packet.payload[0];
+  if (PROFILE_SWITCH_ENABLED && subtype == PROFILE_CONTROL && packet.header.collarId == COLLAR_ID) {
+    ProfileSignal signal{};
+    if (!decodeProfileSignal(packet, signal)) return;
+    bool busy = hdopConfigGuard && millis() - lastConfigRxMs < 20000;
+    for (const auto& tx : pendingTx) if (tx.active) busy = true;
+    radioProfile.receive(
+        signal, hdopSessionId, millis(), busy,
+        [](const ProfileSignal& candidate) {
+          uint8_t record[MAX_PACKET_SIZE];
+          const auto length = encodeProfileSignal(record, sizeof(record), COLLAR_ID, 0, candidate);
+          if (!length || !prefs.begin("vf-profile", false)) return false;
+          const bool saved = prefs.putBytes("pending", record, length) == length;
+          prefs.end();
+          return saved;
+        },
+        [](const ProfileSignal& reply) {
+          uint8_t response[MAX_PACKET_SIZE];
+          const auto length = encodeProfileSignal(response, sizeof(response), COLLAR_ID, allocateSequence(), reply);
+          if (length) transportSend(response, length, false);
+        });
+    return;
+  }
 
   if (subtype == static_cast<uint8_t>(ControlSubtype::ACK)) {
     AckPayload ack;
@@ -1210,7 +1259,18 @@ void setup() {
   memset(pendingTx, 0, sizeof(pendingTx));
 
   loadParametersFromNvs();
-  if (!loadFenceFromNvs()) loadDevelopmentFence();
+  if (!loadFenceFromNvs()) Serial.println("[ERRO] cerca duravel indisponivel");
+  else if (activeFenceDevelopment) Serial.println("[FENCE] cerca de desenvolvimento carregada");
+  if (PROFILE_SWITCH_ENABLED && prefs.begin("vf-profile", true)) {
+    uint8_t raw[MAX_PACKET_SIZE];
+    const size_t length = prefs.getBytesLength("pending");
+    PacketView packet{};
+    ProfileSignal previous{};
+    if (length && length <= sizeof(raw) && prefs.getBytes("pending", raw, length) == length &&
+        decodePacket(raw, length, packet) && decodeProfileSignal(packet, previous))
+      radioProfile.recover(previous);
+    prefs.end();
+  }
 
   geofence.setThresholds(params.muitoPertoM, params.pertoM);
 
@@ -1267,6 +1327,11 @@ void loop() {
   pollLoRaReceive();
   serviceReliableTx();
   pollSerialPacketInjection();
+  if (PROFILE_SWITCH_ENABLED) {
+    bool busy = hdopConfigGuard && millis() - lastConfigRxMs < 20000;
+    for (const auto& tx : pendingTx) if (tx.active) busy = true;
+    radioProfile.service(millis(), busy, [](uint8_t profile) { return applyLoRaProfile(LoRa, profile); });
+  }
 
   if (static_cast<int32_t>(millis() - nextTelemetryAtMs) >= 0) {
     sendTelemetryPacket();

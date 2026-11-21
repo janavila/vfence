@@ -110,6 +110,21 @@ CREATE TABLE IF NOT EXISTS edge_items (
   PRIMARY KEY (base_id, edge_seq)
 );
 
+CREATE TABLE IF NOT EXISTS edge_receipts (
+  base_id TEXT NOT NULL,
+  generation TEXT NOT NULL,
+  edge_seq BIGINT NOT NULL,
+  digest TEXT NOT NULL,
+  delivery_payload TEXT,
+  PRIMARY KEY (base_id, generation, edge_seq)
+);
+
+CREATE TABLE IF NOT EXISTS property_binding (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  property_id TEXT NOT NULL,
+  base_id TEXT NOT NULL
+);
+
 -- Histórico de posições. zone vem calculada pela coleira.
 CREATE TABLE IF NOT EXISTS telemetry (
   id INTEGER PRIMARY KEY,

@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import logging
 
+import asyncio
+
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from backend.clock import utc_now_iso
@@ -59,32 +61,23 @@ async def websocket_route(websocket: WebSocket) -> None:
         logger.info("websocket refused: no session")
         return
 
-    await hub.connect(websocket)
+    active, bases = await asyncio.to_thread(lambda: (fence_service.active_version(db), _all_bases(db)))
+    hello = {"type": "hello", "data": {
+        "server_time": utc_now_iso(), "active_fence_version": active,
+        "bases": [
+            {"base_id": base["base_id"], "online": edge_service.base_is_online(base, settings),
+             "last_heartbeat": base["last_heartbeat"]} for base in bases
+        ],
+    }}
+    if not await hub.connect(websocket, hello):
+        return
     try:
-        await websocket.send_json(
-            {
-                "type": "hello",
-                "data": {
-                    "server_time": utc_now_iso(),
-                    "active_fence_version": fence_service.active_version(db),
-                    "bases": [
-                        {
-                            "base_id": base["base_id"],
-                            "online": edge_service.base_is_online(base, settings),
-                            "last_heartbeat": base["last_heartbeat"],
-                        }
-                        for base in _all_bases(db)
-                    ],
-                },
-            }
-        )
         while True:
             # Só serve para perceber a desconexão.
             await websocket.receive_text()
-    except WebSocketDisconnect:
-        await hub.disconnect(websocket)
-    except Exception as erro:  # noqa: BLE001
-        logger.info("websocket closed unexpectedly (%s)", erro)
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
         await hub.disconnect(websocket)
 
 

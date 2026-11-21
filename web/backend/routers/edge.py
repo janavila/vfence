@@ -105,6 +105,8 @@ def _authenticate(request: Request, authorization: str | None) -> tuple[Database
     db: Database = request.app.state.db
     settings: Settings = request.app.state.settings
     base = _base_from_token(db, _token_from_header(authorization))
+    if getattr(request.app.state, "property_id", None) and base["base_id"] != settings.base_id:
+        raise HTTPException(status_code=403, detail="base_not_provisioned_for_property")
     return db, settings, base
 
 
@@ -222,7 +224,8 @@ async def fence_for_base_route(
 # ---------------------------------------------------------------------------
 
 
-@router.post("/batch", response_model=BatchOut, summary="Recebe a fila local da Base")
+@router.post("/batch", response_model=BatchOut, response_model_exclude_none=True,
+             summary="Recebe a fila local da Base")
 async def batch_route(
     data: BatchIn,
     request: Request,
@@ -237,13 +240,20 @@ async def batch_route(
     db, settings, base = _authenticate(request, authorization)
     _check_body_matches_token(base, data.base_id)
 
-    acked, messages = await asyncio.to_thread(
-        edge_service.process_batch,
-        db,
-        settings,
-        base["base_id"],
-        [item.model_dump() for item in data.items],
-    )
+    try:
+        acked, messages = await asyncio.to_thread(
+            edge_service.process_batch,
+            db,
+            settings,
+            base["base_id"],
+            [item.model_dump() for item in data.items],
+            generation=data.generation,
+        )
+    except edge_service.BatchRejected as exc:
+        raise HTTPException(status_code=409 if exc.conflict else 422,
+                            detail={"code": str(exc), "edge_seq": exc.sequence}) from None
 
     await request.app.state.hub.broadcast_many(messages)
+    if data.generation is not None:
+        return {"generation": data.generation, "acked_sequences": acked}
     return {"acked_up_to": acked}

@@ -185,6 +185,7 @@ def apply_report(
     expected_crc32: str | None,
     active_version: int | None,
     base_id: str,
+    reported_detail: str | None = None,
 ) -> dict | None:
     """Aplica o que a Base relatou sobre uma coleira.
 
@@ -205,7 +206,7 @@ def apply_report(
         )
         return None
 
-    detail: str | None = None
+    detail = reported_detail if status == "failed" else None
 
     # --- A regra do CRC (o que dá sentido a "Confirmada") --------------
     if status == "confirmed":

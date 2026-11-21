@@ -106,7 +106,13 @@ export const enderecoDoGeojson = (versao) => `/api/fences/${versao}/geojson`;
 /* ---- Rebanho e eventos ---- */
 
 export const lerColeiras = () => chamar('/api/collars');
-export const lerEventos = (limite = 100) => chamar(`/api/events?limit=${limite}`);
+export const lerEventos = (limite = 100, filtros = {}) =>
+  chamar(`/api/events?${new URLSearchParams({ limit: limite, ...filtros })}`);
+export const lerTrajeto = (coleira, filtros) =>
+  chamar(`/api/collars/${encodeURIComponent(coleira)}/telemetry?${new URLSearchParams({ limit: 200, ...filtros })}`);
+export const salvarNomeAnimal = (coleira, nome) =>
+  chamar(`/api/collars/${encodeURIComponent(coleira)}`,
+    { metodo: 'PATCH', corpo: { animal_label: nome } });
 
 /* ---- Mensagem de erro para o produtor ---- */
 

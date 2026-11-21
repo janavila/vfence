@@ -37,3 +37,6 @@ static const uint32_t RETRY_JITTER_MS = 2000UL;
 // Habilitar apenas em bancada apos provisionar a Base e validar o transporte.
 static const bool METRIC_SERIAL_EXPORT_ENABLED = false;
 static const bool PDR_SERIAL_EXPORT_ENABLED = false;
+static const bool EVENT_SERIAL_COMMIT_ENABLED = false;
+static const bool PDR_SERIAL_COMMIT_ENABLED = false;
+static const bool PROFILE_SWITCH_ENABLED = false;

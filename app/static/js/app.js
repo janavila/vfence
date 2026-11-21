@@ -2,6 +2,12 @@ const collarsNode=document.querySelector('#collars'),eventsNode=document.querySe
 let collars=[],events=[],map=null,fence=null,fenceLayer=null,fenceVertices=null;
 const zoneColors={SEGURO:'#35745c',ATENCAO:'#946e22',CRITICO:'#a0643f',FORA:'#a34f4f',GNSS_INVALIDO:'#69736f'};
 const zoneLabels={SEGURO:'NORMAL',ATENCAO:'ATENÇÃO',CRITICO:'CRÍTICO',FORA:'FORA DA ÁREA',GNSS_INVALIDO:'GNSS INVÁLIDO'};
+const gatewayEventLabels={
+  outside:'SAÍDA DA CERCA',back_inside:'RETORNO À CERCA',gps_lost:'GNSS PERDIDO',gps_recovered:'GNSS RESTABELECIDO',
+  low_battery:'BATERIA BAIXA',critical_battery:'BATERIA CRÍTICA',device_started:'COLEIRA INICIADA',
+  collar_offline:'COLEIRA OFFLINE',collar_online:'COLEIRA ONLINE',offline:'COLEIRA OFFLINE',
+};
+let eventHistoryTimer=null;
 const markers=new Map();
 const esc=value=>String(value??'—').replace(/[&<>'"]/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
 const number=(value,digits=2)=>value==null?'—':Number(value).toFixed(digits);
@@ -63,9 +69,27 @@ function renderCollars(){
 }
 
 function eventText(event){
+  if(event.event_type!=='zone_change')return gatewayEventLabels[event.event_type]||event.event_type;
   const next=zoneLabels[event.new_value]||event.new_value;
   const previous=zoneLabels[event.old_value]||event.old_value;
   return event.old_value==null?`ZONA INICIAL: ${next}`:`${previous} → ${next}`;
+}
+
+function updateEvents(incoming){
+  const byId=new Map([...events,...incoming].map(event=>[event.id,event]));
+  events=[...byId.values()].sort((a,b)=>b.id-a.id).slice(0,30);
+  renderEvents();
+}
+
+function scheduleEventHistory(){
+  if(eventHistoryTimer!==null)return;
+  eventHistoryTimer=setTimeout(async()=>{
+    eventHistoryTimer=null;
+    try{
+      const response=await fetch('/api/events?limit=30');
+      if(response.ok)updateEvents(await response.json());
+    }catch{}
+  },150);
 }
 
 function renderEvents(){
@@ -130,7 +154,7 @@ async function load(){
       fetch('/api/events?limit=30').then(response=>response.json()),
     ]);
     renderGateway(gateway);renderCentral(central);renderFence(fenceState);
-    collars=collarList;events=eventList;renderCollars();renderEvents();
+    collars=collarList;renderCollars();updateEvents(eventList);
   }catch{document.querySelector('#connection').textContent='LINK API INDISPONÍVEL';}
 }
 
@@ -138,17 +162,18 @@ function connect(){
   const protocol=location.protocol==='https:'?'wss':'ws';
   const socket=new WebSocket(`${protocol}://${location.host}/ws`);
   const status=document.querySelector('#connection');
-  socket.onopen=()=>{status.className='connection live';status.innerHTML='<i></i> Tempo real ativo';};
+  socket.onopen=()=>{status.className='connection live';status.innerHTML='<i></i> Tempo real ativo';scheduleEventHistory();};
   socket.onmessage=({data})=>{
     const message=JSON.parse(data);
     if(message.type==='gateway')renderGateway(message.data);
     if(message.type==='central')renderCentral(message.data);
     if(message.type==='fence')renderFence(message.data);
+    if(message.type==='gateway_event'&&['event','collar_state','offline'].includes(message.data.kind))scheduleEventHistory();
     if(message.type==='telemetry'){
       const index=collars.findIndex(collar=>collar.collar_id===message.collar.collar_id);
       if(index<0)collars.push(message.collar);else collars[index]=message.collar;
-      if(message.event)events.unshift(message.event);
-      renderCollars();renderEvents();
+      if(message.event)updateEvents([message.event]);
+      renderCollars();
     }
   };
   socket.onclose=()=>{status.className='connection';status.innerHTML='<i></i> Reconectando';setTimeout(connect,2000);};

@@ -180,13 +180,35 @@ class Database:
                 conn.execute("SELECT pg_advisory_xact_lock(hashtext('vfence_schema_init'))")
                 for statement in _schema_statements(script):
                     conn.execute(statement)
+                self._migrate_monitoring(conn)
         else:
             script = SQLITE_SCHEMA_FILE.read_text(encoding="utf-8")
             with self.connect() as conn:
                 conn.execute("PRAGMA journal_mode = WAL")
                 conn.executescript(script)
+                self._migrate_monitoring(conn)
                 conn.execute("PRAGMA optimize")
         logger.info("database ready (backend=%s)", self.backend)
+
+    def _migrate_monitoring(self, conn) -> None:
+        columns = {
+            "last_position_at", "last_contact_at", "gnss_status", "link_status",
+        }
+        if self.is_postgresql:
+            for column in sorted(columns):
+                conn.execute(f"ALTER TABLE collars ADD COLUMN IF NOT EXISTS {column} TEXT")
+        else:
+            existing = {row["name"] for row in conn.execute("PRAGMA table_info(collars)")}
+            for column in sorted(columns - existing):
+                conn.execute(f"ALTER TABLE collars ADD COLUMN {column} TEXT")
+        conn.execute(
+            """UPDATE collars SET last_position_at=(
+                 SELECT ts FROM telemetry WHERE telemetry.collar_id=collars.collar_id
+                 AND lat IS NOT NULL AND lon IS NOT NULL AND COALESCE(zone,'')<>'GNSS_INVALIDO'
+                 ORDER BY id DESC LIMIT 1
+               ) WHERE last_position_at IS NULL AND last_lat IS NOT NULL AND last_lon IS NOT NULL"""
+        )
+        conn.execute("UPDATE collars SET last_contact_at=last_seen WHERE last_contact_at IS NULL")
 
     def next_fence_version(self, conn) -> int:
         """Reserva com segurança a próxima versão dentro da transação atual."""
@@ -196,6 +218,18 @@ class Database:
             "SELECT COALESCE(MAX(version), 0) AS maximum FROM fences"
         ).fetchone()
         return int(row["maximum"]) + 1
+
+    def bind_property(self, property_id: str, base_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO property_binding (singleton,property_id,base_id) VALUES (1,?,?) "
+                "ON CONFLICT(singleton) DO NOTHING", (property_id, base_id),
+            )
+            binding = conn.execute("SELECT property_id,base_id FROM property_binding WHERE singleton=1").fetchone()
+            if (binding["property_id"], binding["base_id"]) != (property_id, base_id):
+                raise DatabaseConfigurationError("property storage already has a different owner")
+            if conn.execute("SELECT 1 FROM bases WHERE base_id<>? LIMIT 1", (base_id,)).fetchone():
+                raise DatabaseConfigurationError("storage has other bases; split or restore before binding")
 
     def seed_from_settings(self, settings: Settings) -> None:
         """Cadastra/atualiza a Base e cadastra coleiras sem apagar estado."""

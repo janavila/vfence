@@ -57,7 +57,7 @@ class BatchItemIn(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    edge_seq: int = Field(ge=0)
+    edge_seq: int = Field(strict=True, ge=1, le=9223372036854775807)
     type: Literal["telemetry", "delivery", "event"]
     data: dict[str, Any] = Field(default_factory=dict)
 
@@ -67,11 +67,14 @@ class BatchIn(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    base_id: str
-    items: list[BatchItemIn] = Field(default_factory=list)
+    base_id: str = Field(min_length=1, max_length=64)
+    items: list[BatchItemIn] = Field(default_factory=list, max_length=500)
+    generation: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
 
 
 class BatchOut(BaseModel):
     """A resposta: até onde a Base pode limpar a fila local."""
 
-    acked_up_to: int
+    acked_up_to: int | None = None
+    generation: str | None = None
+    acked_sequences: list[int] | None = None

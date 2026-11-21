@@ -45,11 +45,11 @@ class RealtimeHub:
                 self.full_queues += 1
                 self._record_drop(message)
                 dropped = self._stop_client(client, 1013)
-                logger.warning("websocket backlog full (%d updates discarded)", dropped + 1)
+                logger.warning("[BASE] WEBSOCKET | websocket backlog full (%d updates discarded)", dropped + 1)
 
     async def serve(self, websocket: WebSocket, initial: tuple[dict, ...]) -> None:
         if self._closed or len(self._connections) >= _MAX_CLIENTS:
-            logger.warning("websocket connection refused (hub closed or at capacity)")
+            logger.warning("[BASE] WEBSOCKET | websocket connection refused (hub closed or at capacity)")
             await self._close_socket(websocket, 1013)
             return
 
@@ -69,9 +69,9 @@ class RealtimeHub:
                 receiver.cancel()
                 for result in await asyncio.gather(writer, receiver, return_exceptions=True):
                     if isinstance(result, Exception) and not isinstance(result, WebSocketDisconnect):
-                        logger.error("websocket client failed", exc_info=(type(result), result, result.__traceback__))
+                        logger.error("[BASE] WEBSOCKET | websocket client failed", exc_info=(type(result), result, result.__traceback__))
         except asyncio.TimeoutError:
-            logger.warning("websocket handshake timed out")
+            logger.warning("[BASE] WEBSOCKET | websocket handshake timed out")
             await self._close_socket(websocket, 1013)
         finally:
             self._discard_pending(client)
@@ -83,7 +83,7 @@ class RealtimeHub:
         clients = tuple(self._connections.values())
         dropped = sum(self._stop_client(client, 1001) for client in clients)
         if dropped:
-            logger.info("websocket shutdown (%d queued updates discarded)", dropped)
+            logger.info("[BASE] WEBSOCKET | websocket shutdown (%d queued updates discarded)", dropped)
         await asyncio.gather(*(asyncio.shield(client.done) for client in clients))
 
     @staticmethod
@@ -99,7 +99,7 @@ class RealtimeHub:
                 self.send_timeouts += 1
                 self._record_drop(message)
                 dropped = self._stop_client(client, 1013)
-                logger.warning("websocket send timed out (%d updates discarded)", dropped + 1)
+                logger.warning("[BASE] WEBSOCKET | websocket send timed out (%d updates discarded)", dropped + 1)
                 break
             except asyncio.CancelledError:
                 self._record_drop(message)
@@ -107,12 +107,12 @@ class RealtimeHub:
             except (WebSocketDisconnect, OSError):
                 self._record_drop(message)
                 self._stop_client(client, None)
-                logger.debug("websocket already disconnected", exc_info=True)
+                logger.debug("[BASE] WEBSOCKET | websocket already disconnected", exc_info=True)
                 break
             except Exception:
                 self._record_drop(message)
                 dropped = self._stop_client(client, 1011)
-                logger.exception("websocket send failed (%d updates discarded)", dropped + 1)
+                logger.exception("[BASE] WEBSOCKET | websocket send failed (%d updates discarded)", dropped + 1)
                 break
         if client.close_code is not None:
             await self._close_socket(websocket, client.close_code)
@@ -122,11 +122,11 @@ class RealtimeHub:
         try:
             await asyncio.wait_for(websocket.close(code=code), timeout=_CLIENT_IO_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
-            logger.warning("websocket close timed out")
+            logger.warning("[BASE] WEBSOCKET | websocket close timed out")
         except (WebSocketDisconnect, OSError):
-            logger.debug("websocket already disconnected", exc_info=True)
+            logger.debug("[BASE] WEBSOCKET | websocket already disconnected", exc_info=True)
         except Exception:
-            logger.warning("websocket close failed", exc_info=True)
+            logger.warning("[BASE] WEBSOCKET | websocket close failed", exc_info=True)
 
     def _stop_client(self, client: _Client, code: int | None) -> int:
         if client.closing:

@@ -4,13 +4,16 @@ import asyncio
 import json
 import logging
 import re
+import sqlite3
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import datetime, timezone
+from enum import Enum
 from functools import partial
+from heapq import heapify
 from itertools import count, cycle
 
-from app.database import MetricSaveResult
+from app.database import GatewayEventConflictError, MetricSaveResult
 from app.metric_protocol import (
     HDOP_SUMMARY_KIND,
     METRIC_LINE_MAX_BYTES,
@@ -20,11 +23,11 @@ from app.metric_protocol import (
     parse_metric_summary,
 )
 from app.models import GatewayState
-from app.pdr_protocol import PDR_KIND, PDR_SCHEMA, PdrSummary, parse_pdr_summary
+from app.pdr_protocol import PDR_COMMIT_SCHEMA, PDR_KIND, PDR_SCHEMA, PdrSummary, parse_pdr_summary
 from app.protocol import ParsedPacket, ProtocolError, parse_message
 from app.terminal import (
-    RULE, collar_label, event_block, metric_block, metric_identity, position_line, value_text,
-    zone_transition_alert,
+    ALERT_EVENTS, base_block, base_event, base_metric, base_pdr, base_position, base_value,
+    collar_label, gateway_log_field, gateway_log_snapshot, metric_identity,
 )
 
 logger = logging.getLogger("serial_reader")
@@ -35,12 +38,23 @@ _SERIAL_READ_BYTES = 256
 # Deixa margem para respostas que incluem texto de comandos de ate 512 caracteres.
 _LEGACY_LINE_MAX_BYTES = 4096
 _WORK_QUEUE_CAPACITY = 128
+# O volume de trabalho comum nao consome a reserva de alertas da coleira.
+_CRITICAL_EVENT_CAPACITY = 16
 _METRIC_QUEUE_CAPACITY = 64
 _PDR_QUEUE_CAPACITY = 8
+# A rajada PDR pode ocupar ate oito vagas. Preserve o mesmo espaco para
+# trabalho de maior prioridade, sem reduzir a capacidade das filas existentes.
+_PDR_OPERATIONAL_RESERVE = _PDR_QUEUE_CAPACITY
 _WORK_DRAIN_SECONDS = 2.0
+_CRITICAL_EVENT_PRIORITY = -1
 _LEGACY_WORK_PRIORITY = 0
 _METRIC_WORK_PRIORITY = 1
 _PDR_WORK_PRIORITY = 2
+_PRIORITY_EVENT_NAMES = {
+    "OUTSIDE", "BACK_INSIDE", "GPS_LOST", "GPS_RECOVERED", "LOW_BATTERY", "CRITICAL_BATTERY",
+}
+_GATEWAY_EVENT_KINDS = {"event", "collar_state", "offline"}
+_EVENT_SQLITE_RETRY_SECONDS = (0.05, 0.2)
 _METRIC_ACK_CAPACITY = 16
 _METRIC_ACK_WRITE_SECONDS = 0.25
 _SERIAL_RESYNC = b"\x00\n"
@@ -49,7 +63,54 @@ _JSON_TOKEN = re.compile(_JSON_STRING + r"|[\[\]{}]")
 _JSON_STRING_MEMBER = re.compile(r"\s*:\s*(" + _JSON_STRING + ")")
 _IMMEDIATE_APP_KINDS = {"command_response", "fence_transfer"}
 _FRAMED_SUMMARIES = METRIC_SUMMARY_KINDS | {PDR_KIND}
+_SAFE_FRAME_REJECTIONS = {
+    "mensagem [APP] deve ser um objeto JSON",
+    "resumo exige prefixo [APP] e terminador LF ou CRLF",
+    "resumo deve ocupar uma unica linha",
+    "chave JSON duplicada no resumo",
+    "schema do resumo ausente ou nao suportado",
+    "schema [APP] ausente",
+    "schema [APP] não suportado",
+    "kind [APP] desconhecido",
+}
 _WorkItem = tuple[int, int, Callable[[], Awaitable[bool | None]] | None]
+
+
+class _LineResult(Enum):
+    UNRECOGNIZED = 0
+    REFUSED = 1
+    ACCEPTED = 2
+
+
+class _SerialWorkQueue(asyncio.PriorityQueue[_WorkItem]):
+    def __init__(self, maxsize: int):
+        super().__init__(maxsize=maxsize + _CRITICAL_EVENT_CAPACITY)
+        self.regular_capacity = maxsize
+
+    def evict_newest_pdr(self) -> bool:
+        # O heap pertence ao event loop. Remover e confirmar a pendencia sem
+        # await preserva a ordem dos demais itens e a contagem usada por join().
+        newest = max(
+            (index for index, item in enumerate(self._queue) if item[0] == _PDR_WORK_PRIORITY),
+            key=lambda index: self._queue[index][1],
+            default=None,
+        )
+        if newest is None:
+            return False
+        self._queue.pop(newest)
+        heapify(self._queue)
+        self.task_done()
+        return True
+
+    def discard_regular(self) -> int:
+        preserved = [item for item in self._queue if item[0] == _CRITICAL_EVENT_PRIORITY]
+        discarded = len(self._queue) - len(preserved)
+        self._queue[:] = preserved
+        heapify(self._queue)
+        for _ in range(discarded):
+            self.task_done()
+        return discarded
+
 
 GATEWAY_APP_KINDS = {
     "telemetry", "event", "control", "collar_state", "collar_status",
@@ -87,14 +148,19 @@ class SerialReader:
         self.collar_status: dict[int, dict] = {}
         self.gateway_state: dict | None = None
         self.radio_config: dict | None = None
+        self.effective_profile: dict | None = None
         self._serial_line = bytearray()
         self._discard_until_lf = False
-        self._work_queue: asyncio.PriorityQueue[_WorkItem] | None = None
+        self._work_queue: _SerialWorkQueue | None = None
         self._work_sequence = count()
         self._queued_metrics = 0
         self._queued_pdr = 0
+        self._queued_critical = 0
         self._refused_metrics = 0
+        self._refused_pdr = 0
+        self._evicted_pdr = 0
         self._refused_legacy = 0
+        self._refused_critical = 0
         self._admitted_work = 0
         self._processed_work = 0
         self._failed_work = 0
@@ -108,10 +174,11 @@ class SerialReader:
         if self.config.mock_serial:
             await self._run_mock()
             return
-        queue: asyncio.PriorityQueue[_WorkItem] = asyncio.PriorityQueue(maxsize=_WORK_QUEUE_CAPACITY)
+        queue = _SerialWorkQueue(maxsize=_WORK_QUEUE_CAPACITY)
         self._work_queue = queue
         self._queued_metrics = self._refused_metrics = 0
-        self._queued_pdr = 0
+        self._queued_pdr = self._refused_pdr = self._evicted_pdr = 0
+        self._queued_critical = self._refused_critical = 0
         self._refused_legacy = self._admitted_work = self._processed_work = self._failed_work = 0
         self._legacy_work_error = None
         worker = asyncio.create_task(self._work_loop(queue), name="vfence-serial-storage")
@@ -145,30 +212,62 @@ class SerialReader:
         self._stop.set()
 
     async def _submit_work(self, operation: Callable[[], Awaitable[bool | None]], *,
-                           priority: int = _LEGACY_WORK_PRIORITY, description: str = "") -> None:
+                           priority: int = _LEGACY_WORK_PRIORITY, description: str = "") -> bool:
         queue = self._work_queue
         if queue is None:
-            await operation()
-            return
-        if (queue.full()
-                or priority == _METRIC_WORK_PRIORITY and self._queued_metrics >= _METRIC_QUEUE_CAPACITY
-                or priority == _PDR_WORK_PRIORITY and self._queued_pdr >= _PDR_QUEUE_CAPACITY):
-            if priority != _LEGACY_WORK_PRIORITY:
+            return await operation() is not False
+        if priority == _CRITICAL_EVENT_PRIORITY:
+            if self._queued_critical == _CRITICAL_EVENT_CAPACITY:
+                self._refused_critical += 1
+                logger.error("%s", base_block(
+                    "ERRO | FILA SERIAL", f"Evento: {description}",
+                    f"Estado: RECUSADO POR SATURACAO | Criticos recusados: {self._refused_critical}",
+                    critical=True,
+                ))
+                return False
+            queue.put_nowait((priority, next(self._work_sequence), operation))
+            self._queued_critical += 1
+            self._admitted_work += 1
+            self._diagnostic("[BASE] FILA SERIAL | ADMITIDO %s", description)
+            return True
+        regular_size = queue.qsize() - self._queued_critical
+        regular_full = regular_size >= queue.regular_capacity
+        metric_limit = priority == _METRIC_WORK_PRIORITY and self._queued_metrics >= _METRIC_QUEUE_CAPACITY
+        pdr_limit = priority == _PDR_WORK_PRIORITY and self._queued_pdr >= _PDR_QUEUE_CAPACITY
+        reserved = priority == _PDR_WORK_PRIORITY and regular_size >= queue.regular_capacity - _PDR_OPERATIONAL_RESERVE
+        if regular_full and priority < _PDR_WORK_PRIORITY and not metric_limit and self._queued_pdr:
+            if queue.evict_newest_pdr():
+                regular_full = False
+                self._queued_pdr -= 1
+                self._evicted_pdr += 1
+                if self._evicted_pdr == 1 or self._evicted_pdr % 100 == 0:
+                    logger.warning("[BASE] AVISO | FILA SERIAL | PDR desalojado (%d) %s",
+                                   self._evicted_pdr, description)
+        if regular_full or metric_limit or pdr_limit or reserved:
+            if priority == _PDR_WORK_PRIORITY:
+                self._refused_pdr += 1
+                reason = "global capacity" if regular_full else "PDR quota" if pdr_limit else "operational reserve"
+                if self._refused_pdr == 1 or self._refused_pdr % 100 == 0:
+                    logger.warning("[BASE] AVISO | FILA CHEIA | PDR recusado (%s, %d total) %s",
+                                   reason, self._refused_pdr, description)
+                return False
+            if priority == _METRIC_WORK_PRIORITY:
                 self._refused_metrics += 1
                 refused, label = self._refused_metrics, "metric summary"
             else:
                 self._refused_legacy += 1
                 refused, label = self._refused_legacy, "legacy Serial work"
             if refused == 1 or refused % 100 == 0:
-                logger.warning("[ALERTA] [BASE] FILA CHEIA | %s queue full (%d refused) %s",
+                logger.warning("[BASE] AVISO | FILA CHEIA | %s queue full (%d refused) %s",
                                label, refused, description)
-            return
+            return False
         queue.put_nowait((priority, next(self._work_sequence), operation))
         self._admitted_work += 1
         if priority == _METRIC_WORK_PRIORITY:
             self._queued_metrics += 1
         elif priority == _PDR_WORK_PRIORITY:
             self._queued_pdr += 1
+        return True
 
     async def _work_loop(self, queue: asyncio.PriorityQueue[_WorkItem]) -> None:
         while True:
@@ -176,8 +275,10 @@ class SerialReader:
             try:
                 if operation is None:
                     return
-                metric = priority != _LEGACY_WORK_PRIORITY
-                if priority == _METRIC_WORK_PRIORITY:
+                metric = priority in {_METRIC_WORK_PRIORITY, _PDR_WORK_PRIORITY}
+                if priority == _CRITICAL_EVENT_PRIORITY:
+                    self._queued_critical -= 1
+                elif priority == _METRIC_WORK_PRIORITY:
                     self._queued_metrics -= 1
                 elif priority == _PDR_WORK_PRIORITY:
                     self._queued_pdr -= 1
@@ -186,10 +287,14 @@ class SerialReader:
                         self._failed_work += 1
                 except (KeyError, ValueError, TypeError, RecursionError) as exc:
                     self._failed_work += 1
-                    logger.warning("gateway application line rejected (%s)", exc)
+                    logger.warning("gateway application line rejected (%s)", type(exc).__name__)
                 except Exception as exc:
                     self._failed_work += 1
-                    logger.exception("gateway Serial work failed (metric=%s)", metric)
+                    logger.error("%s", base_block(
+                        "ERRO | PROCESSAMENTO SERIAL",
+                        f"Tipo: {'METRICA' if metric else 'OPERACIONAL'} | Motivo: {base_value(exc)}",
+                        critical=True,
+                    ), exc_info=self.terminal_detail)
                     if not metric and self._legacy_work_error is None:
                         self._legacy_work_error = exc
                 finally:
@@ -202,15 +307,13 @@ class SerialReader:
         try:
             await asyncio.wait_for(queue.join(), timeout=_WORK_DRAIN_SECONDS)
         except asyncio.TimeoutError:
-            discarded = queue.qsize()
-            for _ in range(discarded):
-                queue.get_nowait()
-                queue.task_done()
+            discarded = queue.discard_regular()
             if discarded:
                 logger.warning("gateway Serial work discarded on shutdown (%d items, %d metrics)",
                                discarded, self._queued_metrics)
         finally:
             self._queued_metrics = 0
+            self._queued_pdr = 0
             queue.put_nowait((_LEGACY_WORK_PRIORITY, next(self._work_sequence), None))
             # Uma operacao SQLite em andamento na thread precisa concluir antes de sair.
             await worker
@@ -218,20 +321,25 @@ class SerialReader:
             logger.warning("metric summary queue shutdown (%d total refused)", self._refused_metrics)
         if self._refused_legacy:
             logger.warning("legacy Serial work queue shutdown (%d total refused)", self._refused_legacy)
+        if self._refused_pdr or self._evicted_pdr:
+            logger.warning("PDR summary queue shutdown (%d refused, %d displaced)",
+                           self._refused_pdr, self._evicted_pdr)
         logger.info("gateway Serial work totals (admitted=%d, processed=%d, failed=%d, discarded=%d, refused=%d)",
-                    self._admitted_work, self._processed_work, self._failed_work, discarded,
-                    self._refused_metrics + self._refused_legacy)
+                    self._admitted_work, self._processed_work, self._failed_work, discarded + self._evicted_pdr,
+                    self._refused_metrics + self._refused_legacy + self._refused_pdr + self._refused_critical)
 
     async def _persist_link_event(self, kind: str, timestamp: str, detail: str) -> bool:
         try:
             await asyncio.to_thread(self.database.enqueue_event, kind, timestamp=timestamp, detail=detail)
-        except Exception:
-            logger.exception("failed to queue %s", kind)
+        except Exception as exc:
+            logger.error("%s", base_block(
+                "ERRO | SQLITE", f"Evento de link: {kind} | Motivo: {base_value(exc)}", critical=True,
+            ), exc_info=self.terminal_detail)
             return False
         return True
 
     async def _run_mock(self):
-        logger.info("mock gateway started")
+        logger.info("%s", base_block("GATEWAY | SIMULACAO", "Estado: MOCK INICIADO"))
         self.state.status = "online"
         await self.hub.broadcast({"type": "gateway", "data": self.as_dict()})
 
@@ -257,7 +365,12 @@ class SerialReader:
             try:
                 import serial
 
-                logger.info("[USB] [BASE] aguardando Gateway porta=%s", self.config.serial_port)
+                if not opened_before and self.state.error is None:
+                    logger.info("%s", base_block("USB / GATEWAY", f"Porta configurada: {self.config.serial_port}",
+                                                 "Estado: AGUARDANDO ABERTURA"))
+                elif self.terminal_detail:
+                    logger.info("[BASE] USB | tentativa de abertura porta=%s",
+                                base_value(self.config.serial_port))
                 connection = await asyncio.to_thread(
                     serial.Serial,
                     self.config.serial_port,
@@ -270,14 +383,17 @@ class SerialReader:
                     connection.dtr = False
                     connection.rts = False
                 except Exception as exc:
-                    logger.debug("could not disable DTR/RTS (%s)", exc)
+                    self._diagnostic("[BASE] USB | falha ao desativar DTR/RTS: %s", type(exc).__name__)
                 self._connection = connection
+                self.effective_profile = None
                 self._serial_needs_separator = connection
                 self.state.status = "online"
                 self.state.error = None
-                logger.info("\n%s\n[USB] [BASE] porta %s | porta=%s baud=%s\n%s",
-                            RULE, "reaberta" if opened_before else "aberta",
-                            self.config.serial_port, self.config.serial_baud, RULE)
+                logger.info("%s", base_block(
+                    "USB / GATEWAY",
+                    f"Porta: {self.config.serial_port} | Baud: {self.config.serial_baud}",
+                    f"Estado: {'PORTA REABERTA' if opened_before else 'PORTA ABERTA'}",
+                ))
                 opened_before = True
                 if self.config.central_sync_enabled:
                     await self._submit_work(partial(self._persist_link_event, "gateway_online",
@@ -286,6 +402,10 @@ class SerialReader:
                 await self.hub.broadcast(
                     {"type": "gateway", "data": self.as_dict()}
                 )
+                if getattr(self.config, "event_serial_commit_enabled", False):
+                    await self._send_serial_commit_command(connection, "ENABLE_EVENT_COMMIT", deliveryVersion=1)
+                if getattr(self.config, "pdr_serial_commit_enabled", False) and getattr(self.config, "metrics_gateway_id", ""):
+                    await self._send_serial_commit_command(connection, "ENABLE_PDR_COMMIT", deliveryVersion=2)
 
                 while not self._stop.is_set():
                     chunk = await asyncio.to_thread(self._read_serial_chunk, connection)
@@ -300,8 +420,15 @@ class SerialReader:
             except Exception as exc:
                 state_changed = self.state.status != "offline" or self.state.error != str(exc)
                 if state_changed:
-                    logger.warning("[ERRO] [BASE] USB/Gateway indisponivel | porta=%s motivo=%s",
-                                   self.config.serial_port, exc)
+                    if isinstance(exc, sqlite3.Error):
+                        title, status = "ERRO | SQLITE", "LEITURA INTERROMPIDA POR FALHA NO SQLITE"
+                    else:
+                        title = "ERRO | USB / GATEWAY"
+                        status = "CONEXAO SERIAL INTERROMPIDA" if connection is not None else "FALHA DE ABERTURA"
+                    logger.warning("%s", base_block(
+                        title, f"Porta: {self.config.serial_port} | Estado: {status}",
+                        f"Motivo: {base_value(exc)}", critical=True,
+                    ))
                     if self.config.central_sync_enabled:
                         await self._submit_work(partial(self._persist_link_event, "gateway_offline",
                                                        datetime.now(timezone.utc).isoformat(), str(exc)[:500]))
@@ -333,8 +460,11 @@ class SerialReader:
     async def _process_serial_chunk(self, chunk: bytes) -> None:
         if not chunk:
             # Alguns emissores legados entregam um pacote completo sem LF.
-            # Mesmo quando aceito, seu restante fisico ainda pertence a ele.
-            if self._serial_line and await self.process_line(bytes(self._serial_line), at_timeout=True):
+            # Um pacote reconhecido (admitido ou recusado) ja foi consumido.
+            if not self._serial_line:
+                return
+            result = await self._handle_line(bytes(self._serial_line), at_timeout=True)
+            if result is not _LineResult.UNRECOGNIZED:
                 self._serial_line.clear()
                 self._discard_until_lf = True
             return
@@ -362,49 +492,79 @@ class SerialReader:
             await self.process_line(line)
 
     async def process_line(self, line, *, at_timeout: bool = False) -> bool:
+        """Return admission for queued work, or the handling result for inline work."""
+        return await self._handle_line(line, at_timeout=at_timeout) is _LineResult.ACCEPTED
+
+    async def _handle_line(self, line, *, at_timeout: bool) -> _LineResult:
         try:
             text = line.decode("utf-8").strip() if isinstance(line, bytes) else str(line).strip()
             if not text or "\x00" in text:
-                return False
+                return _LineResult.UNRECOGNIZED
             app_packet = self._parse_gateway_app(text, line)
             if app_packet is not None:
                 # Versioned Gateway frames always end with LF. A full JSON body
                 # at an idle read can still be a short write awaiting resync.
                 if at_timeout and "schema" in app_packet:
-                    return False
+                    return _LineResult.UNRECOGNIZED
+                if "deliveryId" in app_packet or "deliveryVersion" in app_packet:
+                    delivery_id = app_packet.get("deliveryId")
+                    if (app_packet["kind"] != "event" or type(app_packet.get("deliveryVersion")) is not int or
+                            app_packet["deliveryVersion"] != 1 or not isinstance(delivery_id, str) or
+                            not re.fullmatch(r"[0-9a-f]{24}", delivery_id) or
+                            type(app_packet.get("collarId")) is not int or not 1 <= app_packet["collarId"] <= 254):
+                        raise ValueError("invalid event delivery identity")
                 if app_packet["kind"] in _FRAMED_SUMMARIES or app_packet["kind"] in _IMMEDIATE_APP_KINDS:
-                    await self._process_gateway_app(app_packet)
+                    admitted = await self._process_gateway_app(app_packet)
                 else:
+                    priority = _LEGACY_WORK_PRIORITY
                     kind = "POSITION_STATUS" if app_packet["kind"] == "telemetry" else app_packet["kind"]
-                    await self._submit_work(partial(self._process_gateway_app, app_packet),
-                                            description=f"[{collar_label(app_packet.get('collarId'))}] tipo={kind}")
-                return True
-            # Linhas humanas do firmware são diagnóstico, não protocolo. Só
-            # os dois formatos históricos abaixo ainda entram no parser V1.
-            if not (text.startswith("V1|") or text.lower().startswith("recebido:")):
-                if not at_timeout:
-                    self._diagnostic("[RAW GATEWAY] %s", text)
-                return False
-            packet = parse_message(line, max_length=self.config.max_line_length)
-            if packet is None:
-                return False
-            await self._submit_work(partial(self._save_and_broadcast, packet),
-                                    description=f"[{collar_label(packet.collar_id)}] tipo={packet.type}")
-            return True
+                    if kind == "event":
+                        name = app_packet.get("subtype") or app_packet.get("event")
+                        if isinstance(name, str) and name.upper() in _PRIORITY_EVENT_NAMES:
+                            priority = _CRITICAL_EVENT_PRIORITY
+                            kind = name.upper()
+                    admitted = await self._submit_work(
+                        partial(self._process_gateway_app, app_packet), priority=priority,
+                        description=f"[{collar_label(app_packet.get('collarId'))}] tipo={kind}",
+                    )
+            else:
+                # Linhas humanas são diagnóstico. Só os formatos históricos entram no parser V1.
+                if not (text.startswith("V1|") or text.lower().startswith("recebido:")):
+                    if not at_timeout:
+                        self._diagnostic("[RAW GATEWAY] Linha de diagnostico | Caracteres: %s", len(text))
+                    return _LineResult.UNRECOGNIZED
+                packet = parse_message(line, max_length=self.config.max_line_length)
+                if packet is None:
+                    return _LineResult.UNRECOGNIZED
+                admitted = await self._submit_work(
+                    partial(self._save_and_broadcast, packet),
+                    description=f"[{collar_label(packet.collar_id)}] tipo={packet.type}",
+                )
+            return _LineResult.ACCEPTED if admitted else _LineResult.REFUSED
         except ProtocolError as exc:
             if not at_timeout:
                 logger.warning("packet rejected (%s)", exc)
         except (UnicodeDecodeError, json.JSONDecodeError, KeyError,
                 ValueError, TypeError, RecursionError) as exc:
             if not at_timeout:
-                logger.warning("gateway application line rejected (%s)", exc)
-        return False
+                reason = exc.args[0] if exc.args else None
+                label = reason if type(reason) is str and reason in _SAFE_FRAME_REJECTIONS else type(exc).__name__
+                logger.warning("gateway application line rejected (%s)", label)
+        return _LineResult.UNRECOGNIZED
 
-    def _diagnostic(self, message: str, *args) -> None:
-        logger.log(logging.INFO if self.terminal_detail else logging.DEBUG, message, *args)
+    def _diagnostic(self, message: str, value: object) -> None:
+        if self.terminal_detail:
+            logger.info(message, base_value(value, limit=512))
 
     async def _save_and_broadcast(self, packet: ParsedPacket):
-        self._diagnostic("[RAW POS] [BASE] %s", packet.raw_message)
+        if self.terminal_detail:
+            snapshot = gateway_log_snapshot({
+                "sequence": packet.sequence, "latitude": packet.latitude, "longitude": packet.longitude,
+                "zone": packet.zone, "satellites": packet.satellites, "hdop": packet.hdop,
+                "rssi": packet.rssi, "snr": packet.snr,
+            })
+            summary = json.dumps(snapshot, separators=(",", ":"))
+            self._diagnostic("[RAW POS] [BASE] %s", f"[{collar_label(packet.collar_id)}] {summary}")
         collar, event = await asyncio.to_thread(
             self.database.save_packet, packet, self.config.central_sync_enabled
         )
@@ -413,17 +573,22 @@ class SerialReader:
         gps_valid = False if packet.zone == "GNSS_INVALIDO" else (
             True if packet.latitude is not None and packet.longitude is not None else None
         )
-        logger.info("%s", position_line("BASE", packet.collar_id, packet.sequence,
-                                        gps_valid, packet.hdop, packet.rssi, packet.snr, packet.zone))
+        logger.info("%s", base_position(
+            packet.collar_id, packet.sequence, gps_valid, packet.hdop, packet.rssi, packet.snr,
+            packet.zone, detail=self.terminal_detail,
+        ))
         if event:
             previous, current = event["old_value"], event["new_value"]
-            if previous and previous != current and current == "FORA":
-                logger.warning("\n%s", zone_transition_alert(event["collar_id"], previous, current))
-            else:
-                log = logger.info if (packet.version != "GATEWAY_V1" or previous == "FORA"
-                                      or current in {"ATENCAO", "CRITICO"}) else self._diagnostic
-                log("[ZONA BASE] [%s] %s -> %s", collar_label(event["collar_id"]),
-                    previous or "N/A", current)
+            critical = bool(previous and previous != current and current == "FORA")
+            if (critical or packet.version != "GATEWAY_V1" or previous == "FORA"
+                    or current in {"ATENCAO", "CRITICO"} or self.terminal_detail):
+                log = logger.warning if critical else logger.info
+                log("%s", base_block(
+                    "ALERTA | TRANSICAO DE ZONA" if critical else "TRANSICAO DE ZONA",
+                    f"{base_value(previous)} -> {base_value(current)}",
+                    "Origem: telemetria persistida | SQLite: SALVA",
+                    collar_id=event["collar_id"], critical=critical,
+                ))
         await self.hub.broadcast({
             "type": "telemetry", "data": packet.as_dict(),
             "collar": collar, "event": event,
@@ -470,6 +635,11 @@ class SerialReader:
         data = json.loads(payload, object_pairs_hook=capture_pairs)
         if not isinstance(data, dict):
             raise ValueError("mensagem [APP] deve ser um objeto JSON")
+        if "deliveryId" in data or "deliveryVersion" in data:
+            body = wire.removesuffix(b"\n").removesuffix(b"\r")
+            if (data.get("schema") != GATEWAY_SERIAL_SCHEMA or len(pairs) != len(data) or
+                    not wire.endswith(b"\n") or len(wire) > 512 or b"\r" in body or b"\n" in body):
+                raise ValueError("invalid event delivery frame")
         if any(key == "kind" and isinstance(value, str) and value in _FRAMED_SUMMARIES
                for key, value in pairs):
             if not wire.startswith(_APP_PREFIX) or not wire.endswith(b"\n"):
@@ -481,8 +651,8 @@ class SerialReader:
                 raise ValueError(f"resumo excede {METRIC_LINE_MAX_BYTES} bytes")
             if len(pairs) != len(data):
                 raise ValueError("chave JSON duplicada no resumo")
-            schema = PDR_SCHEMA if data.get("kind") == PDR_KIND else GATEWAY_SERIAL_SCHEMA
-            if data.get("schema") != schema:
+            schemas = (PDR_SCHEMA, PDR_COMMIT_SCHEMA) if data.get("kind") == PDR_KIND else (GATEWAY_SERIAL_SCHEMA,)
+            if data.get("schema") not in schemas:
                 raise ValueError("schema do resumo ausente ou nao suportado")
             return data
         schema = data.get("schema")
@@ -531,13 +701,12 @@ class SerialReader:
             fence_version=data.get("fenceVersion"),
         )
 
-    async def _process_gateway_app(self, data: dict) -> None:
+    async def _process_gateway_app(self, data: dict) -> bool:
         kind = data["kind"]
         if self.terminal_detail and kind != "telemetry":
-            self._diagnostic("[RAW GATEWAY] %s", json.dumps(data, separators=(",", ":")))
+            self._diagnostic("[RAW GATEWAY] %s", json.dumps(gateway_log_snapshot(data), separators=(",", ":")))
         if kind in METRIC_SUMMARY_KINDS:
-            await self._process_metric_summary(data)
-            return
+            return await self._process_metric_summary(data)
         if kind == PDR_KIND:
             summary = parse_pdr_summary(data)
             gateway_id = getattr(self.config, "metrics_gateway_id", "")
@@ -545,11 +714,12 @@ class SerialReader:
                 if "pdr" not in self._warned_metric_producers:
                     logger.warning("PDR ignorado (METRICS_GATEWAY_ID nao configurado)")
                     self._warned_metric_producers.add("pdr")
-                return
-            await self._submit_work(partial(self._persist_pdr_summary, gateway_id, summary),
-                                    priority=_PDR_WORK_PRIORITY,
-                                    description=f"[{collar_label(summary.collar_id)}] tipo=PDR")
-            return
+                return False
+            connection = self._connection if (data["schema"] == PDR_COMMIT_SCHEMA and
+                getattr(self.config, "pdr_serial_commit_enabled", False)) else None
+            return await self._submit_work(partial(self._persist_pdr_summary, gateway_id, summary, connection),
+                                           priority=_PDR_WORK_PRIORITY,
+                                           description=f"[{collar_label(summary.collar_id)}] tipo=PDR")
         if kind == "telemetry":
             await self._save_and_broadcast(
                 self._telemetry_packet(
@@ -557,29 +727,77 @@ class SerialReader:
                     "[APP] " + json.dumps(data, separators=(",", ":")),
                 )
             )
-            return
+            return True
 
         if kind == "command_response":
             request_id = data.get("requestId")
             future = self._pending_commands.get(request_id)
-            if future is not None and not future.done():
+            matched = future is not None and not future.done()
+            if matched:
                 future.set_result(data)
+                profile = data.get("activeProfileId")
+                if (data.get("command") in {"GET_PROFILE", "GET_PROFILE_V2"} and data.get("ok") is True
+                        and type(profile) is int and 0 <= profile <= 3
+                        and data.get("profileControlVersion") in {1, 2}):
+                    self.effective_profile = {
+                        "profile_id": profile, "observed_at": datetime.now(timezone.utc).isoformat(),
+                        "transition_state": data.get("state") if data.get("state") in {
+                            "IDLE", "PREPARING", "COMMITTING", "VERIFYING", "COMPLETED", "ROLLING_BACK", "FAILED",
+                        } else None,
+                    }
             if not data.get("ok") or data.get("command") != "FENCE_POINT" or self.terminal_detail:
                 log = logger.info if data.get("ok") else logger.warning
-                log("[%s] [BASE] resposta Gateway comando=%s requestId=%s detalhe=%s",
-                    "OK" if data.get("ok") else "ERRO", value_text(data.get("command")), value_text(request_id),
-                    value_text(data.get("detail")))
-            return
+                response = "ACEITO" if data.get("ok") else "RECUSADO"
+                origin = "GATEWAY RESPONDEU" if matched else "RESPOSTA DO GATEWAY RECEBIDA"
+                command = gateway_log_field("command", data.get("command"))
+                rows = [f"Comando: {base_value(command)} | Resultado: {response}",
+                        f"Estado: {origin}"]
+                detail = gateway_log_field("detail", data.get("detail"))
+                if detail is not None:
+                    rows.append(f"Detalhe: {detail}")
+                if self.terminal_detail:
+                    rows.append(f"Request ID: {base_value(gateway_log_field('requestId', request_id))}")
+                log("%s", base_block("USB / GATEWAY | COMANDO", *rows, collar_id=data.get("collarId"),
+                                     critical=not data.get("ok")))
+            return True
 
         if kind == "fence_transfer":
+            pending = self._fence_result
+            awaiting_result = pending is not None and not pending.done()
             self._handle_fence_transfer(data)
-            state = value_text(data.get("state"))
-            log = logger.warning if state == "failed" else logger.info
-            log("\n%s\n[CERCA] [BASE] [%s] versao=%s requestId=%s estadoGateway=%s detalhe=%s\n%s",
-                RULE, collar_label(data.get("collarId")), value_text(data.get("fenceVersion")),
-                value_text(data.get("requestId")), state, value_text(data.get("detail")), RULE)
+            correlated = awaiting_result and pending.done()
+            state = data.get("state")
+            if state == "started":
+                status = "GATEWAY REPORTOU INICIO DA TRANSFERENCIA"
+            elif state == "confirmed" and correlated:
+                status = "GATEWAY REPORTOU ACK DA COLEIRA"
+            elif state == "confirmed":
+                status = "RELATO DE CONFIRMACAO SEM CORRELACAO"
+            elif state == "failed" and correlated:
+                status = "FALHA REPORTADA PELO GATEWAY"
+            elif state == "failed":
+                status = "FAILED | Operacao atual: NAO ALTERADA"
+            else:
+                status = base_value(gateway_log_field("state", state))
+            rows = [f"Estado: {status}"]
+            detail = gateway_log_field("detail", data.get("detail"))
+            if detail is not None:
+                rows.append(f"Detalhe: {detail}")
+            if state == "failed" or self.terminal_detail:
+                request_id = gateway_log_field("requestId", data.get("requestId"))
+                label = "Request ID recebido" if state == "failed" and not correlated else "Request ID"
+                rows.append(f"{label}: {base_value(request_id)}")
+            version = gateway_log_field("fenceVersion", data.get("fenceVersion"))
+            title = f"CERCA | VERSAO {base_value(version)}"
+            critical = state == "failed" and correlated
+            if state == "failed" and not correlated:
+                title = "CERCA | RELATO SEM CORRELACAO"
+                if version is not None:
+                    rows.append(f"Versao reportada: {version}")
+            log = logger.warning if critical else logger.info
+            log("%s", base_block(title, *rows, collar_id=data.get("collarId"), critical=critical))
             await self.hub.broadcast({"type": "fence_transfer", "data": data})
-            return
+            return True
 
         if kind == "collar_status" and not data.get("empty"):
             collar_id = data.get("collarId")
@@ -595,9 +813,9 @@ class SerialReader:
         elif kind == "radio_config":
             self.radio_config = dict(data)
 
-        await self._process_gateway_event(data)
+        return await self._process_gateway_event(data)
 
-    async def _process_metric_summary(self, data: dict) -> None:
+    async def _process_metric_summary(self, data: dict) -> bool:
         setting = "metrics_installation_id" if data["kind"] == HDOP_SUMMARY_KIND else "metrics_gateway_id"
         producer_id = getattr(self.config, setting, "")
         summary = parse_metric_summary(data, producer_id)
@@ -605,31 +823,30 @@ class SerialReader:
             if setting not in self._warned_metric_producers:
                 logger.warning("metric summary ignored (%s not configured)", setting.upper())
                 self._warned_metric_producers.add(setting)
-            return
+            return False
         connection = self._connection if self._metric_acks is not None else None
-        await self._submit_work(partial(self._persist_metric_summary, summary, connection),
-                                priority=_METRIC_WORK_PRIORITY, description=metric_identity(summary))
+        return await self._submit_work(partial(self._persist_metric_summary, summary, connection),
+                                       priority=_METRIC_WORK_PRIORITY, description=metric_identity(summary))
 
-    async def _persist_pdr_summary(self, gateway_id: str, summary: PdrSummary) -> bool:
+    async def _persist_pdr_summary(self, gateway_id: str, summary: PdrSummary, connection=None) -> bool:
         result = await asyncio.to_thread(self.database.save_pdr_summary, gateway_id, summary)
-        metric = f"{summary.pdr_x100 / 100:.2f}%" if summary.valid else "N/A"
         log = logger.info if result in (MetricSaveResult.INSERTED, MetricSaveResult.DUPLICATE) else logger.warning
-        log("[PDR 60s] [BASE] [%s] sessao=%s janela=%s rx=%u PDR estimado=%s motivo=%s SQLite=%s",
-            collar_label(summary.collar_id), summary.gateway_session_id, summary.window_id,
-            summary.received_count, metric, summary.reason, result.value)
-        return result in (MetricSaveResult.INSERTED, MetricSaveResult.DUPLICATE)
+        log("%s", base_pdr(summary, result.name, detail=self.terminal_detail))
+        persisted = result in (MetricSaveResult.INSERTED, MetricSaveResult.DUPLICATE)
+        if persisted and connection is not None:
+            try:
+                await self._send_serial_commit_command(
+                    connection, "PDR_COMMITTED", collarId=summary.collar_id,
+                    gatewaySessionId=summary.gateway_session_id, windowId=summary.window_id,
+                )
+            except OSError:
+                logger.warning("[BASE] PDR | ACK apos COMMIT nao escrito | Gateway pode reenviar")
+        return persisted
 
     async def _persist_metric_summary(self, summary: MetricSummary, connection=None) -> bool:
         result = await asyncio.to_thread(self.database.save_metric_summary, summary)
-        identity = metric_identity(summary)
-        if result is MetricSaveResult.INSERTED:
-            logger.info("\n%s", metric_block("BASE", summary, "[SQLITE] INSERTED | COMMIT concluido"))
-        elif result is MetricSaveResult.DUPLICATE:
-            logger.info("[SQLITE] [BASE] %s DUPLICATE | registro ja persistido", identity)
-        elif result is MetricSaveResult.CONFLICT:
-            logger.warning("[ERRO] [SQLITE] [BASE] %s CONFLICT | identidade igual, conteudo diferente", identity)
-        else:
-            logger.warning("[ERRO] [SQLITE] [BASE] %s FAILED | confirmacao nao autorizada", identity)
+        log = logger.info if result in (MetricSaveResult.INSERTED, MetricSaveResult.DUPLICATE) else logger.warning
+        log("%s", base_metric(summary, result.name, detail=self.terminal_detail))
         if result not in (MetricSaveResult.INSERTED, MetricSaveResult.DUPLICATE):
             return False
         queue = self._metric_acks
@@ -638,12 +855,18 @@ class SerialReader:
                 and (summary.kind == "RADIO" or summary.gateway_session_id is not None)):
             try:
                 queue.put_nowait((connection, summary))
-                logger.info("[ACK FILA] [BASE] %s confirmacao enfileirada", identity)
+                if self.terminal_detail:
+                    logger.info("%s", base_block(
+                        f"ACK | {summary.kind}", "Estado: ACK ENFILEIRADO",
+                        f"Sessao: {summary.session_id} | Janela: {summary.window_id}", collar_id=summary.collar_id,
+                    ))
             except asyncio.QueueFull:
                 self._refused_metric_acks += 1
                 if self._refused_metric_acks == 1 or self._refused_metric_acks % 100 == 0:
-                    logger.warning("[AVISO] [BASE] %s ACK NAO ENFILEIRADO | fila cheia (%d recusados)",
-                                   identity, self._refused_metric_acks)
+                    logger.warning("%s", base_block(
+                        f"AVISO | ACK {summary.kind}", "Estado: ACK NAO ENFILEIRADO",
+                        f"Motivo: FILA CHEIA | Recusados: {self._refused_metric_acks}", collar_id=summary.collar_id,
+                    ))
         return True
 
     async def _write_metric_acks(self, queue: asyncio.Queue[tuple[object, MetricSummary]]) -> None:
@@ -652,7 +875,10 @@ class SerialReader:
             try:
                 await self._send_metric_ack(connection, summary)
             except Exception as exc:
-                logger.warning("[ERRO] [ACK SERIAL] [BASE] %s falha de escrita (%s)", metric_identity(summary), exc)
+                logger.warning("%s", base_block(
+                    f"ERRO | ACK {summary.kind}", "Escrita Serial: FALHOU", f"Motivo: {base_value(exc)}",
+                    collar_id=summary.collar_id, critical=True,
+                ))
 
     async def _finish_metric_acks(self, writer: asyncio.Task | None) -> None:
         if writer is not None:
@@ -690,8 +916,10 @@ class SerialReader:
                 raise
             if self._serial_needs_separator is connection:
                 self._serial_needs_separator = None
-            logger.info("[ACK SERIAL] [BASE] %s escrita local aceita requestId=%d",
-                        metric_identity(summary), message["requestId"])
+        rows = ["Escrita Serial: CONCLUIDA"]
+        if self.terminal_detail:
+            rows.append(f"Request ID: {message['requestId']} | Sessao: {summary.session_id} | Janela: {summary.window_id}")
+        logger.info("%s", base_block(f"ACK | {summary.kind}", *rows, collar_id=summary.collar_id))
 
     @staticmethod
     def _write_metric_ack_line(connection, line: bytes) -> None:
@@ -703,29 +931,88 @@ class SerialReader:
         finally:
             connection.write_timeout = previous_timeout
 
-    async def _process_gateway_event(self, data: dict):
+    async def _process_gateway_event(self, data: dict) -> bool:
         timestamp = datetime.now(timezone.utc).isoformat()
         collar_id = self._collar_name(data["collarId"]) if isinstance(data.get("collarId"), int) else None
         kind = data.get("kind")
-        should_enqueue = kind in {"event", "collar_state", "offline"}
+        message = {"type": "gateway_event", "data": data}
+        if kind not in _GATEWAY_EVENT_KINDS:
+            await self.hub.broadcast(message)
+            return True
         if kind == "collar_state":
             event_kind = f"collar_{str(data.get('state', 'unknown')).lower()}"
         else:
             event_kind = str(data.get("subtype") or data.get("event") or kind or "gateway_event").lower()
-        if should_enqueue:
-            name = str(data.get("state") or kind).upper() if kind in {"collar_state", "offline"} else event_kind.upper()
-            details = f"seq={value_text(data.get('sequence'))} cerca={value_text(data.get('fenceVersion'))}" if kind == "event" else ""
-            log = logger.warning if name in {"OUTSIDE", "GPS_LOST", "LOW_BATTERY", "CRITICAL_BATTERY", "OFFLINE"} else logger.info
-            log("\n%s", event_block("BASE / GATEWAY", collar_id, name, details))
-        if self.config.central_sync_enabled and should_enqueue:
-            await asyncio.to_thread(
-                self.database.enqueue_event,
-                event_kind,
-                timestamp=timestamp,
-                collar_id=collar_id,
-                detail=json.dumps(data, separators=(",", ":")),
-            )
-        await self.hub.broadcast({"type": "gateway_event", "data": data})
+        radio_event = kind == "event"
+        name = event_kind.upper() if radio_event else str(data.get("state") or kind).upper()
+        safe_name = gateway_log_field("subtype" if radio_event else "state", name) or "DESCONHECIDO"
+        sync_enabled = self.config.central_sync_enabled
+        try:
+            inserted = await self._save_gateway_event(event_kind, timestamp, collar_id, data, sync_enabled)
+        except GatewayEventConflictError:
+            logger.error("%s", base_block(
+                f"ERRO | SQLITE | {safe_name}", "Estado: IDENTIDADE COM CONTEUDO DIVERGENTE",
+                collar_id=collar_id, critical=True,
+            ))
+            return False
+        except sqlite3.Error as exc:
+            logger.error("%s", base_block(
+                f"ERRO | SQLITE | {safe_name}", "Estado: EVENTO RECEBIDO | SQLite: FALHA DE PERSISTENCIA",
+                f"Motivo: {type(exc).__name__}", collar_id=collar_id, critical=True,
+            ))
+            return False
+        if "deliveryId" in data and getattr(self.config, "event_serial_commit_enabled", False):
+            try:
+                await self._send_serial_commit_command(self._connection, "EVENT_COMMITTED",
+                                                      deliveryId=data["deliveryId"])
+            except OSError:
+                logger.warning("[BASE] EVENTO | ACK apos COMMIT nao escrito | Gateway pode reenviar")
+        if not inserted:
+            logger.info("[BASE][%s] EVENTO | Duplicata ja persistida", collar_label(collar_id))
+            return True
+        log = logger.warning if name in ALERT_EVENTS else logger.info
+        log("%s", base_event(
+            collar_id, safe_name, source="Gateway",
+            sequence=gateway_log_field("sequence", data.get("sequence")),
+            fence_version=gateway_log_field("fenceVersion", data.get("fenceVersion")),
+            detail=self.terminal_detail,
+            sync_enabled=sync_enabled,
+        ))
+        await self.hub.broadcast(message)
+        return True
+
+    async def _save_gateway_event(self, kind: str, timestamp: str, collar_id: str | None,
+                                  data: dict, sync_enabled: bool) -> bool:
+        for delay in (*_EVENT_SQLITE_RETRY_SECONDS, None):
+            try:
+                return await asyncio.to_thread(
+                    self.database.save_gateway_event, kind, timestamp=timestamp, collar_id=collar_id,
+                    payload=data, enqueue_for_central=sync_enabled,
+                )
+            except sqlite3.Error as exc:
+                code = getattr(exc, "sqlite_errorcode", 0) & 0xFF
+                if delay is None or code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                    raise
+                await asyncio.sleep(delay)
+
+    async def _send_serial_commit_command(self, connection, command: str, **fields) -> None:
+        message = {"schema": GATEWAY_SERIAL_SCHEMA, "requestId": await self.next_request_id(),
+                   "command": command, **fields}
+        line = b"[CMD] " + json.dumps(message, separators=(",", ":")).encode("ascii") + b"\n"
+        async with self._write_lock:
+            if connection is None or connection is not self._connection or not getattr(connection, "is_open", True):
+                raise ConnectionError("gateway disconnected")
+            if self._serial_needs_separator is connection:
+                line = _SERIAL_RESYNC + line
+            self._serial_needs_separator = connection
+            write = asyncio.create_task(asyncio.to_thread(self._write_metric_ack_line, connection, line))
+            try:
+                await asyncio.shield(write)
+            except asyncio.CancelledError:
+                with suppress(Exception):
+                    await write
+                raise
+            self._serial_needs_separator = None
 
     def _handle_fence_transfer(self, data: dict) -> None:
         if not self._fence_result or self._fence_result.done():
@@ -761,7 +1048,7 @@ class SerialReader:
         if "\n" in command or "\r" in command:
             raise ValueError("comando Serial deve ocupar uma única linha")
         if self.config.mock_serial:
-            logger.info("mock serial command (%s)", command)
+            logger.info("[BASE] USB / GATEWAY | Comando simulado: %s", base_value(command))
             return
         async with self._write_lock:
             connection = self._connection
@@ -798,7 +1085,8 @@ class SerialReader:
             **fields,
         }
         if self.config.mock_serial:
-            logger.info("mock gateway command (%s requestId=%s)", command, request_id)
+            logger.info("[BASE] USB / GATEWAY | Comando simulado: %s | Request ID: %s",
+                        base_value(command), request_id)
             return {**message, "kind": "command_response", "ok": True}
 
         loop = asyncio.get_running_loop()
@@ -824,8 +1112,8 @@ class SerialReader:
         async with self._fence_lock:
             numeric_id = self._numeric_collar_id(collar_id)
             if self.config.mock_serial:
-                logger.info("mock fence confirmed (collar=%s version=%s)",
-                            collar_id, fence["version"])
+                logger.info("[BASE][%s] CERCA | Versao: %s | Confirmacao simulada",
+                            collar_label(collar_id), base_value(fence["version"]))
                 return True, "mock_confirmed"
             loop = asyncio.get_running_loop()
             self._fence_result = loop.create_future()

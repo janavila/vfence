@@ -11,7 +11,7 @@
 
 import {
   enderecoDoGeojson, enderecoDoLog, explicarErro, lerCercaAtiva, lerColeiras,
-  lerConfiguracao, lerEntregas, lerEventos, lerHistorico, reativarCerca,
+  lerConfiguracao, lerEntregas, lerEventos, lerHistorico, lerTrajeto, reativarCerca, salvarNomeAnimal,
 } from './api.js';
 import { criarMapa, enquadrar, marcarBase, mostrarLocalizacao, paraLeaflet } from './map.js';
 import { conectarTempoReal } from './realtime.js';
@@ -31,6 +31,14 @@ const ZONAS = {
 const EVENTOS = {
   zone_change: 'mudou de situação',
   invalid_zone: 'enviou uma situação desconhecida',
+  outside: 'saiu da cerca',
+  back_inside: 'voltou para a cerca',
+  gps_lost: 'perdeu o sinal GNSS',
+  gps_recovered: 'recuperou o sinal GNSS',
+  collar_offline: 'ficou offline',
+  collar_online: 'voltou a comunicar',
+  low_battery: 'bateria baixa',
+  critical_battery: 'bateria crítica',
 };
 
 const elemento = (id) => document.getElementById(id);
@@ -140,6 +148,12 @@ async function tratarReativacao(evento) {
 
 const rebanho = { mapa: null, marcadores: new Map(), cerca: null };
 
+function estadoDaPosicao(coleira) {
+  if (!coleira.last_position_at) return 'Sem horário de posição válida';
+  const hora = formatClock(coleira.last_position_at, { withDate: true });
+  return coleira.position_stale ? `Última posição em ${hora}` : `Posição de ${hora}`;
+}
+
 async function desenharRebanho() {
   await desenharUltimosAcontecimentos();
   let coleiras = [];
@@ -154,25 +168,73 @@ async function desenharRebanho() {
     ? coleiras.map((c) => `
         <tr>
           <td class="mono"><strong>${escapeHtml(c.collar_id)}</strong></td>
-          <td>${escapeHtml(c.animal_label ?? '—')}</td>
-          <td>${c.last_zone ? etiquetaDeZona(c.last_zone) : '—'}</td>
+          <td>${escapeHtml(c.animal_label ?? '—')}
+            <button type="button" data-animal="${escapeHtml(c.collar_id)}"
+              data-name="${escapeHtml(c.animal_label ?? '')}">Editar nome</button></td>
+          <td>${c.last_zone ? etiquetaDeZona(c.last_zone) : '—'}
+            <div class="small">${escapeHtml(estadoDaPosicao(c))}</div></td>
           <td>${numeroOu(c.battery_pct, '%')}</td>
           <td class="small">${numeroOu(c.rssi, ' dBm')} / ${numeroOu(c.snr, '', 1)}</td>
-          <td>${c.fence_version_reported ?? '—'}
+          <td>${c.confirmed_fence_version ?? '—'}
+              <div class="small">Reportada ${c.fence_version_reported ?? '—'}</div>
               ${c.outdated ? '<span class="tag-outdated">desatualizada</span>' : ''}</td>
-          <td class="small">${formatClock(c.last_seen)}</td>
+          <td class="small">${formatClock(c.last_contact_at ?? c.last_seen)}
+            <div>${c.link_status === 'offline' ? 'Offline' : c.link_status === 'online' ? 'Último contato recebido' : 'Sem contato'}</div>
+            <div>${c.gnss_status === 'invalid' ? 'GNSS indisponível' : c.gnss_status === 'valid' ? 'GNSS válido no último informe' : 'GNSS sem informação'}</div></td>
         </tr>`).join('')
     : vazio(7, 'Nenhuma coleira enviou dados ainda');
 
   desenharColeirasNoMapa(coleiras);
+  const seletor = elemento('trail-collar');
+  if (seletor) {
+    const atual = seletor.value;
+    seletor.replaceChildren(...coleiras.map((c) => new Option(c.animal_label || c.collar_id, c.collar_id)));
+    if (coleiras.some((c) => c.collar_id === atual)) seletor.value = atual;
+  }
+}
+
+async function mostrarTrajeto(evento) {
+  evento.preventDefault();
+  const status = elemento('trail-feedback');
+  const coleira = elemento('trail-collar').value;
+  const filtros = {};
+  const dados = new FormData(evento.target);
+  for (const campo of ['start', 'end']) {
+    const valor = dados.get(campo);
+    if (valor) filtros[campo] = new Date(valor).toISOString();
+  }
+  try {
+    const registros = await lerTrajeto(coleira, filtros);
+    const pontos = registros.filter((r) => r.zone !== 'GNSS_INVALIDO' && Number.isFinite(r.lat) &&
+      Number.isFinite(r.lon)).reverse().map((r) => [r.lat, r.lon]);
+    rebanho.trajeto?.remove();
+    if (pontos.length >= 2 && rebanho.mapa) {
+      rebanho.trajeto = L.polyline(pontos, { color: '#245c4f', weight: 3 }).addTo(rebanho.mapa);
+      rebanho.mapa.fitBounds(rebanho.trajeto.getBounds());
+    }
+    status.textContent = pontos.length < 2 ? 'Posições insuficientes no período.' :
+      `${pontos.length} posições${registros.length === 200 ? ' nos 200 registros mais recentes' : ''}.`;
+  } catch (erro) { status.textContent = explicarErro(erro); }
+}
+
+async function editarAnimal(evento) {
+  const botao = evento.target.closest('[data-animal]');
+  if (!botao) return;
+  const nome = window.prompt('Nome do animal', botao.dataset.name);
+  if (nome === null) return;
+  try {
+    await salvarNomeAnimal(botao.dataset.animal, nome);
+    await desenharRebanho();
+  } catch (erro) { elemento('trail-feedback').textContent = explicarErro(erro); }
 }
 
 function desenharColeirasNoMapa(coleiras) {
   if (!rebanho.mapa || !window.L) return;
-  const comPosicao = coleiras.filter((c) => c.last_lat !== null && c.last_lon !== null);
+  const comPosicao = coleiras.filter((c) => Number.isFinite(c.last_lat) && Number.isFinite(c.last_lon));
 
   comPosicao.forEach((coleira) => {
-    const cor = (ZONAS[coleira.last_zone] ?? { cor: 'var(--neutral)' }).cor;
+    const cor = coleira.position_stale ? 'var(--neutral)' :
+      (ZONAS[coleira.last_zone] ?? { cor: 'var(--neutral)' }).cor;
     const posicao = [coleira.last_lat, coleira.last_lon];
     let marcador = rebanho.marcadores.get(coleira.collar_id);
     if (marcador) {
@@ -184,10 +246,9 @@ function desenharColeirasNoMapa(coleiras) {
       }).addTo(rebanho.mapa);
       rebanho.marcadores.set(coleira.collar_id, marcador);
     }
-    marcador.bindTooltip(
-      `${coleira.collar_id} — ${(ZONAS[coleira.last_zone] ?? { texto: 'sem informação' }).texto}`,
-      { direction: 'top' },
-    );
+    const rotulo = document.createElement('span');
+    rotulo.textContent = `${coleira.animal_label || coleira.collar_id}. ${estadoDaPosicao(coleira)}`;
+    marcador.bindTooltip(rotulo, { direction: 'top' });
   });
 
   if (comPosicao.length && !rebanho.enquadrou) {
@@ -220,8 +281,7 @@ async function desenharEventos() {
   const filtro = elemento('event-filter')?.value || '';
   const corpo = elemento('timeline-body');
   try {
-    const eventos = await lerEventos(200);
-    const filtrados = filtro ? eventos.filter((e) => e.collar_id === filtro) : eventos;
+    const filtrados = await lerEventos(200, filtro ? { collar_id: filtro } : {});
     corpo.innerHTML = filtrados.length
       ? filtrados.map((e) => `
           <tr>
@@ -258,6 +318,8 @@ const TELAS = {
   rebanho: {
     desenhar: desenharRebanho,
     async ligar() {
+      elemento('herd-trail')?.addEventListener('submit', mostrarTrajeto);
+      elemento('herd-body')?.addEventListener('click', editarAnimal);
       const config = await lerConfiguracao();
       rebanho.mapa = criarMapa('herd-map', config, 16);
       if (rebanho.mapa) {
@@ -304,10 +366,15 @@ export async function iniciarPainel(nome) {
 
   // Tempo real, com o plano B por consulta periódica cuidando do resto
   // (seção 6.2). Redesenhar a tela inteira é barato: são tabelas pequenas.
-  conectarTempoReal({
-    onTelemetry: () => tela.desenhar(),
-    onEvent: () => tela.desenhar(),
-    onDelivery: () => tela.desenhar(),
-    onPollingTick: () => tela.desenhar(),
-  });
+  let agendado = false;
+  function atualizar() {
+    if (agendado) return;
+    agendado = true;
+    window.setTimeout(async () => {
+      agendado = false;
+      await tela.desenhar();
+    }, 150);
+  }
+  conectarTempoReal({ onTelemetry: atualizar, onEvent: atualizar, onDelivery: atualizar,
+    onPollingTick: atualizar, onStatus: (ligado) => { if (ligado) atualizar(); } });
 }

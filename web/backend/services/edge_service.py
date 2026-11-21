@@ -45,7 +45,11 @@ assíncrono e esta função roda em thread separada.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import math
+import re
 from datetime import datetime, timedelta, timezone
 
 from backend.clock import ISO_FORMAT, utc_now_iso
@@ -60,6 +64,61 @@ logger = logging.getLogger("edge")
 VALID_ZONES = {"SEGURO", "ATENCAO", "CRITICO", "FORA", "GNSS_INVALIDO"}
 
 ITEM_TYPES = {"telemetry", "delivery", "event"}
+_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+_LEGACY_GENERATION = "legacy"
+
+
+class BatchRejected(ValueError):
+    def __init__(self, reason: str, sequence: int, *, conflict: bool = False):
+        super().__init__(reason)
+        self.sequence = sequence
+        self.conflict = conflict
+
+
+def _valid_identifier(value) -> bool:
+    return isinstance(value, str) and _IDENTIFIER.fullmatch(value) is not None
+
+
+def _valid_number(value, low, high, *, integer=False) -> bool:
+    return (type(value) in ((int,) if integer else (int, float))
+            and low <= value <= high and math.isfinite(value))
+
+
+def _validate_item(item: dict) -> tuple[str, str]:
+    seq, kind, data = item["edge_seq"], item["type"], item["data"]
+    if type(seq) is not int or not 1 <= seq <= 2**63 - 1 or kind not in ITEM_TYPES or not isinstance(data, dict):
+        raise BatchRejected("invalid_item", seq)
+    collar = data.get("collar_id")
+    if (kind != "event" or collar is not None) and not _valid_identifier(collar):
+        raise BatchRejected("invalid_collar_id", seq)
+    for key, limit in (("ts", 64), ("zone", 32), ("detail", 4096)):
+        value = data.get(key)
+        if value is not None and (not isinstance(value, str) or len(value) > limit):
+            raise BatchRejected("invalid_" + key, seq)
+    if kind == "event" and not _valid_identifier(data.get("kind")):
+        raise BatchRejected("invalid_event_kind", seq)
+    if kind == "telemetry":
+        for key, low, high, integer in (
+            ("lat", -90, 90, False), ("lon", -180, 180, False), ("satellites", 0, 255, True),
+            ("hdop", 0, 655.34, False), ("battery_pct", 0, 100, True), ("fence_version", 0, 65535, True),
+            ("rssi", -255, 255, False), ("snr", -327.68, 327.67, False),
+        ):
+            value = data.get(key)
+            if value is not None and not _valid_number(value, low, high, integer=integer):
+                raise BatchRejected("invalid_" + key, seq)
+    if kind == "delivery":
+        status, crc = data.get("status"), data.get("crc32")
+        if (not _valid_number(data.get("fence_version"), 1, 2**31 - 1, integer=True)
+                or not isinstance(status, str) or status not in delivery.BASE_REPORTABLE
+                or (crc is not None and (not isinstance(crc, str) or not re.fullmatch(r"[0-9a-fA-F]{8}", crc)))):
+            raise BatchRejected("invalid_delivery", seq)
+    try:
+        canonical = json.dumps([kind, data], sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError, RecursionError):
+        raise BatchRejected("invalid_payload", seq) from None
+    if len(canonical) > 16384:
+        raise BatchRejected("payload_too_large", seq)
+    return hashlib.sha256(canonical.encode()).hexdigest(), canonical
 
 
 # ---------------------------------------------------------------------------
@@ -133,8 +192,8 @@ def base_is_online(base: dict, settings: Settings, now: datetime | None = None) 
 
 
 def process_batch(
-    db: Database, settings: Settings, base_id: str, items: list[dict]
-) -> tuple[int, list[tuple[str, dict]]]:
+    db: Database, settings: Settings, base_id: str, items: list[dict], *, generation: str | None = None
+) -> tuple[int | list[int], list[tuple[str, dict]]]:
     """Grava os itens de um lote e devolve `(acked_up_to, mensagens)`.
 
     Os itens são processados em ordem de `edge_seq`, não na ordem em que
@@ -144,18 +203,26 @@ def process_batch(
     messages: list[tuple[str, dict]] = []
     stored = 0
     skipped = 0
+    receipts = [_validate_item(item) for item in items]
+    scope = generation or _LEGACY_GENERATION
 
     # Uma única transação cobre a reivindicação de edge_seq e a gravação dos
     # dados correspondentes. Se qualquer operação inesperada falhar, nenhum
     # item fica marcado como recebido sem ter seu conteúdo persistido.
     with db.connect():
         active = fence_service.active_version(db)
-        for item in sorted(items, key=lambda entry: entry.get("edge_seq", 0)):
+        for item, (digest, canonical) in sorted(zip(items, receipts), key=lambda pair: pair[0]["edge_seq"]):
             edge_seq = item["edge_seq"]
             item_type = item["type"]
             data = item.get("data") or {}
+            collar_id = data.get("collar_id")
+            if collar_id:
+                with db.connect() as conn:
+                    row = conn.execute("SELECT base_id FROM collars WHERE collar_id=?", (collar_id,)).fetchone()
+                if row and row["base_id"] != base_id:
+                    raise BatchRejected("collar_base_conflict", edge_seq, conflict=True)
 
-            if not _claim(db, base_id, edge_seq, item_type):
+            if not _claim(db, base_id, scope, edge_seq, item_type, digest, canonical):
                 skipped += 1
                 continue
             stored += 1
@@ -169,34 +236,50 @@ def process_batch(
                 if message:
                     messages.append(("event", message))
             elif item_type == "delivery":
+                try:
+                    fence_service.get_by_version(db, data["fence_version"])
+                except fence_service.FenceNotFound:
+                    raise BatchRejected("unknown_fence", edge_seq) from None
                 message = _apply_delivery(db, base_id, data, active)
                 if message:
                     messages.append(("delivery", message))
 
-        acked = acked_up_to(db, base_id)
+        acked = sorted({item["edge_seq"] for item in items}) if generation else acked_up_to(db, base_id)
     logger.info(
-        "base=%s batch received (%d stored, %d already known, acked_up_to=%d)",
-        base_id, stored, skipped, acked,
+        "base=%s batch committed (%d stored, %d already known)",
+        base_id, stored, skipped,
     )
     return acked, messages
 
 
-def _claim(db: Database, base_id: str, edge_seq: int, item_type: str) -> bool:
-    """Registra o item como recebido. Devolve `False` se já era conhecido.
-
-    É aqui que a idempotência acontece: `ON CONFLICT DO NOTHING` na chave
-    `(base_id, edge_seq)`. O `rowcount` diz se a linha foi inserida
-    agora (item novo) ou ignorada (reenvio).
-    """
+def _claim(db: Database, base_id: str, generation: str, edge_seq: int, item_type: str,
+           digest: str, canonical: str) -> bool:
+    """Reivindica e grava a identidade na mesma transação que os dados."""
     with db.connect() as conn:
         cursor = conn.execute(
             """
-            INSERT INTO edge_items (base_id, edge_seq, type, received_at)
-            VALUES (?,?,?,?) ON CONFLICT(base_id, edge_seq) DO NOTHING
+            INSERT INTO edge_receipts (base_id,generation,edge_seq,digest,delivery_payload)
+            VALUES (?,?,?,?,?) ON CONFLICT(base_id,generation,edge_seq) DO NOTHING
             """,
-            (base_id, edge_seq, item_type, utc_now_iso()),
+            (base_id, generation, edge_seq, digest, canonical if item_type == "delivery" else None),
         )
-        return cursor.rowcount == 1
+        if cursor.rowcount == 0:
+            existing = conn.execute(
+                "SELECT digest FROM edge_receipts WHERE base_id=? AND generation=? AND edge_seq=?",
+                (base_id, generation, edge_seq),
+            ).fetchone()
+            if existing["digest"] != digest:
+                raise BatchRejected("identity_conflict", edge_seq, conflict=True)
+            return False
+        if generation == _LEGACY_GENERATION:
+            legacy = conn.execute(
+                "INSERT INTO edge_items (base_id,edge_seq,type,received_at) "
+                "VALUES (?,?,?,?) ON CONFLICT(base_id,edge_seq) DO NOTHING",
+                (base_id, edge_seq, item_type, utc_now_iso()),
+            )
+            if legacy.rowcount == 0:
+                raise BatchRejected("unverified_legacy_identity", edge_seq, conflict=True)
+        return True
 
 
 def acked_up_to(db: Database, base_id: str) -> int:
@@ -222,7 +305,7 @@ def acked_up_to(db: Database, base_id: str) -> int:
         row = conn.execute(
             """
             SELECT MIN(edge_seq) AS menor, MAX(edge_seq) AS maior, COUNT(*) AS quantos
-            FROM edge_items WHERE base_id = ?
+            FROM edge_receipts WHERE base_id = ? AND generation = 'legacy'
             """,
             (base_id,),
         ).fetchone()
@@ -234,7 +317,7 @@ def acked_up_to(db: Database, base_id: str) -> int:
             return maior
 
         sequencias = conn.execute(
-            "SELECT edge_seq FROM edge_items WHERE base_id = ? ORDER BY edge_seq",
+            "SELECT edge_seq FROM edge_receipts WHERE base_id = ? AND generation = 'legacy' ORDER BY edge_seq",
             (base_id,),
         ).fetchall()
 
@@ -251,7 +334,7 @@ def acked_up_to(db: Database, base_id: str) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _ensure_collar(conn, collar_id: str, base_id: str) -> None:
+def _ensure_collar(conn, collar_id: str, base_id: str, edge_seq: int) -> None:
     """Cadastra a coleira se ela ainda não existir.
 
     A seção 7 manda cadastrar as coleiras do `.env` e também "quando
@@ -263,6 +346,9 @@ def _ensure_collar(conn, collar_id: str, base_id: str) -> None:
            ON CONFLICT(collar_id) DO NOTHING""",
         (collar_id, base_id),
     )
+    row = conn.execute("SELECT base_id FROM collars WHERE collar_id=?", (collar_id,)).fetchone()
+    if row["base_id"] != base_id:
+        raise BatchRejected("collar_base_conflict", edge_seq, conflict=True)
 
 
 def _store_telemetry(db: Database, base_id: str, edge_seq: int, data: dict) -> dict | None:
@@ -282,8 +368,9 @@ def _store_telemetry(db: Database, base_id: str, edge_seq: int, data: dict) -> d
         zone = None
 
     ts = data.get("ts") or utc_now_iso()
+    position_valid = data.get("lat") is not None and data.get("lon") is not None and zone != "GNSS_INVALIDO"
     with db.connect() as conn:
-        _ensure_collar(conn, collar_id, base_id)
+        _ensure_collar(conn, collar_id, base_id, edge_seq)
         conn.execute(
             """
             INSERT INTO telemetry (base_id, edge_seq, collar_id, ts, lat, lon, zone,
@@ -311,13 +398,18 @@ def _store_telemetry(db: Database, base_id: str, edge_seq: int, data: dict) -> d
                 battery_pct = COALESCE(?, battery_pct),
                 rssi = COALESCE(?, rssi),
                 snr = COALESCE(?, snr),
-                last_seen = ?
+                last_seen = ?,
+                last_position_at = COALESCE(?,last_position_at),
+                last_contact_at = ?, gnss_status = ?, link_status = 'online'
             WHERE collar_id = ?
             """,
             (
                 base_id, data.get("fence_version"), zone,
-                data.get("lat"), data.get("lon"), data.get("battery_pct"),
-                data.get("rssi"), data.get("snr"), ts, collar_id,
+                data.get("lat") if position_valid else None, data.get("lon") if position_valid else None,
+                data.get("battery_pct"), data.get("rssi"), data.get("snr"),
+                ts, ts if position_valid else None, ts,
+                "valid" if position_valid else "invalid" if zone == "GNSS_INVALIDO" else "unknown",
+                collar_id,
             ),
         )
         if invalid_zone:
@@ -361,7 +453,16 @@ def _store_event(db: Database, base_id: str, edge_seq: int, data: dict) -> dict 
 
     with db.connect() as conn:
         if collar_id:
-            _ensure_collar(conn, collar_id, base_id)
+            _ensure_collar(conn, collar_id, base_id, edge_seq)
+            if kind in {"outside", "back_inside", "low_battery", "critical_battery", "device_started",
+                        "gps_lost", "gps_recovered", "collar_online", "collar_offline", "offline"}:
+                offline = kind in {"collar_offline", "offline"}
+                gnss = {"gps_lost": "invalid", "gps_recovered": "valid"}.get(kind)
+                conn.execute(
+                    "UPDATE collars SET last_contact_at=COALESCE(?,last_contact_at),"
+                    "link_status=?,gnss_status=COALESCE(?,gnss_status) WHERE collar_id=?",
+                    (None if offline else ts, "offline" if offline else "online", gnss, collar_id),
+                )
         cursor = conn.execute(
             """
             INSERT INTO events (base_id, edge_seq, collar_id, kind, zone, detail, ts)
@@ -413,4 +514,5 @@ def _apply_delivery(
         expected_crc32=expected,
         active_version=active_version,
         base_id=base_id,
+        reported_detail=data.get("detail"),
     )

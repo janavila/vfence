@@ -49,9 +49,16 @@
   <section class="stack">
     <article class="panel">
       <div class="panel-heading">
-        <div><h2>Mapa do rebanho</h2><p>Última posição recebida de cada coleira</p></div>
+        <div><h2>Mapa do rebanho</h2><p>Última posição válida de cada coleira</p></div>
         <span class="muted-text small" id="realtime-state" data-live="false">conectando</span>
       </div>
+      <form id="herd-trail" class="panel-heading">
+        <label>Coleira <select id="trail-collar" class="select-input" required></select></label>
+        <label>De <input name="start" type="datetime-local"></label>
+        <label>Até <input name="end" type="datetime-local"></label>
+        <button type="submit" class="button">Ver trajeto</button>
+        <span id="trail-feedback" aria-live="polite"></span>
+      </form>
       <div class="map-surface" id="herd-map">
         <div class="map-fallback">
           <strong>Carregando o mapa…</strong>

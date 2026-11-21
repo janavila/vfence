@@ -42,6 +42,10 @@ class Settings:
     metrics_installation_id: str = os.getenv("METRICS_INSTALLATION_ID", "").strip()
     metrics_gateway_id: str = os.getenv("METRICS_GATEWAY_ID", "").strip()
     metrics_serial_ack_enabled: bool = _as_bool(os.getenv("METRICS_SERIAL_ACK_ENABLED"), False)
+    event_serial_commit_enabled: bool = _as_bool(os.getenv("EVENT_SERIAL_COMMIT_ENABLED"), False)
+    pdr_serial_commit_enabled: bool = _as_bool(os.getenv("PDR_SERIAL_COMMIT_ENABLED"), False)
+    profile_control_enabled: bool = _as_bool(os.getenv("PROFILE_CONTROL_ENABLED"), False)
+    profile_control_token: str = os.getenv("PROFILE_CONTROL_TOKEN", "")
     terminal_detail: bool = _as_bool(os.getenv("VFENCE_TERMINAL_DETAIL"), False)
 
 

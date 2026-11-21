@@ -17,6 +17,7 @@ from app.protocol import parse_message
 from app.serial_reader import (
     GATEWAY_SERIAL_SCHEMA,
     SerialReader,
+    _CRITICAL_EVENT_CAPACITY,
     _METRIC_QUEUE_CAPACITY,
     _SERIAL_READ_BYTES,
     _WORK_QUEUE_CAPACITY,
@@ -293,8 +294,8 @@ class MetricSerialTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs("serial_reader", logging.DEBUG) as logs:
             await self.reader.process_line(serial_line(hdop_json(gatewayReceivedAtMs=2000)))
             await self.reader.process_line(serial_line(hdop_json(hdopMeanX100=123)))
-        self.assertIn("DUPLICATE | registro ja persistido", logs.output[0])
-        self.assertIn("CONFLICT | identidade igual", logs.output[1])
+        self.assertIn("DUPLICATE | REGISTRO IDENTICO JA PERSISTIDO", logs.output[0])
+        self.assertIn("CONFLICT | IDENTIDADE COM CONTEUDO DIVERGENTE", logs.output[1])
         self.assertEqual(len(metric_rows(self.database)), 1)
         self.assertEqual(metric_rows(self.database)[0]["gateway_received_at_ms"], 1250)
 
@@ -445,7 +446,7 @@ class MetricSerialTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(self.reader, "send_command") as send:
             await self.reader.process_line(serial_line(hdop_json()))
             send.assert_not_called()
-        self.assertIn("FAILED | confirmacao nao autorizada", logs.output[0])
+        self.assertIn("FAILED | FALHA DE PERSISTENCIA", logs.output[0])
         self.assertEqual(metric_rows(self.database), [])
         with self.database.connect() as connection:
             connection.execute("DROP TRIGGER block_metric")
@@ -533,7 +534,8 @@ class MetricSerialTests(unittest.IsolatedAsyncioTestCase):
                     serial_line(hdop_json(collarId=index)) for index in range(2, _METRIC_QUEUE_CAPACITY + 4)
                 ) + b"V1|COL02|POS|-31|-54|SEGURO|9|0.90|7\n")
                 await self.wait_for(lambda: reader._work_queue.qsize() == _METRIC_QUEUE_CAPACITY + 1)
-                self.assertEqual(reader._work_queue.maxsize, _WORK_QUEUE_CAPACITY)
+                self.assertEqual(reader._work_queue.regular_capacity, _WORK_QUEUE_CAPACITY)
+                self.assertEqual(reader._work_queue.maxsize, _WORK_QUEUE_CAPACITY + _CRITICAL_EVENT_CAPACITY)
                 self.assertEqual(reader._queued_metrics, _METRIC_QUEUE_CAPACITY)
                 self.assertEqual(reader._refused_metrics, 2)
             finally:
@@ -680,7 +682,7 @@ class MetricSerialTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(open_port.call_count, 1)
         self.assertEqual([row["collar_id"] for row in metric_rows(self.database)], [3])
         self.assertEqual(len(self.database.telemetry("COL02")), 1)
-        self.assertIn("FAILED | confirmacao nao autorizada", "\n".join(logs.output))
+        self.assertIn("FAILED | FALHA DE PERSISTENCIA", "\n".join(logs.output))
         self.assertIn("unexpected metric worker failure", "\n".join(logs.output))
         self.assertEqual(connection.writes, [])
 

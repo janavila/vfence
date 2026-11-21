@@ -4,10 +4,12 @@
 #include <stdlib.h>
 #include <SPI.h>
 #include <LoRa.h>
+#include <Preferences.h>
 #include <driver/uart.h>
 #include <esp_random.h>
 
 #include "gateway_config.h"
+#include "event_serial_delivery.h"
 #include "gateway_serial_output.h"
 #include "metric_serial_export.h"
 #include "pdr_serial.h"
@@ -15,6 +17,7 @@
 #include "serial_command_input.h"
 #include "terminal_serial.h"
 #include "vfence_protocol.h"
+#include "../../firmware_common/profile_transition.h"
 
 using namespace vfence;
 
@@ -46,6 +49,13 @@ struct GatewaySerialPort {
 static GatewaySerialPort gatewaySerialPort;
 static FramedSerial<GatewaySerialPort> framedSerial(gatewaySerialPort);
 static GatewaySerialOutput<GatewaySerialPort> gatewayOutput(framedSerial, gatewayTerminal);
+static EventSerialDelivery eventSerialDelivery;
+static bool eventSerialNegotiated = false;
+static uint32_t eventCollarRun[255]{};
+static PdrSerialDelivery pdrSerialDelivery;
+static bool pdrSerialNegotiated = false;
+static GatewayProfileTransition radioTransition;
+static Preferences profilePreferences;
 
 uint16_t nextGatewaySequence = 0;
 uint16_t nextPingToken = 1;
@@ -613,6 +623,10 @@ bool sendFenceCommitReliable() {
 }
 
 bool startFenceTransfer() {
+  if (PROFILE_SWITCH_ENABLED && radioTransition.busy()) {
+    gatewayOutput.println("[FENCE TX] transicao de perfil em andamento.");
+    return false;
+  }
   if (!fenceTx.staged) {
     gatewayOutput.println("[FENCE TX] nenhuma cerca preparada. Use FENCE_NEW/FENCE_POINT.");
     return false;
@@ -862,6 +876,11 @@ static void publishRadioWindow(uint32_t startedAtMs, bool useSamples, bool repor
         else ++pdrPendingCount;
         pdr.latest = {published, frame.windowId, startedAtMs};
         pdr.hasReport = pdr.pending = true;
+        if (PDR_SERIAL_COMMIT_ENABLED && !pdrSerialDelivery.retain(static_cast<uint8_t>(id), pdr.latest) &&
+            (pdrSerialDelivery.refused == 1 || pdrSerialDelivery.refused % 100 == 0)) {
+          gatewayTerminal.tryPrint(framedSerial, "[ERRO] [GATEWAY] PDR v2 retencao cheia recusados=%lu\n",
+                                   static_cast<unsigned long>(pdrSerialDelivery.refused));
+        }
       }
     }
     RadioSummaryEntry& entry = frame.entries[id];
@@ -956,7 +975,7 @@ static void servicePdrOutput(uint32_t now) {
     auto& slot = pdrSlots[id];
     if (!slot.pending) continue;
     if (PDR_SERIAL_EXPORT_ENABLED && !pdrTxReady) return;
-    if (pdrTxReady) {
+    if (pdrTxReady && !PDR_SERIAL_COMMIT_ENABLED) {
       char line[512];
       const size_t length = formatPdrReport(slot.latest, radioSessionId, id, line);
       if (!length) return;
@@ -1038,6 +1057,7 @@ void markCollarSeen(uint8_t collarId, int rssi, float snr, bool hasRadioMetrics)
 }
 
 void serviceOfflineDetection() {
+  if (PROFILE_SWITCH_ENABLED && radioTransition.busy()) return;
   const uint32_t now = millis();
   if (now - lastOfflineSweepMs < 1000UL) return;
   lastOfflineSweepMs = now;
@@ -1366,22 +1386,8 @@ static void processHdopSummary(const PacketView& packet, uint32_t receivedAtMs) 
                 dropped != hdopDroppedPending ? (expanded ? " | janela anterior sobrescrita" : "/SUBST") : "");
 }
 
-void processTelemetry(const PacketView& packet, int rssi, float snr,
-                      bool hasRadioMetrics) {
-  if (packet.payloadLength < 1) return;
-
-  if (packet.payload[0] != static_cast<uint8_t>(TelemetrySubtype::POSITION_STATUS)) {
-    gatewayOutput.print("[TELEMETRY] subtype desconhecido 0x");
-    gatewayOutput.println(packet.payload[0], HEX);
-    return;
-  }
-
-  TelemetryPayload d;
-  if (!decodeTelemetry(packet, d)) {
-    gatewayOutput.println("[TELEMETRY] payload POSITION_STATUS invalido");
-    return;
-  }
-
+static void emitPositionStatus(const PacketView& packet, const TelemetryPayload& d, int rssi,
+                               float snr, bool hasRadioMetrics) {
   CollarState& c = collars[packet.header.collarId];
   if (hasRadioMetrics && !packet.header.retry) {
     accumulateRadioSample(c.radio, packet.header.sequence, rssi, snr);
@@ -1432,6 +1438,24 @@ void processTelemetry(const PacketView& packet, int rssi, float snr,
         unsigned(d.fenceVersion), unsigned(d.stateFlags), (d.stateFlags & STATE_BUZZER_ACTIVE) ? "ON" : "OFF",
         (d.stateFlags & STATE_SECOND_ACTUATOR_ACTIVE) ? "ON" : "OFF");
   }
+}
+
+void processTelemetry(const PacketView& packet, int rssi, float snr,
+                      bool hasRadioMetrics) {
+  if (packet.payloadLength < 1) return;
+
+  if (packet.payload[0] != static_cast<uint8_t>(TelemetrySubtype::POSITION_STATUS)) {
+    gatewayOutput.print("[TELEMETRY] subtype desconhecido 0x");
+    gatewayOutput.println(packet.payload[0], HEX);
+    return;
+  }
+
+  TelemetryPayload position;
+  if (!decodeTelemetry(packet, position)) {
+    gatewayOutput.println("[TELEMETRY] payload POSITION_STATUS invalido");
+    return;
+  }
+  emitPositionStatus(packet, position, rssi, snr, hasRadioMetrics);
 }
 
 // ============================================================
@@ -1584,6 +1608,7 @@ void processEvent(const PacketView& packet) {
   // Um retry de DEVICE_STARTED nao deve limpar o historico novamente.
   if (isDeviceStarted && !packet.header.retry) {
     clearReliableHistory(packet.header.collarId);
+    ++eventCollarRun[packet.header.collarId];
   }
 
   if (packet.header.ackReq &&
@@ -1597,7 +1622,31 @@ void processEvent(const PacketView& packet) {
 
   uint16_t fenceVersion = 0;
   bool hasFenceVersion = false;
-  if (!processEventPayload(packet, fenceVersion, hasFenceVersion)) {
+  const bool deferred = EVENT_SERIAL_COMMIT_ENABLED && packet.header.ackReq;
+  const uint8_t collar = packet.header.collarId;
+  const uint16_t sequence = packet.header.sequence;
+  const uint32_t collarRun = eventCollarRun[collar];
+  EventSerialDelivery::Entry* retained = nullptr;
+  if (deferred) {
+    if (const auto* pending = eventSerialDelivery.find(collar, sequence, collarRun)) {
+      if (pending->payloadSize != packet.payloadLength ||
+          memcmp(pending->payload, packet.payload, packet.payloadLength) != 0) {
+        gatewayTerminal.print(framedSerial, "[ERRO] [GATEWAY] [COL %03u] conflito de evento pendente seq=%u\n",
+                              unsigned(collar), unsigned(sequence));
+      }
+      return;
+    }
+    retained = eventSerialDelivery.available();
+    if (!retained) {
+      gatewayTerminal.print(framedSerial, "[ERRO] [GATEWAY] [COL %03u] evento sem ACK: retencao cheia seq=%u\n",
+                            unsigned(collar), unsigned(sequence));
+      return;
+    }
+    gatewayOutput.captureNextFrame(retained->line, sizeof(retained->line));
+  }
+  const bool valid = processEventPayload(packet, fenceVersion, hasFenceVersion);
+  const size_t captured = retained ? gatewayOutput.endCapture() : 0;
+  if (!valid) {
     if (packet.header.ackReq) {
       // Se o subtype existe mas o tamanho nao bate, e INVALID_LENGTH.
       const bool known = subtype >= static_cast<uint8_t>(EventSubtype::OUTSIDE) &&
@@ -1611,7 +1660,15 @@ void processEvent(const PacketView& packet) {
   }
 
   const char* ackStatus = "N/A";
-  if (packet.header.ackReq) {
+  if (retained) {
+    if (!eventSerialDelivery.retain(*retained, radioSessionId, collar, sequence, collarRun,
+                                    packet.payload, packet.payloadLength, captured)) {
+      gatewayTerminal.print(framedSerial, "[ERRO] [GATEWAY] [COL %03u] evento nao retido seq=%u\n",
+                            unsigned(collar), unsigned(sequence));
+      return;
+    }
+    ackStatus = "AGUARDANDO COMMIT DA BASE";
+  } else if (packet.header.ackReq) {
     rememberReliable(packet.header.collarId, packet.header.sequence);
     ackStatus = sendAckResponse(packet.header.collarId, packet.header.sequence)
         ? "TX LOCAL ACEITO" : "FALHA LOCAL";
@@ -1708,7 +1765,9 @@ void processIncomingPacket(const uint8_t* data, size_t len,
     return;
   }
 
-  markCollarSeen(collarId, rssi, snr, hasRadioMetrics);
+  const bool countedPosition = packet.header.type == MessageType::TELEMETRY &&
+      packet.payloadLength > 0 && packet.payload[0] == POSITION_STATUS_COUNTED;
+  if (!countedPosition) markCollarSeen(collarId, rssi, snr, hasRadioMetrics);
 
   if (packet.header.version != PROTOCOL_VERSION) {
     gatewayTerminal.print(framedSerial, "[RX] versao nao suportada: %u\n", unsigned(packet.header.version));
@@ -1719,20 +1778,25 @@ void processIncomingPacket(const uint8_t* data, size_t len,
     return;
   }
 
+  if (countedPosition) {
+    PositionDeliveryTag tag;
+    uint8_t payload[LEGACY_POSITION_PAYLOAD_SIZE];
+    PacketView legacy;
+    TelemetryPayload position;
+    if (!unpackCountedPosition(packet, tag, legacy, payload) ||
+        !decodeTelemetry(legacy, position)) return;
+    // ONLINE means a valid contact for this subtype, even without a GNSS fix
+    // or when this ordinal does not contribute to the PDR window.
+    markCollarSeen(collarId, rssi, snr, hasRadioMetrics);
+    if (hasRadioMetrics) pdrSlots[collarId].tracker.observe(tag, receivedAtMs, radioTransition.active);
+    emitPositionStatus(legacy, position, rssi, snr, hasRadioMetrics);
+    return;
+  }
+
   switch (packet.header.type) {
-    case MessageType::TELEMETRY: {
-      if (packet.payloadLength && packet.payload[0] == POSITION_STATUS_COUNTED) {
-        PositionDeliveryTag tag;
-        uint8_t payload[LEGACY_POSITION_PAYLOAD_SIZE];
-        PacketView legacy;
-        if (!unpackCountedPosition(packet, tag, legacy, payload)) return;
-        if (hasRadioMetrics) pdrSlots[collarId].tracker.observe(tag, receivedAtMs, INITIAL_LORA_PROFILE);
-        processTelemetry(legacy, rssi, snr, hasRadioMetrics);
-      } else {
-        processTelemetry(packet, rssi, snr, hasRadioMetrics);
-      }
+    case MessageType::TELEMETRY:
+      processTelemetry(packet, rssi, snr, hasRadioMetrics);
       break;
-    }
 
     case MessageType::EVENT:
       if (hasRadioMetrics && !packet.header.retry) {
@@ -1747,6 +1811,14 @@ void processIncomingPacket(const uint8_t* data, size_t len,
       break;
 
     case MessageType::CONTROL:
+      if (PROFILE_SWITCH_ENABLED && hasRadioMetrics && packet.payloadLength && packet.payload[0] == PROFILE_CONTROL) {
+        ProfileSignal signal{};
+        if (decodeProfileSignal(packet, signal)) {
+          radioTransition.receive(collarId, signal, receivedAtMs);
+          markCollarSeen(collarId, rssi, snr, true);
+        }
+        break;
+      }
       processControl(packet);
       break;
 
@@ -1859,15 +1931,14 @@ void printStatus() {
 }
 
 void emitRadioConfig() {
+  const auto& profile = LORA_PROFILES[radioTransition.active];
   emitAppHeader("radio_config", true);
-  gatewayOutput.print(",\"frequencyHz\":"); gatewayOutput.print(LORA_FREQUENCY_HZ);
-  gatewayOutput.print(",\"spreadingFactor\":"); gatewayOutput.print(LORA_SPREADING_FACTOR);
-  gatewayOutput.print(",\"bandwidthHz\":"); gatewayOutput.print(LORA_SIGNAL_BANDWIDTH);
-  gatewayOutput.print(",\"codingRateDenominator\":"); gatewayOutput.print(LORA_CODING_RATE_DENOMINATOR);
-  gatewayOutput.print(",\"preambleLength\":"); gatewayOutput.print(LORA_PREAMBLE_LENGTH);
-  gatewayOutput.print(",\"syncWord\":"); gatewayOutput.print(LORA_SYNC_WORD);
-  gatewayOutput.print(",\"txPowerDbm\":"); gatewayOutput.print(LORA_TX_POWER_DBM);
-  gatewayOutput.println(",\"crcEnabled\":true}");
+  gatewayOutput.printf(",\"frequencyHz\":%lu,\"spreadingFactor\":%u,\"bandwidthHz\":%lu,"
+      "\"codingRateDenominator\":%u,\"preambleLength\":%u,\"syncWord\":%u,\"txPowerDbm\":%u,\"crcEnabled\":%s}\r\n",
+      static_cast<unsigned long>(profile.frequencyHz), unsigned(profile.spreadingFactor),
+      static_cast<unsigned long>(profile.bandwidthHz), unsigned(profile.codingRateDenominator),
+      unsigned(profile.preambleSymbols), unsigned(profile.syncWord), unsigned(profile.txPowerDbm),
+      profile.crcEnabled ? "true" : "false");
 }
 
 static uint16_t nextStatusCollar = 0;
@@ -2062,6 +2133,76 @@ const char* stagedFenceProblem() {
   return nullptr;
 }
 
+static bool saveProfileTransition(const GatewayProfileTransition& state) {
+  uint8_t record[32]{};
+  memcpy(record, "VPT2", 4);
+  writeU32BE(record + 4, state.operation);
+  record[8] = state.source;
+  record[9] = state.target;
+  record[10] = static_cast<uint8_t>(state.phase);
+  record[11] = state.count;
+  for (uint8_t i = 0; i < state.count; ++i) record[12 + i] = state.members[i].id;
+  writeU32BE(record + 28, crc32IsoHdlc(record, 28));
+  if (!profilePreferences.begin("vf-profile", false)) return false;
+  const bool saved = profilePreferences.putBytes("operation", record, sizeof(record)) == sizeof(record);
+  profilePreferences.end();
+  return saved;
+}
+
+static void recoverProfileTransition() {
+  if (!profilePreferences.begin("vf-profile", true)) return;
+  uint8_t record[32];
+  const bool valid = profilePreferences.getBytesLength("operation") == sizeof(record) &&
+      profilePreferences.getBytes("operation", record, sizeof(record)) == sizeof(record) &&
+      memcmp(record, "VPT2", 4) == 0 && readU32BE(record + 28) == crc32IsoHdlc(record, 28);
+  profilePreferences.end();
+  if (!valid || !record[11] || record[11] > PROFILE_MAX_MEMBERS ||
+      record[8] >= LORA_PROFILE_COUNT || record[9] >= LORA_PROFILE_COUNT) return;
+  for (uint8_t i = 0; i < record[11]; ++i) {
+    if (!record[12 + i] || record[12 + i] == 255) return;
+  }
+  radioTransition.session = radioSessionId;
+  radioTransition.operation = readU32BE(record + 4);
+  radioTransition.source = record[8];
+  radioTransition.target = record[9];
+  radioTransition.count = record[11];
+  for (uint8_t i = 0; i < radioTransition.count; ++i) radioTransition.members[i].id = record[12 + i];
+  radioTransition.recover(millis());
+}
+
+static void serviceGlobalProfile() {
+  const bool busy = !gatewayTerminalIdle() || eventSerialDelivery.hasPending();
+  const auto before = radioTransition.phase;
+  const auto activeBefore = radioTransition.active;
+  const bool wasOverdue = radioTransition.recoveryOverdue();
+  radioTransition.service(millis(), busy,
+      [](uint8_t id, const ProfileSignal& signal) {
+        uint8_t packet[MAX_PACKET_SIZE];
+        const auto length = encodeProfileSignal(packet, sizeof(packet), id, allocateSequence(), signal);
+        if (length) transportSend(packet, length);
+      },
+      [](uint8_t profile) {
+        if (!applyLoRaProfile(LoRa, profile)) return false;
+        if (profile != radioTransition.active) {
+          publishRadioWindow(radioWindowStartMs, false, false);
+          radioWindowStartMs = millis();
+        }
+        return true;
+      });
+  if (radioTransition.phase != before && !saveProfileTransition(radioTransition)) {
+    gatewayTerminal.print(framedSerial, "[ERRO] [GATEWAY] PERFIL falha no diario NVS; recuperacao P0 pendente\n");
+    radioTransition.recover(millis());
+  }
+  if (radioTransition.recoveryOverdue() && !wasOverdue) {
+    gatewayTerminal.print(framedSerial, "[ERRO] [GATEWAY] PERFIL prazo excedido; recuperacao P0 pendente\n");
+  }
+  if (radioTransition.phase != before || radioTransition.active != activeBefore) {
+    gatewayTerminal.print(framedSerial, "[PERFIL] [GATEWAY] operacao=%lu fase=%s atual=P%u\n",
+        static_cast<unsigned long>(radioTransition.operation), profilePhaseName(radioTransition.phase),
+        unsigned(radioTransition.active));
+  }
+}
+
 static void emitProfileResponse(uint32_t requestId, const String& command, bool ok, const char* detail) {
   emitAppHeader("command_response", true);
   gatewayOutput.print(",\"requestId\":"); gatewayOutput.print(requestId);
@@ -2070,9 +2211,10 @@ static void emitProfileResponse(uint32_t requestId, const String& command, bool 
   gatewayOutput.print(",\"detail\":\""); gatewayOutput.print(detail);
   gatewayOutput.printf("\",\"profileControlVersion\":1,\"gatewaySessionId\":\"%016llx\","
                 "\"activeProfileId\":%u,\"operationId\":%lu,\"state\":\"%s\","
-                "\"switchEnabled\":false,\"requestedProfileId\":",
-                static_cast<unsigned long long>(radioSessionId), unsigned(INITIAL_LORA_PROFILE),
-                static_cast<unsigned long>(profilePlan.operation()), profilePlan.pending() ? "PLANNED" : "IDLE");
+                "\"switchEnabled\":%s,\"requestedProfileId\":",
+                static_cast<unsigned long long>(radioSessionId), unsigned(radioTransition.active),
+                static_cast<unsigned long>(profilePlan.operation()), profilePlan.pending() ? "PLANNED" : "IDLE",
+                PROFILE_SWITCH_ENABLED ? "true" : "false");
   if (profilePlan.pending()) gatewayOutput.print(profilePlan.target());
   else gatewayOutput.print("null");
   if (command == "LIST_PROFILES") {
@@ -2091,6 +2233,68 @@ static void emitProfileResponse(uint32_t requestId, const String& command, bool 
     gatewayOutput.print(']');
   }
   gatewayOutput.println('}');
+}
+
+static void emitProfileTransition(uint32_t requestId, const String& command, bool ok) {
+  emitAppHeader("command_response", true);
+  gatewayOutput.printf(",\"requestId\":%lu,\"command\":\"%s\",\"ok\":%s,\"profileControlVersion\":2,"
+      "\"gatewaySessionId\":\"%016llx\",\"activeProfileId\":%u,\"sourceProfileId\":%u,"
+      "\"targetProfileId\":%u,\"operationId\":%lu,\"deadlineAtMs\":%lu,\"state\":\"%s\",\"switchEnabled\":%s,",
+      static_cast<unsigned long>(requestId), command.c_str(), ok ? "true" : "false",
+      static_cast<unsigned long long>(radioSessionId), unsigned(radioTransition.active),
+      unsigned(radioTransition.source), unsigned(radioTransition.target),
+      static_cast<unsigned long>(radioTransition.operation), static_cast<unsigned long>(radioTransition.deadline),
+      profilePhaseName(radioTransition.phase), PROFILE_SWITCH_ENABLED ? "true" : "false");
+  gatewayOutput.print("\"participants\":[");
+  for (uint8_t i = 0; i < radioTransition.count; ++i) {
+    const auto& member = radioTransition.members[i];
+    if (i) gatewayOutput.print(',');
+    gatewayOutput.printf("{\"collarId\":%u,\"proved\":%s}", unsigned(member.id), member.proved ? "true" : "false");
+  }
+  gatewayOutput.println("]}");
+}
+
+static bool processProfileTransition(const GatewayCommandJson& json, const String& command, uint32_t requestId) {
+  if (command == "GET_PROFILE_V2") {
+    emitProfileTransition(requestId, command, true);
+    return true;
+  }
+  if (command != "START_PROFILE_V2" && command != "CANCEL_PROFILE_V2") return false;
+  const char* field = nullptr;
+  size_t length = 0;
+  uint64_t session;
+  uint32_t operation = 0;
+  bool ok = PROFILE_SWITCH_ENABLED &&
+      json.stringField("gatewaySessionId", field, length) && length == 16 &&
+      readMetricId(field, session) && session == radioSessionId &&
+      json.unsignedField("operationId", operation, UINT32_MAX) && operation;
+  auto next = radioTransition;
+  if (ok && command == "CANCEL_PROFILE_V2") {
+    ok = operation == next.operation && next.cancel(millis());
+  } else if (ok) {
+    uint32_t target;
+    ok = gatewayTerminalIdle() && !fenceTx.staged && !eventSerialDelivery.hasPending() &&
+        json.unsignedField("profileId", target, LORA_PROFILE_COUNT - 1) &&
+        json.stringField("roster", field, length) && length && length < PROFILE_MAX_MEMBERS * 4;
+    uint8_t roster[PROFILE_MAX_MEMBERS]{};
+    uint8_t count = 0;
+    size_t offset = 0;
+    while (ok && offset < length) {
+      unsigned id = 0;
+      while (offset < length && field[offset] >= '0' && field[offset] <= '9') {
+        id = id * 10 + field[offset++] - '0';
+        if (id > 254) { ok = false; break; }
+      }
+      if (!ok || !id || count == PROFILE_MAX_MEMBERS || !collars[id].online) { ok = false; break; }
+      roster[count++] = id;
+      if (offset < length && (field[offset++] != ',' || offset == length)) ok = false;
+    }
+    if (ok) ok = next.start(session, operation, static_cast<uint8_t>(target), roster, count, millis());
+  }
+  if (ok) ok = saveProfileTransition(next);
+  if (ok) radioTransition = next;
+  emitProfileTransition(requestId, command, ok);
+  return true;
 }
 
 static bool processProfileCommand(const GatewayCommandJson& json, const String& command, uint32_t requestId) {
@@ -2166,7 +2370,50 @@ void processJsonCommand(const String& line) {
     emitCommandResponse(requestId, command.c_str(), false, "schema_invalid");
     return;
   }
-  if (processProfileCommand(json, command, requestId)) return;
+  if (command == "ENABLE_EVENT_COMMIT") {
+    uint32_t version;
+    const bool supported = EVENT_SERIAL_COMMIT_ENABLED &&
+        json.unsignedField("deliveryVersion", version, 1) && version == 1;
+    if (supported) eventSerialNegotiated = true;
+    emitCommandResponse(requestId, command.c_str(), supported, supported ? nullptr : "event_commit_unsupported");
+    return;
+  }
+  if (command == "EVENT_COMMITTED") {
+    if (!eventSerialNegotiated || !json.stringField("deliveryId", field, length)) return;
+    auto* saved = eventSerialDelivery.confirm(radioSessionId, field, length);
+    if (!saved) return;
+    if (eventCollarRun[saved->collar] == saved->collarRun) {
+      rememberReliable(saved->collar, saved->sequence);
+      sendAckResponse(saved->collar, saved->sequence);
+    }
+    saved->occupied = false;
+    return;
+  }
+  if (command == "ENABLE_PDR_COMMIT") {
+    uint32_t version;
+    const bool supported = PDR_SERIAL_COMMIT_ENABLED &&
+        json.unsignedField("deliveryVersion", version, 2) && version == 2;
+    if (supported) pdrSerialNegotiated = true;
+    emitCommandResponse(requestId, command.c_str(), supported, supported ? nullptr : "pdr_commit_unsupported");
+    return;
+  }
+  if (command == "PDR_COMMITTED") {
+    uint32_t collar;
+    uint64_t session, window;
+    if (!pdrSerialNegotiated || !json.unsignedField("collarId", collar, 254) || !collar ||
+        !json.stringField("gatewaySessionId", field, length) || length != 16 ||
+        !readMetricId(field, session) || !json.stringField("windowId", field, length) ||
+        length != 16 || !readMetricId(field, window)) return;
+    pdrSerialDelivery.confirm(radioSessionId, session, static_cast<uint8_t>(collar), window);
+    return;
+  }
+  if (processProfileTransition(json, command, requestId) || processProfileCommand(json, command, requestId)) return;
+  if (PROFILE_SWITCH_ENABLED && radioTransition.busy() &&
+      (command == "SET_PARAMETERS" || command == "FENCE_NEW" || command == "FENCE_POINT" ||
+       command == "FENCE_SEND")) {
+    emitCommandResponse(requestId, command.c_str(), false, "BUSY");
+    return;
+  }
 
   if (command == "GET_STATUS") {
     emitCommandResponse(requestId, command.c_str(), true);
@@ -2455,6 +2702,7 @@ void setup() {
   gatewayOutput.println("============================================================");
   if (GATEWAY_TERMINAL_DETAIL) printHelp();
   radioWindowStartMs = millis();
+  if (PROFILE_SWITCH_ENABLED) recoverProfileTransition();
 }
 
 void loop() {
@@ -2465,9 +2713,22 @@ void loop() {
   framedSerial.service();
   serviceCollarStatus();
   pollSerialCommands();
+  if (eventSerialNegotiated && framedSerial.canQueue(2)) {
+    eventSerialDelivery.service(millis(), [](const uint8_t* data, size_t size) {
+      framedSerial.queue(data, size, true);
+      return true;
+    });
+  }
   serviceRadioWindows(millis());
   serviceMetricSerialExport();
   serviceRadioTerminal(millis());
   servicePdrOutput(millis());
+  if (pdrSerialNegotiated && gatewayTerminalIdle() &&
+      framedSerial.canQueue(FramedSerial<GatewaySerialPort>::RESERVED_FRAMES + 1))
+    pdrSerialDelivery.service(millis(), radioSessionId, [](const uint8_t* data, size_t size) {
+      framedSerial.queue(data, size, false);
+      return true;
+    });
+  if (PROFILE_SWITCH_ENABLED) serviceGlobalProfile();
   serviceTerminalSummary(millis());
 }

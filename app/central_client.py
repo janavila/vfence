@@ -7,7 +7,10 @@ import httpx
 
 
 class CentralClientError(RuntimeError):
-    pass
+    def __init__(self, *args: object, status_code: int | None = None, invalid_response: bool = False):
+        super().__init__(*args)
+        self.status_code = status_code
+        self.invalid_response = invalid_response
 
 
 class CentralAuthenticationError(CentralClientError):
@@ -89,12 +92,13 @@ class CentralClient:
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
             raise CentralClientError(str(exc)) from exc
         if response.status_code in {401, 403}:
-            raise CentralAuthenticationError(response.text)
+            raise CentralAuthenticationError(response.text, status_code=response.status_code)
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             raise CentralClientError(
-                f"Central respondeu HTTP {response.status_code}: {response.text[:200]}"
+                f"Central respondeu HTTP {response.status_code}: {response.text[:200]}",
+                status_code=response.status_code,
             ) from exc
         return response
 
@@ -108,7 +112,7 @@ class CentralClient:
         })
         data = response.json()
         if "desired_fence_version" not in data or "server_time" not in data:
-            raise CentralClientError("resposta de heartbeat inválida")
+            raise CentralClientError("resposta de heartbeat inválida", invalid_response=True)
         return data
 
     async def download_fence(self, version: int) -> dict:
@@ -125,5 +129,17 @@ class CentralClient:
         data = response.json()
         acked = data.get("acked_up_to")
         if not isinstance(acked, int):
-            raise CentralClientError("resposta de lote inválida")
+            raise CentralClientError("resposta de lote inválida", invalid_response=True)
+        return acked
+
+    async def send_batch_confirmed(self, base_id: str, generation: str, items: list[dict]) -> list[int]:
+        response = await self._request(
+            "POST", "/api/edge/batch", json={"base_id": base_id, "generation": generation, "items": items},
+        )
+        data = response.json()
+        expected = [item["edge_seq"] for item in items]
+        acked = data.get("acked_sequences") if isinstance(data, dict) else None
+        if (not isinstance(acked, list) or data.get("generation") != generation
+                or any(type(sequence) is not int for sequence in acked) or acked != expected):
+            raise CentralClientError("confirmação de lote incompatível", invalid_response=True)
         return acked

@@ -15,6 +15,15 @@ class GatewaySerialOutput : public Print {
       : serial_(serial), terminal_(terminal) {}
 
   void reserveFrame() { reserved_ = true; }
+  void captureNextFrame(uint8_t* target, size_t capacity) {
+    capture_ = target;
+    captureCapacity_ = capacity;
+    captured_ = 0;
+  }
+  size_t endCapture() {
+    capture_ = nullptr;
+    return captured_;
+  }
 
   size_t write(uint8_t byte) override { return write(&byte, 1); }
 
@@ -51,7 +60,12 @@ class GatewaySerialOutput : public Print {
  private:
   void finishLine() {
     const bool operational = used_ >= 6 && memcmp(line_, "[APP] ", 6) == 0;
-    if (overflowed_) {
+    if (capture_ && operational) {
+      if (!overflowed_ && used_ <= captureCapacity_) {
+        memcpy(capture_, line_, used_);
+        captured_ = used_;
+      }
+    } else if (overflowed_) {
       if (operational || reserved_) serial_.recordOperationalRefusal();
       else terminal_.recordOmission();
     } else if (operational) {
@@ -70,6 +84,9 @@ class GatewaySerialOutput : public Print {
   size_t used_ = 0;
   bool overflowed_ = false;
   bool reserved_ = false;
+  uint8_t* capture_ = nullptr;
+  size_t captureCapacity_ = 0;
+  size_t captured_ = 0;
 };
 
 }  // namespace vfence

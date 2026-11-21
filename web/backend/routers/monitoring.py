@@ -32,10 +32,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
-from backend.schemas.monitoring import BaseOut, CollarOut, EventOut, TelemetryOut
+from backend.schemas.monitoring import AnimalLabelIn, BaseOut, CollarOut, EventOut, TelemetryOut
 from backend.services import edge_service, fence_service
 
 logger = logging.getLogger("monitoring")
@@ -49,18 +50,26 @@ router = APIRouter(prefix="/api", tags=["rebanho"])
 
 
 def _collars(db, active_version: int | None) -> list[dict]:
-    rows = db.list_collars()
-    return [
-        {
-            **row,
-            # Calculado, não gravado: muda sozinho quando a cerca ativa muda.
-            "outdated": (
-                active_version is not None
-                and row["fence_version_reported"] != active_version
-            ),
-        }
-        for row in rows
-    ]
+    with db.connect() as conn:
+        rows = [dict(row) for row in conn.execute(
+            "SELECT collars.*,(SELECT MAX(fence_version) FROM deliveries "
+            "WHERE deliveries.collar_id=collars.collar_id AND status='confirmed') AS confirmed_fence_version "
+            "FROM collars ORDER BY collar_id",
+        )]
+    now = datetime.now(timezone.utc)
+    for row in rows:
+        stamp = row["last_position_at"]
+        age = None
+        if stamp:
+            try:
+                moment = datetime.fromisoformat(stamp)
+                age = max(0, int((now - moment).total_seconds())) if moment.tzinfo else None
+            except ValueError:
+                pass
+        row["position_age_s"] = age
+        row["position_stale"] = age is None or age > 120 or row["gnss_status"] == "invalid"
+        row["outdated"] = active_version is not None and row["fence_version_reported"] != active_version
+    return rows
 
 
 @router.get("/collars", response_model=list[CollarOut], summary="Coleiras e último estado")
@@ -68,6 +77,44 @@ async def collars_route(request: Request) -> list[dict]:
     db = request.app.state.db
     active = await asyncio.to_thread(fence_service.active_version, db)
     return await asyncio.to_thread(_collars, db, active)
+
+
+@router.patch("/collars/{collar_id}", response_model=CollarOut)
+async def change_animal_label(collar_id: str, body: AnimalLabelIn, request: Request) -> dict:
+    db = request.app.state.db
+    label = body.animal_label.strip() if body.animal_label else None
+    if label and any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in label):
+        raise HTTPException(422, "invalid_animal_label")
+
+    def update():
+        with db.connect() as conn:
+            cursor = conn.execute("UPDATE collars SET animal_label=? WHERE collar_id=?", (label or None, collar_id))
+            if cursor.rowcount == 0:
+                return None
+            return next(row for row in _collars(db, fence_service.active_version(db)) if row["collar_id"] == collar_id)
+
+    updated = await asyncio.to_thread(update)
+    if updated is None:
+        raise HTTPException(404, "collar_not_found")
+    return updated
+
+
+def _history_filter(collar_id, start, end, before_id):
+    for bound in (start, end):
+        if bound is not None and bound.tzinfo is None:
+            raise HTTPException(422, "history_date_requires_timezone")
+    if start is not None and end is not None and start >= end:
+        raise HTTPException(422, "invalid_history_period")
+    filters, args = [], []
+    for condition, value in (
+        ("collar_id=?", collar_id), ("id<?", before_id),
+        ("substr(ts,1,19)>=?", start.astimezone(timezone.utc).isoformat()[:19] if start else None),
+        ("substr(ts,1,19)<?", end.astimezone(timezone.utc).isoformat()[:19] if end else None),
+    ):
+        if value is not None:
+            filters.append(condition)
+            args.append(value)
+    return (" WHERE " + " AND ".join(filters) if filters else ""), args
 
 
 @router.get(
@@ -79,6 +126,9 @@ async def telemetry_route(
     collar_id: str,
     request: Request,
     limit: int = Query(100, ge=1, le=1000),
+    start: datetime | None = None,
+    end: datetime | None = None,
+    before_id: int | None = Query(None, ge=1),
 ) -> list[dict]:
     """Mais recente primeiro.
 
@@ -88,6 +138,7 @@ async def telemetry_route(
     de bateria.
     """
     db = request.app.state.db
+    where, parameters = _history_filter(collar_id, start, end, before_id)
 
     def consultar() -> list[dict] | None:
         with db.connect() as conn:
@@ -99,8 +150,8 @@ async def telemetry_route(
             return [
                 dict(row)
                 for row in conn.execute(
-                    "SELECT * FROM telemetry WHERE collar_id = ? ORDER BY id DESC LIMIT ?",
-                    (collar_id, limit),
+                    "SELECT * FROM telemetry" + where + " ORDER BY id DESC LIMIT ?",
+                    (*parameters, limit),
                 )
             ]
 
@@ -120,6 +171,9 @@ async def events_route(
     request: Request,
     limit: int = Query(100, ge=1, le=1000),
     collar_id: str | None = Query(None, description="filtra por coleira"),
+    start: datetime | None = None,
+    end: datetime | None = None,
+    before_id: int | None = Query(None, ge=1),
 ) -> list[dict]:
     """Mais recente primeiro, com filtro opcional por coleira.
 
@@ -128,18 +182,13 @@ async def events_route(
     atendendo o contrato da seção 6 sem ele.
     """
     db = request.app.state.db
+    where, parameters = _history_filter(collar_id, start, end, before_id)
 
     def consultar() -> list[dict]:
         with db.connect() as conn:
-            if collar_id:
-                linhas = conn.execute(
-                    "SELECT * FROM events WHERE collar_id = ? ORDER BY id DESC LIMIT ?",
-                    (collar_id, limit),
-                )
-            else:
-                linhas = conn.execute(
-                    "SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)
-                )
+            linhas = conn.execute(
+                "SELECT * FROM events" + where + " ORDER BY id DESC LIMIT ?", (*parameters, limit),
+            )
             return [dict(linha) for linha in linhas]
 
     return await asyncio.to_thread(consultar)

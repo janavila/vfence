@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sqlite3
@@ -24,6 +25,10 @@ class MetricSaveResult(Enum):
     FAILED = "failed"
 
 
+class GatewayEventConflictError(ValueError):
+    pass
+
+
 class Database:
     def __init__(self, database_url: str):
         prefix = "sqlite:///"
@@ -38,8 +43,8 @@ class Database:
             self._memory.row_factory = sqlite3.Row
 
     @contextmanager
-    def connect(self):
-        connection = self._memory or sqlite3.connect(self.path, timeout=10)
+    def connect(self, *, timeout: float = 10):
+        connection = self._memory or sqlite3.connect(self.path, timeout=timeout)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         try:
@@ -79,12 +84,20 @@ class Database:
                     ON telemetry(collar_id, timestamp DESC);
                 CREATE INDEX IF NOT EXISTS idx_events_timestamp
                     ON events(timestamp DESC);
+                CREATE TABLE IF NOT EXISTS gateway_event_receipts (
+                    delivery_id TEXT PRIMARY KEY, digest TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS central_outbox (
                     edge_seq INTEGER PRIMARY KEY AUTOINCREMENT,
                     item_type TEXT NOT NULL,
                     data_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS central_outbox_stream (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1), generation TEXT NOT NULL
+                );
+                INSERT OR IGNORE INTO central_outbox_stream (singleton,generation)
+                    VALUES (1,lower(hex(randomblob(16))));
                 CREATE TABLE IF NOT EXISTS fence_state (
                     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
                     desired_version INTEGER,
@@ -188,7 +201,16 @@ class Database:
                     PRIMARY KEY (gateway_id, gateway_session_id, window_id, collar_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_pdr_windows_collar ON pdr_windows(collar_id, persisted_at DESC);
+                CREATE TABLE IF NOT EXISTS profile_operations (
+                    gateway_session TEXT NOT NULL, operation_id INTEGER NOT NULL,
+                    profile_id INTEGER NOT NULL, participants TEXT NOT NULL, status TEXT NOT NULL,
+                    report_json TEXT, updated_at TEXT NOT NULL,
+                    PRIMARY KEY (gateway_session,operation_id)
+                );
             """)
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(fence_deliveries)")}
+            if "confirmed_crc32" not in columns:
+                db.execute("ALTER TABLE fence_deliveries ADD COLUMN confirmed_crc32 TEXT")
             db.execute("PRAGMA optimize")
 
     def save_pdr_summary(self, gateway_id: str, summary: PdrSummary) -> MetricSaveResult:
@@ -228,6 +250,50 @@ class Database:
                 ORDER BY persisted_at DESC, rowid DESC LIMIT ?
                 """, (collar_id, limit)).fetchall()
         return [{**dict(row), "valid": bool(row["valid"])} for row in rows]
+
+    def link_metrics(self, collar_id: int, limit: int) -> dict:
+        with self._lock, self.connect() as db:
+            position = db.execute(
+                "SELECT timestamp,zone,hdop,rssi,snr FROM telemetry WHERE collar_id=? "
+                "ORDER BY timestamp DESC,id DESC LIMIT 1", (f"COL{collar_id:02d}",),
+            ).fetchone()
+            windows = {}
+            for kind in ("HDOP", "RADIO"):
+                windows[kind.lower()] = [dict(row) for row in db.execute(
+                    "SELECT * FROM metric_summaries WHERE collar_id=? AND kind=? "
+                    "ORDER BY persisted_at DESC,id DESC LIMIT ?", (collar_id, kind, limit),
+                )]
+            windows["pdr"] = self.list_pdr(collar_id, limit)
+        return {"instant": dict(position) if position else None, "windows": windows}
+
+    def start_profile_operation(self, session: str, reported_id: int, target: int, collars: list[int]) -> int:
+        with self._lock, self.connect() as db:
+            local = db.execute("SELECT COALESCE(MAX(operation_id),0) FROM profile_operations WHERE gateway_session=?",
+                               (session,)).fetchone()[0]
+            operation = max(local, reported_id) + 1
+            if operation > 0xFFFFFFFF:
+                raise ValueError("profile operation identity exhausted")
+            db.execute(
+                "INSERT INTO profile_operations VALUES (?,?,?,?, 'REQUESTED',NULL,?)",
+                (session, operation, target, json.dumps(collars), datetime.now(timezone.utc).isoformat()),
+            )
+        return operation
+
+    def record_profile_operation(self, session: str, operation: int, report: dict) -> None:
+        with self._lock, self.connect() as db:
+            db.execute(
+                "UPDATE profile_operations SET status=?,report_json=?,updated_at=? "
+                "WHERE gateway_session=? AND operation_id=?",
+                (report["state"], json.dumps(report), datetime.now(timezone.utc).isoformat(), session, operation),
+            )
+
+    def profile_history(self, limit: int) -> list[dict]:
+        with self._lock, self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM profile_operations ORDER BY updated_at DESC,operation_id DESC LIMIT ?", (limit,),
+            ).fetchall()
+        return [{**dict(row), "participants": json.loads(row["participants"]),
+                 "report_json": json.loads(row["report_json"]) if row["report_json"] else None} for row in rows]
 
     def save_metric_summary(self, summary: MetricSummary) -> MetricSaveResult:
         try:
@@ -355,6 +421,40 @@ class Database:
             return [dict(row) for row in db.execute(
                 "SELECT * FROM events ORDER BY timestamp DESC LIMIT ?", (limit,)).fetchall()]
 
+    def save_gateway_event(self, kind: str, *, timestamp: str, collar_id: str | None,
+                           payload: dict, enqueue_for_central: bool) -> bool:
+        # Para eventos do Gateway, new_value preserva o JSON recebido. As
+        # transicoes de zona continuam usando old_value e new_value como antes.
+        detail = json.dumps(payload, separators=(",", ":"))
+        local_collar = collar_id or "GATEWAY"
+        with self._lock, self.connect(timeout=0.25) as db:
+            delivery_id = payload.get("deliveryId")
+            if delivery_id is not None:
+                encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+                digest = hashlib.sha256(encoded.encode()).hexdigest()
+                cursor = db.execute(
+                    "INSERT INTO gateway_event_receipts (delivery_id,digest) VALUES (?,?) "
+                    "ON CONFLICT(delivery_id) DO NOTHING",
+                    (delivery_id, digest),
+                )
+                if cursor.rowcount == 0:
+                    existing = db.execute(
+                        "SELECT digest FROM gateway_event_receipts WHERE delivery_id=?", (delivery_id,),
+                    ).fetchone()
+                    if existing["digest"] != digest:
+                        raise GatewayEventConflictError("gateway event delivery identity conflict")
+                    return False
+            db.execute(
+                "INSERT INTO events (collar_id,timestamp,event_type,new_value) VALUES (?,?,?,?)",
+                (local_collar, timestamp, kind, detail),
+            )
+            if enqueue_for_central:
+                self._queue(db, "event", {
+                    "collar_id": collar_id, "kind": kind, "zone": None,
+                    "detail": detail, "ts": timestamp,
+                }, timestamp)
+        return True
+
     def enqueue_event(self, kind: str, *, timestamp: str, collar_id: str | None = None,
                       zone: str | None = None, detail: str | None = None) -> int:
         with self._lock, self.connect() as db:
@@ -373,34 +473,69 @@ class Database:
             data["detail"] = detail
         with self._lock, self.connect() as db:
             db.execute(
-                """INSERT INTO fence_deliveries(version,collar_id,status,detail,updated_at)
-                   VALUES(?,?,?,?,?)
+                """INSERT INTO fence_deliveries(version,collar_id,status,detail,updated_at,confirmed_crc32)
+                   VALUES(?,?,?,?,?,?)
                    ON CONFLICT(version,collar_id) DO UPDATE SET
-                   status=excluded.status,detail=excluded.detail,updated_at=excluded.updated_at""",
-                (version, collar_id, status, detail, timestamp),
+                   status=excluded.status,detail=excluded.detail,updated_at=excluded.updated_at,
+                   confirmed_crc32=excluded.confirmed_crc32""",
+                (version, collar_id, status, detail, timestamp, crc32 if status == "confirmed" else None),
             )
             return self._queue(db, "delivery", data, timestamp)
 
+    def confirmed_recipients(self, version: int, crc: str) -> set[str]:
+        with self._lock, self.connect() as db:
+            return {row[0] for row in db.execute(
+                "SELECT collar_id FROM fence_deliveries WHERE version=? AND status='confirmed' AND confirmed_crc32=?",
+                (version, crc),
+            )}
+
     def outbox_batch(self, limit: int = 100) -> list[dict]:
         with self._lock, self.connect() as db:
-            rows = db.execute(
-                "SELECT edge_seq,item_type,data_json FROM central_outbox ORDER BY edge_seq LIMIT ?",
-                (limit,),
-            ).fetchall()
-            return [
-                {"edge_seq": row["edge_seq"], "type": row["item_type"],
-                 "data": json.loads(row["data_json"])}
-                for row in rows
-            ]
+            return self._outbox_batch(db, limit)
+
+    def outbox_snapshot(self, limit: int) -> tuple[str, list[dict]]:
+        with self._lock, self.connect() as db:
+            return self._outbox_generation(db), self._outbox_batch(db, limit)
+
+    @staticmethod
+    def _outbox_batch(db, limit: int) -> list[dict]:
+        rows = db.execute(
+            "SELECT edge_seq,item_type,data_json FROM central_outbox ORDER BY edge_seq LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [{"edge_seq": row["edge_seq"], "type": row["item_type"],
+                 "data": json.loads(row["data_json"])} for row in rows]
 
     def acknowledge_outbox(self, edge_seq: int) -> int:
         with self._lock, self.connect() as db:
             cursor = db.execute("DELETE FROM central_outbox WHERE edge_seq <= ?", (edge_seq,))
             return cursor.rowcount
 
+    def outbox_generation(self) -> str:
+        with self._lock, self.connect() as db:
+            return self._outbox_generation(db)
+
+    @staticmethod
+    def _outbox_generation(db) -> str:
+        return db.execute("SELECT generation FROM central_outbox_stream WHERE singleton=1").fetchone()[0]
+
+    def acknowledge_confirmed_batch(self, generation: str, sequences: list[int]) -> int:
+        with self._lock, self.connect() as db:
+            if self._outbox_generation(db) != generation:
+                raise ValueError("outbox generation changed before acknowledgement")
+            result = db.executemany("DELETE FROM central_outbox WHERE edge_seq=?",
+                                    ((sequence,) for sequence in sequences))
+            return result.rowcount
+
     def outbox_size(self) -> int:
         with self._lock, self.connect() as db:
             return int(db.execute("SELECT COUNT(*) FROM central_outbox").fetchone()[0])
+
+    def outbox_health(self) -> dict:
+        with self._lock, self.connect() as db:
+            row = db.execute("SELECT COUNT(*) AS size, MIN(created_at) AS oldest FROM central_outbox").fetchone()
+            return {"outbox_size": row["size"], "outbox_oldest_at": row["oldest"],
+                    "outbox_pressure": row["size"] >= 10000}
 
     def save_pending_fence(self, fence: dict, timestamp: str) -> None:
         version = int(fence["version"])

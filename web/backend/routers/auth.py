@@ -108,7 +108,7 @@ async def login_route(data: LoginIn, request: Request, response: Response) -> di
         httponly=True,
         samesite="lax",
         path="/",
-        # secure=False: o MVP roda em HTTP na rede local. Ver o topo do módulo.
+        secure=request.url.scheme == "https",
     )
     logger.info("login accepted for user %s", settings.admin_user)
     return {"user": settings.admin_user, "authenticated": True}

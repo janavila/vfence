@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 
 PDR_SCHEMA = "vfence.gateway.pdr.v1"
+PDR_COMMIT_SCHEMA = "vfence.gateway.pdr.v2"
 PDR_KIND = "pdr_window_summary"
 _HEX_ID = re.compile(r"[0-9a-f]{16}")
 _REASONS = {"ok", "no_samples", "one_sample", "session_changed", "profile_changed", "discontinuity"}
@@ -33,7 +34,7 @@ class PdrSummary:
 
 
 def parse_pdr_summary(data: dict) -> PdrSummary:
-    if data.keys() != _FIELDS or data["schema"] != PDR_SCHEMA or data["kind"] != PDR_KIND:
+    if data.keys() != _FIELDS or data["schema"] not in (PDR_SCHEMA, PDR_COMMIT_SCHEMA) or data["kind"] != PDR_KIND:
         raise ValueError("contrato PDR invalido")
 
     for key in ("gatewaySessionId", "windowId", "collarSessionId"):

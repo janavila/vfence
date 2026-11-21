@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -86,6 +87,7 @@ def create_app(
     env_file: Path | None = DEFAULT_ENV_FILE,
     settings: Settings | None = None,
     log_to_file: bool = True,
+    property_id: str | None = None,
 ) -> FastAPI:
     """Monta e devolve a aplicação do Central.
 
@@ -133,13 +135,18 @@ def create_app(
         file_log = settings.log_file if log_to_file and not settings.uses_postgresql else None
         setup_logging(settings.log_level, file_log)
         await asyncio.to_thread(database.initialize)
+        if property_id is not None:
+            await asyncio.to_thread(database.bind_property, property_id, settings.base_id)
         await asyncio.to_thread(database.seed_from_settings, settings)
         logger.info(
             "central started (version=%s, database=%s)",
             __version__, database.backend,
         )
-        yield
-        logger.info("central stopping")
+        try:
+            yield
+        finally:
+            await hub.close()
+            logger.info("central stopping")
 
     app = FastAPI(
         title="VFence Central",
@@ -156,6 +163,7 @@ def create_app(
     # próximas fases leem de lá (via Request) em vez de usar variável
     # global, o que mantém dois apps de teste independentes um do outro.
     app.state.settings = settings
+    app.state.property_id = property_id
     app.state.db = database
     app.state.hub = hub
     # Calculado na primeira tentativa de login e reaproveitado (ver auth.py).
@@ -185,9 +193,10 @@ def create_app(
         """Devolve o usuário logado, ou None. Usada aqui e no /ws."""
         if not settings.auth_enabled:
             return settings.admin_user
-        return read_session_token(
+        user = read_session_token(
             request.cookies.get(SESSION_COOKIE, ""), settings.session_secret
         )
+        return user if user == settings.admin_user else None
 
     app.state.sessao_valida = sessao_valida
 
@@ -294,5 +303,14 @@ def create_app(
     return app
 
 
+def create_runtime_app():
+    configured = os.getenv("VFENCE_PROPERTIES_CONFIG")
+    if configured:
+        from backend.properties import create_property_app, load_properties
+
+        return create_property_app(load_properties(Path(configured), load_settings()))
+    return create_app()
+
+
 # O Uvicorn procura este nome: `uvicorn backend.main:app`.
-app = create_app()
+app = create_runtime_app()

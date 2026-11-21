@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class CollarOut(BaseModel):
@@ -23,7 +23,18 @@ class CollarOut(BaseModel):
     rssi: int | None = None
     snr: float | None = None
     last_seen: str | None = None
+    last_position_at: str | None = None
+    position_age_s: int | None = None
+    position_stale: bool = True
+    last_contact_at: str | None = None
+    gnss_status: str | None = None
+    link_status: str | None = None
+    confirmed_fence_version: int | None = None
     outdated: bool = False
+
+
+class AnimalLabelIn(BaseModel):
+    animal_label: str | None = Field(max_length=80)
 
 
 class TelemetryOut(BaseModel):

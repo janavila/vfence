@@ -517,10 +517,13 @@ def test_relato_de_versao_antiga_vai_para_o_log_sem_mexer_na_cerca_ativa(
     assert "late report confirmed" in client.get("/api/fences/1/log").text
 
 
-def test_relato_sobre_cerca_inexistente_e_ignorado(client, base_headers):
+def test_relato_sobre_cerca_inexistente_e_recusado_sem_ack(client, base_headers, database):
     resposta = relatar(client, base_headers, 1, status="confirmed", crc32="DA29321E", fence_version=99)
 
-    assert resposta.json() == {"acked_up_to": 1}  # o item foi recebido
+    assert resposta.status_code == 422
+    assert resposta.json() == {"detail": {"code": "unknown_fence", "edge_seq": 1}}
+    with database.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) AS n FROM edge_receipts").fetchone()["n"] == 0
 
 
 def test_cada_mudanca_de_entrega_vai_para_o_log_da_cerca(client, base_headers, cerca_criada):

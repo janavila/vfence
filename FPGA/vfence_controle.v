@@ -1,8 +1,6 @@
-// VFence - Unidade de Controle (UC)
-// Verilog-2001 / Quartus II 13.1
-// Uma instancia do nucleo representa UMA coleira.
-// A janela e encerrada por window_close (Raspberry/Nios), nao por clock FPGA.
-
+// VFence - Unidade de Controle (UC), votacao GLOBAL multicoleiras.
+// Verilog-2001 / Quartus II 13.1.
+// window_close vem do Raspberry/Nios ao fim da janela de cinco minutos.
 module vfence_controle (
     input  wire clk,
     input  wire reset_n,
@@ -10,18 +8,15 @@ module vfence_controle (
     input  wire window_close,
     input  wire result_ack,
     input  wire critical_next,
-
     output reg  process_sample,
     output reg  capture_normal,
     output reg  capture_critical,
     output reg  clear_window
 );
-
     localparam [1:0] ST_COLLECT = 2'd0,
                      ST_NORMAL  = 2'd1,
                      ST_CRITICO = 2'd2,
                      ST_RESULT  = 2'd3;
-
     reg [1:0] state, next_state;
 
     always @(posedge clk or negedge reset_n) begin
@@ -37,7 +32,6 @@ module vfence_controle (
         capture_normal   = 1'b0;
         capture_critical = 1'b0;
         clear_window     = 1'b0;
-
         case (state)
             ST_COLLECT: begin
                 if (sample_valid) begin
@@ -51,17 +45,15 @@ module vfence_controle (
                 end
             end
             ST_NORMAL: begin
-                // Um ciclo depois do fechamento: os contadores ja foram atualizados.
+                // O ultimo sample ja entrou nos registradores no clock anterior.
                 capture_normal = 1'b1;
                 next_state = ST_RESULT;
             end
             ST_CRITICO: begin
-                // O segundo PDR critico tem precedencia sobre o fechamento normal.
                 capture_critical = 1'b1;
                 next_state = ST_RESULT;
             end
             ST_RESULT: begin
-                // Resultado fica estavel ate o software confirmar a LEITURA.
                 if (result_ack) begin
                     clear_window = 1'b1;
                     next_state = ST_COLLECT;
