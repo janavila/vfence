@@ -142,6 +142,13 @@ COLLAR_IDS=COL01,COL02
 
 Não publique o `.env`.
 
+Com o Central no Vercel, use o **domínio de produção**:
+`CENTRAL_BASE_URL=https://vfence.vercel.app`. Não use o link de um deploy
+específico (`vfence-<hash>-vfence.vercel.app` ou `vfence-git-main-…`): esses
+links são protegidos por login do Vercel e o Raspberry receberia 401. Se o
+Central responder 503 (`database_unavailable`), o banco dele está fora do ar;
+o Monitor mantém a outbox e reenvia sozinho quando ele voltar.
+
 ## Execução no Raspberry
 
 ```bash

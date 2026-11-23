@@ -74,11 +74,19 @@ def setup_logging(level: str = "INFO", log_file: Path | None = None) -> None:
     console.setFormatter(formatter)
     handlers.append(console)
 
+    # Arquivo: opcional. Em disco somente-leitura (o deployment do Vercel,
+    # por exemplo) não ter arquivo de log não pode derrubar o servidor: o
+    # console continua e a falha fica registrada nele.
+    file_error: OSError | None = None
     if log_file is not None:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(log_file, encoding="utf-8")
-        file_handler.setFormatter(formatter)
-        handlers.append(file_handler)
+        try:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        except OSError as error:
+            file_error = error
+        else:
+            file_handler.setFormatter(formatter)
+            handlers.append(file_handler)
 
     root = logging.getLogger()
     for existing in list(root.handlers):
@@ -91,6 +99,12 @@ def setup_logging(level: str = "INFO", log_file: Path | None = None) -> None:
     for name in UVICORN_LOGGERS:
         for handler in logging.getLogger(name).handlers:
             handler.setFormatter(formatter)
+
+    if file_error is not None:
+        logging.getLogger("central").warning(
+            "log file disabled, console only (%s: %s)",
+            type(file_error).__name__, file_error.strerror or file_error,
+        )
 
 
 def _as_level(level: str) -> int:

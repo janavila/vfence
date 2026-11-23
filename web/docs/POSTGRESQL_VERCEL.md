@@ -118,6 +118,34 @@ inválido, rollback, concorrência de versão e persistência entre duas instân
 8. Confirme que `POST /api/edge/batch` responde `acked_up_to` e que telemetria,
    eventos e entregas aparecem no Central.
 
+## Quando o Central não abre no Vercel
+
+Desde 23/11/2026, banco fora do ar **não derruba mais o servidor**. As telas
+abrem, `GET /api/health` responde 200, e as demais rotas `/api/...` respondem
+`503 {"detail": "database_unavailable"}`. O Central tenta reconectar sozinho,
+no máximo a cada 5 s. Antes disso, qualquer falha na subida virava
+`500 FUNCTION_INVOCATION_FAILED` em todas as rotas, até no login.
+
+Para saber o motivo, abra **Logs** no projeto do Vercel e procure:
+
+| Linha no log | Significado | O que fazer |
+|---|---|---|
+| `db: database connection failed (host=..., error=..., sqlstate=...): ...` | o PostgreSQL recusou ou não respondeu; `host` diz o provedor e o texto final diz o porquê | ver abaixo |
+| `... password authentication failed ...` | usuário ou senha da `DATABASE_URL` não valem mais | gerar nova URL no provedor e atualizar a variável |
+| `... could not translate host name ...` / `... Name or service not known ...` | o servidor da URL não existe mais (projeto apagado ou URL errada) | conferir o projeto no provedor |
+| `... Tenant or user not found ...` / `... endpoint ... is disabled ...` | projeto pausado (Supabase gratuito pausa após 7 dias parado) ou suspenso (cota do Neon) | reativar o projeto no provedor |
+| `DATABASE_URL ausente: no Vercel o SQLite não tem onde gravar` | a variável não existe no ambiente daquele deploy | criar `DATABASE_URL` em **Production** |
+| `central started (..., UNAVAILABLE)` | o processo subiu, mas sem banco | resolver a causa acima; não precisa reiniciar |
+
+Depois de alterar qualquer variável no Vercel, faça **Redeploy**: o deploy só
+lê as variáveis quando é gerado.
+
+**Rollback esquecido.** Se uma correção enviada ao `main` "não aparece" em
+`vfence.vercel.app`, confira em *Overview* se a produção está num **Instant
+Rollback**. Enquanto ele estiver ativo, os deploys novos ficam como
+"Production · Staged" e o domínio continua no deploy antigo. Para sair do
+rollback, use **Promote to Production** no deploy mais novo.
+
 ## Garantias da implementação
 
 - Criação da cerca e de todos os pontos ocorre na mesma transação.
@@ -125,6 +153,11 @@ inválido, rollback, concorrência de versão e persistência entre duas instân
   desfaz a reivindicação e evita perda silenciosa.
 - A versão da cerca no PostgreSQL usa `pg_advisory_xact_lock`, impedindo duas
   instâncias de escolherem o mesmo `MAX(version) + 1`.
+- Com o schema já completo, a subida só **lê** o catálogo (`information_schema`
+  e `pg_indexes`) e não roda DDL nenhum. `CREATE INDEX` e `ALTER TABLE`, mesmo
+  com `IF NOT EXISTS`, travam a tabela; rodados a cada subida a frio, eles
+  disputavam `collars` e `telemetry` com o lote da Base e podiam entrar em
+  deadlock. Quando há o que migrar, a migração roda com `lock_timeout` de 10 s.
 - IDs automáticos usam `IDENTITY`; `edge_seq` usa `BIGINT`.
 - Datas continuam como texto ISO 8601 UTC e coordenadas continuam E6 para não
   alterar o contrato externo.

@@ -61,6 +61,13 @@ async def websocket_route(websocket: WebSocket) -> None:
         logger.info("websocket refused: no session")
         return
 
+    # Com o banco fora do ar não há retrato para mandar. 1013 é "tente
+    # mais tarde": o navegador segue na consulta a cada 5 s, que recebe
+    # 503 até o banco voltar (ver `exigir_banco` no main.py).
+    if not getattr(app.state, "db_ready", True):
+        await websocket.close(code=1013, reason="database_unavailable")
+        return
+
     active, bases = await asyncio.to_thread(lambda: (fence_service.active_version(db), _all_bases(db)))
     hello = {"type": "hello", "data": {
         "server_time": utc_now_iso(), "active_fence_version": active,

@@ -51,6 +51,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -60,7 +61,7 @@ from fastapi.staticfiles import StaticFiles
 
 from backend import __version__
 from backend.config import DEFAULT_ENV_FILE, PROJECT_DIR, Settings, load_settings
-from backend.db import Database
+from backend.db import Database, DatabaseConfigurationError, describe_connection_error
 from backend.errors import ApiError
 from backend.logging_setup import setup_logging
 from backend.security import SESSION_COOKIE, read_session_token
@@ -80,6 +81,9 @@ logger = logging.getLogger("central")
 FRONTEND_DIR = PROJECT_DIR / "frontend"
 STATIC_DIR = PROJECT_DIR / "static"
 LOGO_FILE = STATIC_DIR / "VFence.png"
+
+# Intervalo mínimo entre duas tentativas de preparar um banco indisponível.
+DB_RETRY_SECONDS = 5.0
 
 
 def create_app(
@@ -105,6 +109,60 @@ def create_app(
 
     database = Database(settings.database_target)
     hub = RealtimeHub()
+
+    def preparar_banco() -> None:
+        """Cria o schema, amarra a propriedade e cadastra Base e coleiras.
+
+        Tudo idempotente: pode rodar de novo a cada tentativa de reconexão.
+        """
+        database.initialize()
+        if property_id is not None:
+            database.bind_property(property_id, settings.base_id)
+        database.seed_from_settings(settings)
+
+    async def tentar_preparar_banco(*, config_fatal: bool) -> bool:
+        """Uma tentativa de deixar o banco pronto. Devolve se conseguiu.
+
+        **Por que uma falha aqui não derruba mais o servidor.** Antes, se o
+        PostgreSQL não respondesse na subida, o `lifespan` levantava a
+        exceção e o Uvicorn encerrava o processo. No Vercel isso virava
+        `500 FUNCTION_INVOCATION_FAILED` em TODAS as rotas — até a tela de
+        login, que nem usa o banco — e o produtor não via mensagem nenhuma.
+        Agora as telas continuam abrindo, a API responde 503
+        (`database_unavailable`, que o frontend já traduz para "O servidor
+        teve um problema. Tente de novo em instantes.") e a próxima
+        requisição tenta de novo, no máximo a cada `DB_RETRY_SECONDS`.
+
+        A exceção é o erro de CONFIGURAÇÃO na subida (driver ausente, banco
+        de uma propriedade já amarrado a outra): esse não se resolve
+        sozinho, e servir dados com ele seria pior do que não subir.
+        """
+        app.state.db_last_attempt = time.monotonic()
+        try:
+            await asyncio.to_thread(preparar_banco)
+        except DatabaseConfigurationError:
+            app.state.db_ready = False
+            if config_fatal:
+                raise
+            logger.exception("database configuration error; API answers 503")
+            return False
+        except Exception as error:  # noqa: BLE001 - qualquer falha vira 503, não queda
+            app.state.db_ready = False
+            dica = ""
+            if not settings.uses_postgresql and os.getenv("VERCEL"):
+                dica = " | DATABASE_URL ausente: no Vercel o SQLite não tem onde gravar"
+            logger.error(
+                "database unavailable (%s: %s); pages stay up, API answers 503 "
+                "and retries in %.0fs%s",
+                type(error).__name__,
+                describe_connection_error(error, settings.database_url or ""),
+                app.state.db_retry_s, dica,
+            )
+            return False
+        if not app.state.db_ready:
+            app.state.db_ready = True
+            logger.info("database available (backend=%s)", database.backend)
+        return True
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -134,13 +192,10 @@ def create_app(
         # deployment. Os logs ficam no stdout e são coletados pela plataforma.
         file_log = settings.log_file if log_to_file and not settings.uses_postgresql else None
         setup_logging(settings.log_level, file_log)
-        await asyncio.to_thread(database.initialize)
-        if property_id is not None:
-            await asyncio.to_thread(database.bind_property, property_id, settings.base_id)
-        await asyncio.to_thread(database.seed_from_settings, settings)
+        pronto = await tentar_preparar_banco(config_fatal=True)
         logger.info(
-            "central started (version=%s, database=%s)",
-            __version__, database.backend,
+            "central started (version=%s, database=%s, %s)",
+            __version__, database.backend, "ready" if pronto else "UNAVAILABLE",
         )
         try:
             yield
@@ -168,6 +223,13 @@ def create_app(
     app.state.hub = hub
     # Calculado na primeira tentativa de login e reaproveitado (ver auth.py).
     app.state.admin_password_hash = None
+    # Situação do banco (ver `tentar_preparar_banco`). Começa "não pronto":
+    # se a plataforma não rodar o `lifespan`, a primeira chamada à API
+    # prepara o banco do mesmo jeito.
+    app.state.db_ready = False
+    app.state.db_last_attempt = float("-inf")
+    app.state.db_retry_s = DB_RETRY_SECONDS
+    app.state.db_lock = asyncio.Lock()
 
     # ---- login: o que fica aberto e o que fica protegido ---------------
     #
@@ -199,6 +261,40 @@ def create_app(
         return user if user == settings.admin_user else None
 
     app.state.sessao_valida = sessao_valida
+
+    # Declarado ANTES do `exigir_sessao` de propósito: no FastAPI o último
+    # middleware declarado é o mais externo, então o login é conferido
+    # primeiro e quem não entrou recebe 401 sem tocar no banco.
+    @app.middleware("http")
+    async def exigir_banco(request: Request, call_next):
+        """Responde 503 na API enquanto o banco estiver indisponível.
+
+        Ficam de fora as páginas e arquivos (não usam o banco), o
+        `/api/health` (diz se o PROCESSO está no ar — ver health.py) e o
+        login (o usuário vem do `.env`, não do banco). Para o resto, cada
+        requisição pode disparar uma nova tentativa, uma de cada vez e no
+        máximo a cada `db_retry_s` segundos, para um banco fora do ar não
+        receber uma enxurrada de conexões.
+        """
+        path = request.url.path
+        if (
+            app.state.db_ready
+            or not path.startswith("/api/")
+            or path == "/api/health"
+            or path.startswith("/api/auth/")
+        ):
+            return await call_next(request)
+        async with app.state.db_lock:
+            espera = time.monotonic() - app.state.db_last_attempt
+            if not app.state.db_ready and espera >= app.state.db_retry_s:
+                await tentar_preparar_banco(config_fatal=False)
+        if app.state.db_ready:
+            return await call_next(request)
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "database_unavailable"},
+            headers={"Retry-After": str(max(1, round(app.state.db_retry_s)))},
+        )
 
     @app.middleware("http")
     async def exigir_sessao(request: Request, call_next):

@@ -3,6 +3,11 @@ VFENCE — DIAGNÓSTICO DO ENVIO DE CERCA NO VERCEL
 
 Data do diagnóstico: 15/10/2026
 
+>>> ATUALIZAÇÃO 23/11/2026: documento histórico. A migração para PostgreSQL
+>>> descrita como pendente abaixo foi feita em 16/10/2026. Para diagnosticar
+>>> o Central no Vercel hoje, use a seção "Quando o Central não abre no
+>>> Vercel" de web/docs/POSTGRESQL_VERCEL.md.
+
 1. PROBLEMA OBSERVADO
 ---------------------
 

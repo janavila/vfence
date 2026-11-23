@@ -21,12 +21,14 @@ pelo provedor.
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 import threading
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from backend.config import Settings
 from backend.security import hash_token
@@ -37,6 +39,11 @@ BACKEND_DIR = Path(__file__).resolve().parent
 SQLITE_SCHEMA_FILE = BACKEND_DIR / "schema.sql"
 POSTGRESQL_SCHEMA_FILE = BACKEND_DIR / "schema_postgresql.sql"
 FENCE_VERSION_LOCK_ID = 0x5646454E  # "VFEN", estável entre processos.
+
+# Colunas de monitoramento acrescentadas depois da primeira versão do schema.
+MONITORING_COLUMNS = ("gnss_status", "last_contact_at", "last_position_at", "link_status")
+_TABLE_NAME = re.compile(r"CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+(\w+)", re.IGNORECASE)
+_INDEX_NAME = re.compile(r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+(\w+)", re.IGNORECASE)
 
 
 class DatabaseError(RuntimeError):
@@ -62,6 +69,35 @@ def _schema_statements(script: str) -> Iterator[str]:
     for statement in "\n".join(lines).split(";"):
         if statement.strip():
             yield statement.strip()
+
+
+def _database_host(url: str) -> str:
+    """Só o servidor da URL: diz qual provedor é sem expor credenciais."""
+    try:
+        return urlsplit(url).hostname or "-"
+    except ValueError:
+        return "-"
+
+
+def describe_connection_error(error: BaseException, url: str) -> str:
+    """Resume a falha do driver sem a URL e sem a senha.
+
+    A mensagem do libpq é o que diz POR QUE a conexão falhou (senha
+    recusada, servidor inexistente, projeto suspenso, tempo esgotado). Sem
+    ela, o log do Vercel mostrava só "database connection failed" e não
+    havia como saber se o problema era a variável ou o provedor.
+    """
+    text = " ".join(str(error).split())
+    try:
+        password = urlsplit(url).password
+    except ValueError:
+        password = None
+    # Só segredos não vazios: `str.replace("", ...)` poria "***" entre
+    # todas as letras da mensagem (SQLite, por exemplo, não tem URL).
+    for secret in (url, password):
+        if secret:
+            text = text.replace(secret, "***")
+    return text[:300] or type(error).__name__
 
 
 class _PostgresConnection:
@@ -130,8 +166,17 @@ class Database:
                 connect_timeout=10,
                 prepare_threshold=None,
             )
-        except psycopg.Error:
+        except psycopg.Error as error:
             # A URL pode conter usuário e senha; nunca propagamos seu conteúdo.
+            # A exceção pública continua genérica; o log leva o motivo, já
+            # sem a URL e sem a senha, e o servidor (que identifica o provedor).
+            logger.error(
+                "database connection failed (host=%s, error=%s, sqlstate=%s): %s",
+                _database_host(self.database_url or ""),
+                type(error).__name__,
+                getattr(error, "sqlstate", None) or "-",
+                describe_connection_error(error, self.database_url or ""),
+            )
             raise DatabaseConnectionError("database connection failed") from None
 
     @contextmanager
@@ -177,6 +222,15 @@ class Database:
         if self.is_postgresql:
             script = POSTGRESQL_SCHEMA_FILE.read_text(encoding="utf-8")
             with self.connect() as conn:
+                if self._postgres_schema_ready(conn, script):
+                    logger.info("database ready (backend=postgresql, schema up to date)")
+                    return
+                # Só chega aqui no primeiro deploy ou depois de mudança no
+                # schema. O limite de espera impede que uma subida fique
+                # presa atrás de um lote longo da Base: se estourar, a
+                # inicialização falha, a aplicação continua no ar e tenta
+                # de novo na próxima requisição (ver main.py).
+                conn.execute("SET LOCAL lock_timeout = '10s'")
                 conn.execute("SELECT pg_advisory_xact_lock(hashtext('vfence_schema_init'))")
                 for statement in _schema_statements(script):
                     conn.execute(statement)
@@ -190,25 +244,59 @@ class Database:
                 conn.execute("PRAGMA optimize")
         logger.info("database ready (backend=%s)", self.backend)
 
-    def _migrate_monitoring(self, conn) -> None:
-        columns = {
-            "last_position_at", "last_contact_at", "gnss_status", "link_status",
-        }
-        if self.is_postgresql:
-            for column in sorted(columns):
-                conn.execute(f"ALTER TABLE collars ADD COLUMN IF NOT EXISTS {column} TEXT")
-        else:
-            existing = {row["name"] for row in conn.execute("PRAGMA table_info(collars)")}
-            for column in sorted(columns - existing):
-                conn.execute(f"ALTER TABLE collars ADD COLUMN {column} TEXT")
-        conn.execute(
-            """UPDATE collars SET last_position_at=(
-                 SELECT ts FROM telemetry WHERE telemetry.collar_id=collars.collar_id
-                 AND lat IS NOT NULL AND lon IS NOT NULL AND COALESCE(zone,'')<>'GNSS_INVALIDO'
-                 ORDER BY id DESC LIMIT 1
-               ) WHERE last_position_at IS NULL AND last_lat IS NOT NULL AND last_lon IS NOT NULL"""
+    def _postgres_schema_ready(self, conn, script: str) -> bool:
+        """Confere, só lendo o catálogo, se tabelas, índices e colunas já existem.
+
+        `CREATE ... IF NOT EXISTS` parece inofensivo, mas `CREATE INDEX`
+        trava a tabela em modo SHARE e `ALTER TABLE` em ACCESS EXCLUSIVE
+        mesmo quando nada muda. No Vercel isso roda a cada subida a frio e
+        disputava `telemetry` e `collars` com o lote da Base, que trava as
+        duas na ordem inversa — receita de deadlock. Ler o catálogo não
+        trava tabela nenhuma.
+        """
+        tables = {row["name"] for row in conn.execute(
+            "SELECT table_name AS name FROM information_schema.tables "
+            "WHERE table_schema = current_schema()"
+        )}
+        indexes = {row["name"] for row in conn.execute(
+            "SELECT indexname AS name FROM pg_indexes WHERE schemaname = current_schema()"
+        )}
+        return (
+            set(_TABLE_NAME.findall(script)) <= tables
+            and set(_INDEX_NAME.findall(script)) <= indexes
+            and set(MONITORING_COLUMNS) <= self._collar_columns(conn)
         )
-        conn.execute("UPDATE collars SET last_contact_at=last_seen WHERE last_contact_at IS NULL")
+
+    def _collar_columns(self, conn) -> set[str]:
+        if self.is_postgresql:
+            rows = conn.execute(
+                "SELECT column_name AS name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = 'collars'"
+            )
+        else:
+            rows = conn.execute("PRAGMA table_info(collars)")
+        return {row["name"] for row in rows}
+
+    def _migrate_monitoring(self, conn) -> None:
+        """Acrescenta as colunas de monitoramento que faltarem.
+
+        O preenchimento a partir do histórico só roda quando a coluna acabou
+        de nascer: depois disso, toda gravação de telemetria já mantém as
+        duas colunas, e repetir os UPDATEs a cada subida só travaria linhas.
+        """
+        added = [c for c in MONITORING_COLUMNS if c not in self._collar_columns(conn)]
+        for column in added:
+            conn.execute(f"ALTER TABLE collars ADD COLUMN {column} TEXT")
+        if "last_position_at" in added:
+            conn.execute(
+                """UPDATE collars SET last_position_at=(
+                     SELECT ts FROM telemetry WHERE telemetry.collar_id=collars.collar_id
+                     AND lat IS NOT NULL AND lon IS NOT NULL AND COALESCE(zone,'')<>'GNSS_INVALIDO'
+                     ORDER BY id DESC LIMIT 1
+                   ) WHERE last_lat IS NOT NULL AND last_lon IS NOT NULL"""
+            )
+        if "last_contact_at" in added:
+            conn.execute("UPDATE collars SET last_contact_at=last_seen")
 
     def next_fence_version(self, conn) -> int:
         """Reserva com segurança a próxima versão dentro da transação atual."""

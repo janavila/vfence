@@ -27,7 +27,7 @@ def test_current_gnss_history_and_label_remain_independent(client, base_headers)
     assert client.get("/api/events", params={"collar_id": "COL01"}).json()[0]["kind"] == "collar_offline"
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_central_broadcast_is_bounded_and_does_not_wait_for_slow_websocket(monkeypatch):
     from backend.services import realtime
     monkeypatch.setattr(realtime, "_QUEUE_SIZE", 2)
