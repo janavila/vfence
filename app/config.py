@@ -19,7 +19,7 @@ class Settings:
     database_url: str = os.getenv("DATABASE_URL", "sqlite:///./vfence.db")
     mock_serial: bool = _as_bool(os.getenv("VFENCE_MOCK_SERIAL"), False)
     reconnect_seconds: float = float(os.getenv("SERIAL_RECONNECT_SECONDS", "3"))
-    collar_offline_seconds: int = int(os.getenv("COLLAR_OFFLINE_SECONDS", "30"))
+    collar_offline_seconds: int = int(os.getenv("COLLAR_OFFLINE_SECONDS", "180"))
     max_line_length: int = int(os.getenv("MAX_LINE_LENGTH", "512"))
     mock_interval_seconds: float = float(os.getenv("MOCK_INTERVAL_SECONDS", "3"))
     central_sync_enabled: bool = _as_bool(os.getenv("CENTRAL_SYNC_ENABLED"), False)

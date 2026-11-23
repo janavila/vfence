@@ -7,7 +7,7 @@ import re
 import sqlite3
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from functools import partial
 from heapq import heapify
@@ -146,6 +146,10 @@ class SerialReader:
         self._fence_collar_id: int | None = None
         self._fence_version: int | None = None
         self.collar_status: dict[int, dict] = {}
+        self.collar_contacts: dict[str, dict] = {}
+        self.collar_gnss: dict[str, dict] = {}
+        self.last_response_at: str | None = None
+        self.connection_error_kind: str | None = None
         self.gateway_state: dict | None = None
         self.radio_config: dict | None = None
         self.effective_profile: dict | None = None
@@ -385,10 +389,13 @@ class SerialReader:
                 except Exception as exc:
                     self._diagnostic("[BASE] USB | falha ao desativar DTR/RTS: %s", type(exc).__name__)
                 self._connection = connection
+                self.last_response_at = None
+                self.collar_contacts.clear()
                 self.effective_profile = None
                 self._serial_needs_separator = connection
                 self.state.status = "online"
                 self.state.error = None
+                self.connection_error_kind = None
                 logger.info("%s", base_block(
                     "USB / GATEWAY",
                     f"Porta: {self.config.serial_port} | Baud: {self.config.serial_baud}",
@@ -434,6 +441,7 @@ class SerialReader:
                                                        datetime.now(timezone.utc).isoformat(), str(exc)[:500]))
                 self.state.status = "offline"
                 self.state.error = str(exc)
+                self.connection_error_kind = "storage" if isinstance(exc, sqlite3.Error) else "serial"
                 await self.hub.broadcast(
                     {"type": "gateway", "data": self.as_dict()}
                 )
@@ -524,7 +532,7 @@ class SerialReader:
                             priority = _CRITICAL_EVENT_PRIORITY
                             kind = name.upper()
                     admitted = await self._submit_work(
-                        partial(self._process_gateway_app, app_packet), priority=priority,
+                        partial(self._process_gateway_app, app_packet, datetime.now(timezone.utc)), priority=priority,
                         description=f"[{collar_label(app_packet.get('collarId'))}] tipo={kind}",
                     )
             else:
@@ -540,6 +548,8 @@ class SerialReader:
                     partial(self._save_and_broadcast, packet),
                     description=f"[{collar_label(packet.collar_id)}] tipo={packet.type}",
                 )
+            if admitted and app_packet is not None and app_packet["kind"] != "telemetry":
+                self.last_response_at = datetime.now(timezone.utc).isoformat()
             return _LineResult.ACCEPTED if admitted else _LineResult.REFUSED
         except ProtocolError as exc:
             if not at_timeout:
@@ -570,6 +580,14 @@ class SerialReader:
         )
         self.state.last_message = packet.raw_message
         self.state.last_seen = datetime.now(timezone.utc).isoformat()
+        self.last_response_at = self.state.last_seen
+        if packet.type == "POS":
+            observed = packet.timestamp.isoformat()
+            previous = self.collar_contacts.get(packet.collar_id, {})
+            if observed >= previous.get("observed_at", ""):
+                self.collar_contacts[packet.collar_id] = {
+                    "state": "online", "last_contact_at": observed, "observed_at": observed,
+                }
         gps_valid = False if packet.zone == "GNSS_INVALIDO" else (
             True if packet.latitude is not None and packet.longitude is not None else None
         )
@@ -591,7 +609,7 @@ class SerialReader:
                 ))
         await self.hub.broadcast({
             "type": "telemetry", "data": packet.as_dict(),
-            "collar": collar, "event": event,
+            "collar": self.collar_snapshot(collar), "event": event, "gateway": self.as_dict(),
         })
 
     @staticmethod
@@ -670,9 +688,27 @@ class SerialReader:
         data["kind"] = kind
         return data
 
-    def _telemetry_packet(self, data: dict, line: str) -> ParsedPacket:
-        gps_valid = bool(data.get("gpsValid"))
-        inside = bool(data.get("inside"))
+    def _telemetry_packet(self, data: dict, line: str, received_at: datetime | None = None) -> ParsedPacket:
+        collar_id, sequence = data["collarId"], data["sequence"]
+        if type(collar_id) is not int or not 1 <= collar_id <= 254:
+            raise ValueError("invalid telemetry collar ID")
+        if type(sequence) is not int or not 0 <= sequence <= 65535:
+            raise ValueError("invalid telemetry sequence")
+        for field in ("gpsValid", "inside", "near", "veryNear"):
+            if field in data and type(data[field]) is not bool:
+                raise ValueError("invalid telemetry flag")
+
+        def number(field, minimum, maximum, *, integer=False):
+            value = data.get(field)
+            types = (int,) if integer else (int, float)
+            if value is not None and (type(value) not in types or not minimum <= value <= maximum):
+                raise ValueError("invalid telemetry measurement")
+            return value
+
+        latitude = number("latitude", -90, 90)
+        longitude = number("longitude", -180, 180)
+        gps_valid = data.get("gpsValid") is True
+        inside = data.get("inside") is True
         if not gps_valid:
             zone = "GNSS_INVALIDO"
         elif not inside:
@@ -685,23 +721,23 @@ class SerialReader:
             zone = "SEGURO"
         return ParsedPacket(
             version="GATEWAY_V1",
-            collar_id=self._collar_name(data["collarId"]),
+            collar_id=self._collar_name(collar_id),
             type="POS",
-            timestamp=datetime.now(timezone.utc),
+            timestamp=received_at or datetime.now(timezone.utc),
             raw_message=line,
-            latitude=data.get("latitude"),
-            longitude=data.get("longitude"),
+            latitude=latitude if gps_valid else None,
+            longitude=longitude if gps_valid else None,
             zone=zone,
-            satellites=data.get("satellites"),
-            hdop=data.get("hdop"),
-            rssi=data.get("rssi"),
-            snr=data.get("snr"),
-            sequence=int(data["sequence"]),
-            battery_pct=data.get("battery"),
-            fence_version=data.get("fenceVersion"),
+            satellites=number("satellites", 0, 254, integer=True) if gps_valid else None,
+            hdop=number("hdop", 0, 655.34) if gps_valid else None,
+            rssi=number("rssi", -1e6, 1e6),
+            snr=number("snr", -1e6, 1e6),
+            sequence=sequence,
+            battery_pct=number("battery", 0, 100, integer=True),
+            fence_version=number("fenceVersion", 0, 65535, integer=True),
         )
 
-    async def _process_gateway_app(self, data: dict) -> bool:
+    async def _process_gateway_app(self, data: dict, received_at: datetime | None = None) -> bool:
         kind = data["kind"]
         if self.terminal_detail and kind != "telemetry":
             self._diagnostic("[RAW GATEWAY] %s", json.dumps(gateway_log_snapshot(data), separators=(",", ":")))
@@ -725,6 +761,7 @@ class SerialReader:
                 self._telemetry_packet(
                     data,
                     "[APP] " + json.dumps(data, separators=(",", ":")),
+                    received_at,
                 )
             )
             return True
@@ -813,7 +850,27 @@ class SerialReader:
         elif kind == "radio_config":
             self.radio_config = dict(data)
 
+        if kind in {"collar_state", "collar_status", "offline"} and type(data.get("collarId")) is int:
+            self._record_collar_contact(data, received_at or datetime.now(timezone.utc))
         return await self._process_gateway_event(data)
+
+    def _record_collar_contact(self, data: dict, received_at: datetime) -> None:
+        collar_id = data["collarId"]
+        state = "offline" if data["kind"] == "offline" else str(data.get("state", "")).lower()
+        if not 1 <= collar_id <= 254 or state not in {"online", "offline"}:
+            return
+        name = self._collar_name(collar_id)
+        previous = self.collar_contacts.get(name, {})
+        observed = received_at.isoformat()
+        if observed < previous.get("observed_at", ""):
+            return
+        last_contact = previous.get("last_contact_at")
+        age = data.get("lastSeenS")
+        if type(age) is int and 0 <= age <= 0xFFFFFFFF:
+            last_contact = (received_at - timedelta(seconds=age)).isoformat()
+        elif state == "online":
+            last_contact = observed
+        self.collar_contacts[name] = {"state": state, "last_contact_at": last_contact, "observed_at": observed}
 
     async def _process_metric_summary(self, data: dict) -> bool:
         setting = "metrics_installation_id" if data["kind"] == HDOP_SUMMARY_KIND else "metrics_gateway_id"
@@ -970,6 +1027,8 @@ class SerialReader:
         if not inserted:
             logger.info("[BASE][%s] EVENTO | Duplicata ja persistida", collar_label(collar_id))
             return True
+        if collar_id and event_kind in {"gps_lost", "gps_recovered"}:
+            self.collar_gnss[collar_id] = {"type": event_kind, "at": timestamp}
         log = logger.warning if name in ALERT_EVENTS else logger.info
         log("%s", base_event(
             collar_id, safe_name, source="Gateway",
@@ -1164,12 +1223,26 @@ class SerialReader:
                 self._fence_collar_id = None
                 self._fence_version = None
 
+    def collar_snapshot(self, data: dict) -> dict:
+        name = data["collar_id"]
+        return {**data, "contact": self.collar_contacts.get(name), "gnss_event": self.collar_gnss.get(name)}
+
     def as_dict(self):
         return {
             "status": self.state.status,
+            "as_of": datetime.now(timezone.utc).isoformat(),
+            "serial_open": self._connection is not None and self.state.status == "online",
+            "last_response_at": self.last_response_at if self.state.status == "online" and not self.config.mock_serial else None,
+            "freshness_seconds": getattr(self.config, "collar_offline_seconds", 180),
             "serial_port": self.state.serial_port,
             "last_message": self.state.last_message,
             "last_seen": self.state.last_seen,
             "error": self.state.error,
+            "error_kind": self.connection_error_kind,
             "mock": self.config.mock_serial,
+            "commit_config": {
+                "metrics": getattr(self.config, "metrics_serial_ack_enabled", False),
+                "events": getattr(self.config, "event_serial_commit_enabled", False),
+                "pdr": getattr(self.config, "pdr_serial_commit_enabled", False),
+            },
         }

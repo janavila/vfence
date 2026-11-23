@@ -398,17 +398,60 @@ class Database:
                         "ts": stamp,
                         "detail": f"{old_zone or 'none'}->{packet.zone}",
                     }, stamp)
-            collar = dict(db.execute("SELECT * FROM collars WHERE collar_id = ?", (packet.collar_id,)).fetchone())
+            collar = self._collar_snapshots(db, packet.collar_id)[0]
             return collar, event
+
+    @staticmethod
+    def _collar_snapshots(db, collar_id=None):
+        # The legacy summary retains non-null values. Keep the latest sample
+        # and last valid fix separate so consumers can report their provenance.
+        where = "" if collar_id is None else "WHERE c.collar_id = ?"
+        rows = db.execute(f"""
+            SELECT c.*, t.timestamp AS position_at, t.latitude AS position_lat,
+                t.longitude AS position_lon, t.zone AS position_zone,
+                t.satellites AS position_satellites, t.hdop AS position_hdop,
+                t.rssi AS position_rssi, t.snr AS position_snr, t.sequence AS position_sequence,
+                t.raw_message AS position_raw, f.timestamp AS fix_at,
+                f.latitude AS fix_lat, f.longitude AS fix_lon
+            FROM collars c
+            LEFT JOIN telemetry t ON t.id = (SELECT id FROM telemetry WHERE collar_id = c.collar_id
+                ORDER BY timestamp DESC, id DESC LIMIT 1)
+            LEFT JOIN telemetry f ON f.id = (SELECT id FROM telemetry WHERE collar_id = c.collar_id
+                AND zone IS NOT NULL AND zone != 'GNSS_INVALIDO'
+                AND latitude BETWEEN -90 AND 90 AND longitude BETWEEN -180 AND 180
+                ORDER BY timestamp DESC, id DESC LIMIT 1)
+            {where} ORDER BY c.collar_id
+            """, () if collar_id is None else (collar_id,))
+        snapshots = []
+        for row in rows:
+            data = dict(row)
+            raw = data.pop("position_raw")
+            fields = ("at", "lat", "lon", "zone", "satellites", "hdop", "rssi", "snr", "sequence")
+            position = {key: data.pop(f"position_{key}") for key in fields}
+            if raw and raw.startswith("[APP] "):
+                try:
+                    report = json.loads(raw[6:])
+                except ValueError:
+                    report = {}
+                if isinstance(report, dict):
+                    for source, target, maximum in (("battery", "battery_pct", 100),
+                                                     ("fenceVersion", "fence_version", 65535),
+                                                     ("distanceBorderM", "distance_border_m", 65534)):
+                        value = report.get(source)
+                        if type(value) is int and 0 <= value <= maximum:
+                            position[target] = value
+            fix = {key: data.pop(f"fix_{key}") for key in ("at", "lat", "lon")}
+            snapshots.append({**data, "position": position if position["at"] else None,
+                              "last_fix": fix if fix["at"] else None})
+        return snapshots
 
     def list_collars(self):
         with self._lock, self.connect() as db:
-            return [dict(row) for row in db.execute("SELECT * FROM collars ORDER BY collar_id").fetchall()]
+            return self._collar_snapshots(db)
 
     def get_collar(self, collar_id: str):
         with self._lock, self.connect() as db:
-            row = db.execute("SELECT * FROM collars WHERE collar_id = ?", (collar_id,)).fetchone()
-            return dict(row) if row else None
+            return next(iter(self._collar_snapshots(db, collar_id)), None)
 
     def telemetry(self, collar_id: str, limit: int = 100):
         with self._lock, self.connect() as db:
@@ -419,7 +462,7 @@ class Database:
     def events(self, limit: int = 100):
         with self._lock, self.connect() as db:
             return [dict(row) for row in db.execute(
-                "SELECT * FROM events ORDER BY timestamp DESC LIMIT ?", (limit,)).fetchall()]
+                "SELECT * FROM events ORDER BY timestamp DESC, id DESC LIMIT ?", (limit,)).fetchall()]
 
     def save_gateway_event(self, kind: str, *, timestamp: str, collar_id: str | None,
                            payload: dict, enqueue_for_central: bool) -> bool:

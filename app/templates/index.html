@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#f4f5f6">
   <title>VFence Monitor v1.0</title>
-  <link rel="stylesheet" href="/static/css/style.css?v=6">
+  <link rel="stylesheet" href="/static/css/style.css?v=8">
   <link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css">
 </head>
 <body>
@@ -13,7 +13,7 @@
     <div class="header-inner">
       <div class="brand"><span class="brand-symbol">VF</span><div><h1>VFence Monitor</h1><span>v1.0</span></div></div>
       <nav class="primary-nav" aria-label="Navegação principal"><a href="/" class="active">Monitoramento</a><a href="/fences">Cercas</a></nav>
-      <span id="connection" class="connection"><i></i> Conectando</span>
+      <span id="connection" class="connection" role="status"><i></i> Conectando</span>
     </div>
   </header>
 
@@ -24,43 +24,44 @@
     </div>
 
     <section class="metrics-grid" aria-label="Resumo operacional">
-      <article class="metric-card"><span>Gateway</span><strong id="gateway-status" class="status-pill offline">Offline</strong><small>Conexão com o receptor</small></article>
-      <article class="metric-card"><span>Unidades monitoradas</span><strong id="collar-count" class="metric-value mono">00</strong><small>Coleiras com telemetria</small></article>
-      <article class="metric-card"><span>Em atenção</span><strong id="alert-count" class="metric-value mono">00</strong><small>Atenção ou estado crítico</small></article>
-      <article class="metric-card"><span>Fora da área</span><strong id="outside-count" class="metric-value mono">00</strong><small>Ocorrências atuais</small></article>
+      <article class="metric-card"><span>Gateway</span><strong id="gateway-status" class="status-pill">—</strong><small id="gateway-detail">Aguardando consulta</small></article>
+      <article class="metric-card"><span>Unidades monitoradas</span><strong id="collar-count" class="metric-value mono">—</strong><small id="collar-detail">Contato recente</small></article>
+      <article class="metric-card"><span>Em atenção</span><strong id="alert-count" class="metric-value mono">—</strong><small>Atenção ou crítico com posição recente</small></article>
+      <article class="metric-card"><span>Fora da área</span><strong id="outside-count" class="metric-value mono">—</strong><small>Saídas confirmadas pela zona recente</small></article>
     </section>
 
     <section class="system-line" aria-label="Dados técnicos do gateway">
       <div><span>Interface</span><strong id="serial-port" class="mono">—</strong></div>
-      <div><span>Último pacote</span><strong id="last-message" class="mono">Sem dados</strong></div>
+      <div><span>Última telemetria persistida</span><strong id="last-message" class="mono">—</strong></div>
     </section>
 
     <section class="fence-line" aria-label="Sincronização da cerca">
-      <div><span>Central</span><strong id="central-status">Desativado</strong></div>
+      <div><span>Central</span><strong id="central-status">—</strong></div>
       <div><span>Cerca desejada</span><strong id="fence-desired" class="mono">—</strong></div>
       <div><span>Cerca local</span><strong id="fence-local" class="mono">—</strong></div>
-      <div><span>Estado</span><strong id="fence-status">Sem cerca</strong></div>
+      <div><span>Versão confirmada</span><strong id="fence-confirmed" class="mono">—</strong></div>
+      <div><span>Estado</span><strong id="fence-status">—</strong></div>
       <div><span>Vértices</span><strong id="fence-points" class="mono">0</strong></div>
     </section>
 
     <section class="monitor-grid">
       <article class="panel map-panel">
-        <div class="panel-heading"><div><h3>Posicionamento</h3><p>Cerca local e última localização recebida por unidade</p></div><span id="map-state">Sem cerca local</span></div>
+        <div class="panel-heading"><div><h3>Posicionamento</h3><p>Cerca local e posições com fix recente</p></div><span id="map-state">—</span></div>
         <div id="map"><div class="map-fallback"><strong>Mapa indisponível</strong><span>Coordenadas disponíveis na tabela</span></div></div>
       </article>
       <article class="panel events-panel">
-        <div class="panel-heading"><div><h3>Eventos recentes</h3><p>Alertas da coleira e transições de zona</p></div></div>
-        <div class="events-table-wrap"><table class="events-table"><thead><tr><th>Horário</th><th>Unidade</th><th>Transição</th></tr></thead><tbody id="events"><tr class="empty-row"><td colspan="3">Sem eventos registrados</td></tr></tbody></table></div>
+        <div class="panel-heading"><div><h3>Eventos recentes</h3><p>Histórico gravado na Base · horário de Brasília</p></div></div>
+        <div class="events-table-wrap"><table class="events-table"><thead><tr><th>Data e hora</th><th>Unidade</th><th>Evento</th></tr></thead><tbody id="events"><tr class="empty-row"><td colspan="3">Carregando eventos…</td></tr></tbody></table></div>
       </article>
     </section>
 
     <section class="panel units-panel">
-      <div class="panel-heading"><div><h3>Unidades</h3><p>Estado atual e qualidade da telemetria</p></div></div>
-      <div class="table-scroll"><table class="units-table"><thead><tr><th>ID</th><th>Estado</th><th>Latitude</th><th>Longitude</th><th>Sat.</th><th>HDOP</th><th>RSSI</th><th>SNR</th><th>Sequência</th><th>Atualização</th></tr></thead><tbody id="collars" aria-live="polite"><tr class="empty-row"><td colspan="10">Sem telemetria disponível</td></tr></tbody></table></div>
+      <div class="panel-heading"><div><h3>Unidades</h3><p>Última amostra por unidade · selecione o ID para ver as médias</p></div></div>
+      <div class="table-scroll"><table class="units-table"><thead><tr><th>ID</th><th>Estado</th><th>Latitude</th><th>Longitude</th><th>Sat.</th><th>HDOP</th><th>RSSI</th><th>SNR</th><th>Sequência</th><th>Recepção</th></tr></thead><tbody id="collars"><tr class="empty-row"><td colspan="10">Carregando telemetria…</td></tr></tbody></table></div>
     </section>
   </main>
 
   <script src="/static/vendor/leaflet/leaflet.js"></script>
-  <script src="/static/js/app.js?v=6"></script>
+  <script src="/static/js/app.js?v=8"></script>
 </body>
 </html>

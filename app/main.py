@@ -179,7 +179,8 @@ async def fence_state():
 
 @app.get("/api/collars")
 async def collars():
-    return await asyncio.to_thread(database.list_collars)
+    rows = await asyncio.to_thread(database.list_collars)
+    return [reader.collar_snapshot(row) for row in rows]
 
 
 @app.get("/api/collars/{collar_id}")
@@ -187,7 +188,7 @@ async def collar(collar_id: str):
     result = await asyncio.to_thread(database.get_collar, collar_id)
     if result is None:
         raise HTTPException(status_code=404, detail="collar_not_found")
-    return result
+    return reader.collar_snapshot(result)
 
 
 @app.get("/api/collars/{collar_id}/telemetry")
