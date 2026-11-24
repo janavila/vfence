@@ -28,6 +28,9 @@ const profileName = value => between(value, 0, 3) ? `P${value}` : EMPTY;
 const display = (value, unit = '') => Number.isFinite(value) ? `${number.format(value / 100)}${unit}` : EMPTY;
 
 let collars = [];
+let positionCollars = [];
+let metricCollars = [];
+let manualSelection = null;
 let gateway = null;
 let linkMetrics = null;
 let pdr = null;
@@ -53,13 +56,72 @@ function showDetails(id, values) {
 }
 
 function collarNumber(id) {
-  const match = /^COL(\d{2,3})$/.exec(id);
+  const match = /^COL\s*(\d{1,3})$/.exec(id);
   const value = match ? Number(match[1]) : null;
-  return between(value, 1, 254) && id === `COL${String(value).padStart(2, '0')}` ? value : null;
+  return between(value, 1, 254) ? value : null;
 }
+
+const collarName = id => `COL${String(id).padStart(2, '0')}`;
 
 function selectedUnit() {
   return collars.find(collar => collar.collar_id === selector.value);
+}
+
+function refreshCollarList() {
+  const byNumber = new Map();
+  for (const unit of positionCollars) {
+    const id = collarNumber(unit?.collar_id);
+    if (id != null) byNumber.set(id, {...unit, collar_id: collarName(id)});
+  }
+  for (const unit of metricCollars) {
+    const id = unit?.collar_id;
+    if (between(id, 1, 254)) {
+      byNumber.set(id, {
+        collar_id: collarName(id), ...byNumber.get(id), latest_persisted: unit.latest_persisted,
+      });
+    }
+  }
+  collars = [...byNumber.entries()].sort(([a], [b]) => a - b).map(([, unit]) => unit);
+}
+
+function latestCommit(unit, kinds) {
+  return Math.max(0, ...kinds.map(kind => Date.parse(unit.latest_persisted?.[kind]) || 0));
+}
+
+function selectDefaultCollar() {
+  if (collars.some(unit => unit.collar_id === manualSelection)) return manualSelection;
+  const linkKinds = ['hdop', 'radio'];
+  const latest = [...collars].sort((a, b) =>
+    latestCommit(b, linkKinds) - latestCommit(a, linkKinds) ||
+    latestCommit(b, ['pdr']) - latestCommit(a, ['pdr']) ||
+    (Date.parse(b.contact?.last_contact_at) || 0) - (Date.parse(a.contact?.last_contact_at) || 0)
+  )[0];
+  const current = selectedUnit();
+  if (current && latestCommit(current, linkKinds)) return current.collar_id;
+  return latest?.collar_id ?? '';
+}
+
+function renderCollarCards() {
+  const cards = byId('fpga-cards');
+  const focused = document.activeElement?.dataset.collar;
+  const buttons = collars.map(unit => {
+    const button = element('button', '', 'fpga-panel fpga-collar-card');
+    button.type = 'button';
+    button.dataset.collar = unit.collar_id;
+    button.setAttribute('aria-pressed', String(unit.collar_id === selector.value));
+    button.append(element('strong', unit.collar_id));
+    for (const [kind, label] of [['hdop', 'HDOP'], ['radio', 'RADIO'], ['pdr', 'PDR']]) {
+      const stamp = unit.latest_persisted?.[kind];
+      button.append(element('small', `${label} · ${stamp ? date(stamp) : 'Sem registro'}`));
+    }
+    button.addEventListener('click', () => {
+      selector.value = unit.collar_id;
+      selectCollar();
+    });
+    return button;
+  });
+  cards.replaceChildren(...(buttons.length ? buttons : [element('p', 'Nenhuma coleira disponível.', 'fpga-empty')]));
+  buttons.find(button => button.dataset.collar === focused)?.focus({preventScroll: true});
 }
 
 function renderUnit() {
@@ -274,27 +336,32 @@ async function refreshOverview() {
   if (overviewPending || document.hidden) return;
   overviewPending = true;
   try {
-    const [units, gatewayResponse] = await Promise.allSettled([
-      getJson('/api/collars'), getJson('/api/gateway'),
+    const [units, summaries, gatewayResponse] = await Promise.allSettled([
+      getJson('/api/collars'), getJson('/api/fpga/collars'), getJson('/api/gateway'),
     ]);
     const unitsOk = units.status === 'fulfilled' && Array.isArray(units.value);
+    const summariesOk = summaries.status === 'fulfilled' && Array.isArray(summaries.value);
     const gatewayOk = gatewayResponse.status === 'fulfilled' && gatewayResponse.value &&
       typeof gatewayResponse.value.mock === 'boolean';
-    overviewFailed = !unitsOk || !gatewayOk;
-    if (unitsOk) {
+    overviewFailed = !unitsOk || !summariesOk || !gatewayOk;
+    if (unitsOk) positionCollars = units.value;
+    if (summariesOk) metricCollars = summaries.value;
+    if (unitsOk || summariesOk) {
       const previous = selector.value;
-      collars = units.value.filter(unit => collarNumber(unit?.collar_id) != null);
+      refreshCollarList();
+      const selected = selectDefaultCollar();
       if (collars.map(unit => unit.collar_id).join() !== Array.from(selector.options, option => option.value).join()) {
         const options = collars.map(unit => new Option(unit.collar_id, unit.collar_id));
         selector.replaceChildren(...(options.length ? options : [new Option('Sem coleiras', '')]));
-        if (collars.some(unit => unit.collar_id === previous)) selector.value = previous;
       }
+      selector.value = selected;
       selector.disabled = !collars.length;
       if (selector.value !== previous) resetMetrics();
     } else if (!collars.length) {
       selector.replaceChildren(new Option('Consulta indisponível', ''));
     }
     if (gatewayOk) gateway = gatewayResponse.value;
+    renderCollarCards();
     render();
     await refreshMetrics();
   } finally {
@@ -302,10 +369,14 @@ async function refreshOverview() {
   }
 }
 
-selector.addEventListener('change', () => {
+function selectCollar() {
+  manualSelection = selector.value;
+  renderCollarCards();
   resetMetrics();
   refreshMetrics();
-});
+}
+
+selector.addEventListener('change', selectCollar);
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) refreshOverview();
 });

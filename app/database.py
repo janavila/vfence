@@ -251,6 +251,22 @@ class Database:
                 """, (collar_id, limit)).fetchall()
         return [{**dict(row), "valid": bool(row["valid"])} for row in rows]
 
+    def metric_collars(self) -> list[dict]:
+        """List the most recent commit per metric kind for each observed collar."""
+        with self._lock, self.connect() as db:
+            rows = db.execute("""
+                SELECT collar_id, LOWER(kind) AS kind, MAX(persisted_at) AS latest
+                FROM metric_summaries GROUP BY collar_id, kind
+                UNION ALL
+                SELECT collar_id, 'pdr', MAX(persisted_at)
+                FROM pdr_windows GROUP BY collar_id
+                ORDER BY collar_id
+            """).fetchall()
+        collars = {}
+        for row in rows:
+            collars.setdefault(row["collar_id"], {})[row["kind"]] = row["latest"]
+        return [{"collar_id": collar, "latest_persisted": latest} for collar, latest in collars.items()]
+
     def link_metrics(self, collar_id: int, limit: int) -> dict:
         with self._lock, self.connect() as db:
             position = db.execute(

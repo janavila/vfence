@@ -6,8 +6,8 @@
   <meta name="theme-color" content="#f8faf9">
   <title>FPGA · VFence Monitor</title>
   <link rel="stylesheet" href="/static/css/style.css?v=8">
-  <link rel="stylesheet" href="/static/css/fpga.css?v=1">
-  <script src="/static/js/fpga.js?v=1" defer></script>
+  <link rel="stylesheet" href="/static/css/fpga.css?v=2">
+  <script src="/static/js/fpga.js?v=2" defer></script>
 </head>
 <body class="fpga-page">
   <header class="app-header">
@@ -26,6 +26,11 @@
       </div>
     </div>
     <p class="fpga-status" id="fpga-api-status" role="status">Consultando a Base…</p>
+
+    <section class="fpga-section" aria-labelledby="fpga-collars-title">
+      <h3 id="fpga-collars-title">Coleiras na Base</h3>
+      <div class="fpga-collar-grid" id="fpga-cards"></div>
+    </section>
 
     <section class="fpga-panel fpga-unit" aria-label="Estado operacional da coleira">
       <dl id="fpga-unit"></dl>

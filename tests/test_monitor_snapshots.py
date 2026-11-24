@@ -97,3 +97,25 @@ async def test_monitor_windows_use_persisted_scales(monitor):
     assert windows["pdr"][0]["estimated_lost_count"] == 2
     assert all(rows[0]["duration_ms"] == 60000 and rows[0]["age_ms"] >= 0 for rows in windows.values())
     assert hub.broadcast.await_count == 0
+
+
+def test_fpga_catalog_discovers_metric_only_collars(monitor):
+    db, _, _, client = monitor
+    assert client.get("/api/fpga/collars").json() == []
+    session = "a" * 16
+    window = "0000000000000001"
+    db.save_metric_summary(MetricSummary(
+        "RADIO", "GW", 2, session, window, 60000, 60000, 5,
+        rssi_mean_x100=-5120, snr_mean_x100=945, rssi_mean_valid=True, snr_mean_valid=True,
+    ))
+    db.save_pdr_summary("GW", PdrSummary(
+        254, session, window, session, 60000, 60000, 0, 2, 2, 0, 10000, True, "ok",
+    ))
+    assert client.get("/api/collars").json() == []
+    catalog = client.get("/api/fpga/collars").json()
+    radio = client.get("/api/collars/2/link-metrics").json()["windows"]["radio"][0]
+    pdr = client.get("/api/collars/254/pdr").json()[0]
+    assert catalog == [
+        {"collar_id": 2, "latest_persisted": {"radio": radio["persisted_at"]}},
+        {"collar_id": 254, "latest_persisted": {"pdr": pdr["persisted_at"]}},
+    ]

@@ -21,6 +21,7 @@ function page() {
       }
     },
     addEventListener(type, handler) { this[type] = handler; },
+    setAttribute(name, value) { this[name] = value; },
   });
   function getElementById(id) {
     if (!nodes.has(id)) nodes.set(id, element());
@@ -59,6 +60,7 @@ function fixtures() {
       collar_id: 'COL01', contact: {state: 'online', last_contact_at: now()},
       position: {zone: 'GNSS_INVALIDO', at: now()},
     }],
+    '/api/fpga/collars': [{collar_id: 1, latest_persisted: {hdop: common.persisted_at, radio: common.persisted_at}}],
     '/api/gateway': {mock: false, serial_open: true, freshness_seconds: 180},
     '/api/collars/1/link-metrics?limit=1': {
       collar_id: 1, gateway: {effective_profile: {profile_id: 0, observed_at: now()}},
@@ -87,6 +89,34 @@ test('reads only real data endpoints, preserves a valid zero and shows missing P
   assert.deepEqual(ui.field('metrics_valid[3]'), {value: '0', state: 'Inválido'});
   assert.deepEqual(ui.field('pdr_x100'), {value: '—', state: 'Ausente'});
   assert.equal(ui.getElementById('fpga-sufficiency').textContent, 'Dados insuficientes');
+});
+
+test('opens the collar with summaries, discovers metric-only collars and keeps a manual choice', async () => {
+  const ui = page();
+  const data = fixtures();
+  const first = data['/api/collars/1/link-metrics?limit=1'];
+  const radio = {...first.windows.radio[0], sample_count: 5, rssi_mean_x100: -5120, snr_mean_x100: 945};
+  data['/api/fpga/collars'] = [
+    {collar_id: 2, latest_persisted: {radio: now()}},
+    {collar_id: 254, latest_persisted: {hdop: stale()}},
+  ];
+  data['/api/collars/2/link-metrics?limit=1'] = {...first, collar_id: 2, windows: {radio: [radio]}};
+  data['/api/collars/2/pdr?limit=1'] = [];
+  await ui.refresh(data);
+  assert.equal(ui.getElementById('fpga-collar').value, 'COL02');
+  assert.equal(ui.getElementById('fpga-radio-value').textContent, '-51,20 dBm · 9,45 dB');
+  assert.equal(ui.field('sample_count').value, 5);
+  assert.ok(ui.requests.some(({url}) => url === '/api/collars/2/link-metrics?limit=1'));
+  assert.ok(!ui.requests.some(({url}) => url.includes('/api/collars/1/')));
+  const cards = ui.getElementById('fpga-cards').children;
+  assert.deepEqual(cards.map(card => card.dataset.collar), ['COL01', 'COL02', 'COL254']);
+  assert.equal(cards[1]['aria-pressed'], 'true');
+
+  cards[0].click();
+  await new Promise(setImmediate);
+  await ui.refresh(data);
+  assert.equal(ui.getElementById('fpga-collar').value, 'COL01');
+  assert.equal(ui.getElementById('fpga-cards').children[0]['aria-pressed'], 'true');
 });
 
 test('correlates RADIO and PDR by producer and window and keeps HDOP on its own clock', async () => {

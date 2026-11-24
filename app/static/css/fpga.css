@@ -22,6 +22,23 @@
 .fpga-status { margin: 12px 0 16px; color: var(--muted); }
 .fpga-status[data-warning="true"] { color: #795419; }
 .fpga-section { margin-top: 24px; }
+.fpga-collar-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 205px), 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.fpga-collar-card {
+  display: grid;
+  gap: 8px;
+  text-align: left;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+.fpga-collar-card[aria-pressed="true"] { border-color: var(--primary); background: var(--primary-soft); }
+.fpga-collar-card:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.fpga-collar-card small { color: var(--muted); }
 .fpga-workspace h3 { margin: 0 0 10px; font-size: 16px; font-weight: 600; }
 .fpga-workspace h4 { margin: 0; font-size: 14px; font-weight: 600; }
 .fpga-metrics, .fpga-diagnostics { display: grid; gap: 14px; }

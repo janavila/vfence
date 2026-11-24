@@ -132,6 +132,11 @@ async def collar_pdr(collar_id: int = RoutePath(ge=1, le=254), limit: int = Quer
     return await asyncio.to_thread(database.list_pdr, collar_id, limit)
 
 
+@app.get("/api/fpga/collars")
+async def fpga_metric_collars():
+    return await asyncio.to_thread(database.metric_collars)
+
+
 @app.get("/api/collars/{collar_id}/link-metrics")
 async def collar_link_metrics(collar_id: int = RoutePath(ge=1, le=254), limit: int = Query(1, ge=1, le=120)):
     snapshot = await asyncio.to_thread(database.link_metrics, collar_id, limit)
