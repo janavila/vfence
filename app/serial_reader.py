@@ -27,7 +27,7 @@ from app.pdr_protocol import PDR_COMMIT_SCHEMA, PDR_KIND, PDR_SCHEMA, PdrSummary
 from app.protocol import ParsedPacket, ProtocolError, parse_message
 from app.terminal import (
     ALERT_EVENTS, base_block, base_event, base_metric, base_pdr, base_position, base_value,
-    collar_label, gateway_log_field, gateway_log_snapshot, metric_identity,
+    collar_label, fpga_metric_diagnostic, gateway_log_field, gateway_log_snapshot, metric_identity,
 )
 
 logger = logging.getLogger("serial_reader")
@@ -751,6 +751,7 @@ class SerialReader:
         if kind in METRIC_SUMMARY_KINDS:
             return await self._process_metric_summary(data)
         if kind == PDR_KIND:
+            observed_at = received_at or datetime.now(timezone.utc)
             summary = parse_pdr_summary(data)
             gateway_id = getattr(self.config, "metrics_gateway_id", "")
             if not gateway_id:
@@ -760,7 +761,8 @@ class SerialReader:
                 return False
             connection = self._connection if (data["schema"] == PDR_COMMIT_SCHEMA and
                 getattr(self.config, "pdr_serial_commit_enabled", False)) else None
-            return await self._submit_work(partial(self._persist_pdr_summary, gateway_id, summary, connection),
+            return await self._submit_work(partial(self._persist_pdr_summary, gateway_id, summary, connection,
+                                                   received_at=observed_at),
                                            priority=_PDR_WORK_PRIORITY,
                                            description=f"[{collar_label(summary.collar_id)}] tipo=PDR")
         if kind == "telemetry":
@@ -880,6 +882,7 @@ class SerialReader:
         self.collar_contacts[name] = {"state": state, "last_contact_at": last_contact, "observed_at": observed}
 
     async def _process_metric_summary(self, data: dict) -> bool:
+        received_at = datetime.now(timezone.utc)
         setting = "metrics_installation_id" if data["kind"] == HDOP_SUMMARY_KIND else "metrics_gateway_id"
         producer_id = getattr(self.config, setting, "")
         summary = parse_metric_summary(data, producer_id)
@@ -889,10 +892,12 @@ class SerialReader:
                 self._warned_metric_producers.add(setting)
             return False
         connection = self._connection if self._metric_acks is not None else None
-        return await self._submit_work(partial(self._persist_metric_summary, summary, connection),
+        return await self._submit_work(partial(self._persist_metric_summary, summary, connection,
+                                               received_at=received_at),
                                        priority=_METRIC_WORK_PRIORITY, description=metric_identity(summary))
 
-    async def _persist_pdr_summary(self, gateway_id: str, summary: PdrSummary, connection=None) -> bool:
+    async def _persist_pdr_summary(self, gateway_id: str, summary: PdrSummary, connection=None, *,
+                                   received_at: datetime | None = None) -> bool:
         result = await asyncio.to_thread(self.database.save_pdr_summary, gateway_id, summary)
         log = logger.info if result in (MetricSaveResult.INSERTED, MetricSaveResult.DUPLICATE) else logger.warning
         log("%s", base_pdr(summary, result.name, detail=self.terminal_detail))
@@ -905,9 +910,12 @@ class SerialReader:
                 )
             except OSError:
                 logger.warning("[BASE] PDR | ACK apos COMMIT nao escrito | Gateway pode reenviar")
+        if result is MetricSaveResult.INSERTED and received_at is not None:
+            logger.info("%s", fpga_metric_diagnostic(summary, received_at))
         return persisted
 
-    async def _persist_metric_summary(self, summary: MetricSummary, connection=None) -> bool:
+    async def _persist_metric_summary(self, summary: MetricSummary, connection=None, *,
+                                      received_at: datetime | None = None) -> bool:
         result = await asyncio.to_thread(self.database.save_metric_summary, summary)
         log = logger.info if result in (MetricSaveResult.INSERTED, MetricSaveResult.DUPLICATE) else logger.warning
         log("%s", base_metric(summary, result.name, detail=self.terminal_detail))
@@ -931,6 +939,8 @@ class SerialReader:
                         f"AVISO | ACK {summary.kind}", "Estado: ACK NAO ENFILEIRADO",
                         f"Motivo: FILA CHEIA | Recusados: {self._refused_metric_acks}", collar_id=summary.collar_id,
                     ))
+        if result is MetricSaveResult.INSERTED and received_at is not None:
+            logger.info("%s", fpga_metric_diagnostic(summary, received_at))
         return True
 
     async def _write_metric_acks(self, queue: asyncio.Queue[tuple[object, MetricSummary]]) -> None:

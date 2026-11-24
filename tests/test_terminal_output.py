@@ -412,6 +412,44 @@ async def test_base_metric_blocks_separate_windows_and_preserve_invalidity(caplo
     assert "ACK | PDR" not in caplog.text and "ACK ENFILEIRADO" not in caplog.text
     assert db.list_pdr(254, 1)[0]["pdr_x100"] == 6667
 
+    observations = [record.getMessage() for record in caplog.records if "DADOS RECEBIDOS" in record.getMessage()]
+    assert len(observations) == 6
+    hdop, empty_hdop, radio, empty_radio, measured, invalid_pdr = observations
+    assert "hdopMeanX100=142 | hdopMeanValid=True" in hdop
+    assert "gatewayReceivedAtMs=1250" in hdop
+    assert "hdop_x100=DISPONIVEL" in hdop and "pdr_x100=AUSENTE" in hdop
+    assert "hdop_x100=INVALIDO" in empty_hdop and "sampleCount=0" in empty_hdop
+    assert "rssiMeanX100=-9340 | rssiMeanValid=True" in radio and "snr_x100=DISPONIVEL" in radio
+    assert "rssi_mag=INVALIDO" in empty_radio and "sample_count=INVALIDO" in empty_radio
+    assert "pdrX100=6667" in measured and "estimatedLostCount=1" in measured
+    assert "pdr_x100=INVALIDO" in invalid_pdr and "reason=session_changed" in invalid_pdr
+    for observation in observations:
+        assert all(marker in observation for marker in (
+            "Sessao=", "Janela=", "RX Base (UTC)=", "Duracao=60000 ms", "PREVIA FPGA",
+            "NAO ENVIADO — INTEGRACAO PENDENTE",
+        ))
+        assert "ENVIADO AO FPGA" not in observation
+
+
+async def test_fpga_diagnostic_skips_duplicates_and_rejected_packets(caplog):
+    reader, db = base_reader()
+    frame = radio_json(snrMeanX100=0, sampleCount=256)
+    rejected = hdop_json(hdopMeanX100=65535)
+    del rejected["windowId"]
+    with caplog.at_level(logging.INFO, logger="serial_reader"):
+        assert await reader.process_line(serial_line(frame))
+        assert await reader.process_line(serial_line(frame))
+        assert not await reader.process_line(serial_line(rejected))
+        db.link_metrics(1, 1)
+        db.link_metrics(1, 1)
+    assert caplog.text.count("DADOS RECEBIDOS") == 1
+    assert caplog.text.count("PREVIA FPGA") == 1
+    assert "snrMeanX100=0" in caplog.text and "snr_x100=DISPONIVEL" in caplog.text
+    assert "sample_count=INVALIDO" in caplog.text
+    assert "rssi_mag=DISPONIVEL" in caplog.text and "hdop_x100=AUSENTE" in caplog.text
+    assert "DUPLICATE | REGISTRO IDENTICO JA PERSISTIDO" in caplog.text
+    assert "gateway application line rejected" in caplog.text
+
 
 async def test_base_sqlite_error_does_not_report_position_saved(caplog):
     reader, db = base_reader(reconnect_seconds=0.3)

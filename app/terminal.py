@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+from datetime import datetime
 
 from app.metric_protocol import MetricSummary
 from app.pdr_protocol import PdrSummary
@@ -244,3 +245,70 @@ def base_pdr(summary: PdrSummary, result: str, *, detail: bool) -> str:
         ))
     return base_block("PDR ESTIMADO | JANELA 60s", *rows, collar_id=summary.collar_id,
                       critical=result in {"CONFLICT", "FAILED"})
+
+
+def _fpga_field(value: int | None, valid: bool, minimum: int, maximum: int) -> str:
+    if not valid:
+        return "INVALIDO"
+    if value is None:
+        return "AUSENTE"
+    return "DISPONIVEL" if minimum <= value <= maximum else "INVALIDO"
+
+
+def fpga_metric_diagnostic(summary: MetricSummary | PdrSummary, received_at: datetime) -> str:
+    fields = dict.fromkeys(
+        ("hdop_x100", "rssi_mag", "snr_x100", "pdr_x100", "sample_count"), "AUSENTE",
+    )
+    clock = "Gateway"
+    if isinstance(summary, PdrSummary):
+        kind = "PDR"
+        session = summary.gateway_session_id
+        values = (
+            f"pdrX100={base_value(summary.pdr_x100)} | PDR estimado={_mean(summary.pdr_x100, summary.valid, '%')}"
+            f" | valid={summary.valid} | reason={summary.reason}\n"
+            f" receivedCount={summary.received_count} | estimatedTxCount={base_value(summary.estimated_tx_count)}"
+            f" | estimatedLostCount={base_value(summary.estimated_lost_count)}"
+            f" | profileId={base_value(summary.profile_id)} | collarSessionId={base_value(summary.collar_session_id)}"
+        )
+        fields["pdr_x100"] = _fpga_field(summary.pdr_x100, summary.valid, 1, 10000)
+    else:
+        kind = summary.kind
+        session = summary.session_id
+        _, means = _metric_values(summary)
+        values = f"sampleCount={summary.sample_count} | {means}"
+        if kind == "HDOP":
+            clock = "coleira"
+            values += (
+                f"\n hdopMeanX100={base_value(summary.hdop_mean_x100)} | hdopMeanValid={summary.hdop_mean_valid}"
+                f" | gatewaySessionId={base_value(summary.gateway_session_id)}"
+                f" | gatewayReceivedAtMs={base_value(summary.gateway_received_at_ms)}"
+            )
+            fields["hdop_x100"] = _fpga_field(
+                summary.hdop_mean_x100, summary.hdop_mean_valid is True and 1 <= summary.sample_count <= 60, 0, 65534,
+            )
+        else:
+            values += (
+                f"\n rssiMeanX100={base_value(summary.rssi_mean_x100)} | rssiMeanValid={summary.rssi_mean_valid}"
+                f" | snrMeanX100={base_value(summary.snr_mean_x100)} | snrMeanValid={summary.snr_mean_valid}"
+            )
+            fields["rssi_mag"] = _fpga_field(summary.rssi_mean_x100, summary.rssi_mean_valid is True, -25500, 0)
+            fields["snr_x100"] = _fpga_field(summary.snr_mean_x100, summary.snr_mean_valid is True, -32768, 32767)
+            fields["sample_count"] = _fpga_field(summary.sample_count, True, 1, 255)
+
+    availability = " | ".join(f"{field}={state}" for field, state in fields.items())
+    flags = " | ".join(
+        f"{name}={fields[field]}"
+        for name, field in (("HDOP", "hdop_x100"), ("PDR", "pdr_x100"), ("SNR", "snr_x100"), ("RSSI", "rssi_mag"))
+    )
+    return (
+        f"[BASE][{collar_label(summary.collar_id)}] DADOS RECEBIDOS | {kind} | Sessao={session}"
+        f" | Janela={summary.window_id}\n"
+        f" RX Base (UTC)={received_at.isoformat(timespec='milliseconds')} | Inicio ({clock})={summary.started_at_ms} ms"
+        f" | Duracao={summary.duration_ms} ms\n"
+        f" {values}\n"
+        f" PREVIA FPGA | Campos neste pacote | collar_id=DISPONIVEL | current_profile=AUSENTE | minute_index=AUSENTE\n"
+        f" {availability}\n"
+        f" metrics_valid | {flags}\n"
+        " Resultado da previa: DADOS INSUFICIENTES | Janelas sem correlacao operacional\n"
+        " NAO ENVIADO — INTEGRACAO PENDENTE"
+    )
