@@ -259,10 +259,32 @@ class Database:
             ).fetchone()
             windows = {}
             for kind in ("HDOP", "RADIO"):
-                windows[kind.lower()] = [dict(row) for row in db.execute(
-                    "SELECT * FROM metric_summaries WHERE collar_id=? AND kind=? "
-                    "ORDER BY persisted_at DESC,id DESC LIMIT ?", (collar_id, kind, limit),
-                )]
+                # Session IDs are random. Order sessions by their first insertion
+                # so a late window cannot make a previously observed session current.
+                # Fixed-width hexadecimal window IDs sort by sequence within a session.
+                windows[kind.lower()] = [dict(row) for row in db.execute("""
+                    WITH sessions AS (
+                        SELECT producer_id, session_id, ROW_NUMBER() OVER (
+                            PARTITION BY producer_id ORDER BY MIN(id) DESC
+                        ) AS session_rank
+                        FROM metric_summaries
+                        WHERE collar_id = :collar_id AND kind = :kind
+                        GROUP BY producer_id, session_id
+                    ),
+                    ranked_windows AS (
+                        SELECT summary.id, ROW_NUMBER() OVER (
+                            PARTITION BY summary.producer_id ORDER BY summary.window_id DESC
+                        ) AS window_rank
+                        FROM metric_summaries AS summary
+                        JOIN sessions USING (producer_id, session_id)
+                        WHERE summary.collar_id = :collar_id AND summary.kind = :kind
+                            AND sessions.session_rank = 1
+                    )
+                    SELECT summary.* FROM ranked_windows
+                    JOIN metric_summaries AS summary USING (id)
+                    WHERE window_rank <= :limit
+                    ORDER BY window_rank, summary.persisted_at DESC, summary.id DESC
+                """, {"collar_id": collar_id, "kind": kind, "limit": limit})]
             windows["pdr"] = self.list_pdr(collar_id, limit)
         return {"instant": dict(position) if position else None, "windows": windows}
 

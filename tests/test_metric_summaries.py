@@ -110,6 +110,38 @@ class MetricDatabaseTests(unittest.TestCase):
             self.assertIs(self.database.save_metric_summary(summary), MetricSaveResult.FAILED)
         self.assertEqual(metric_rows(self.database), [])
 
+    def test_link_metrics_orders_out_of_order_windows_and_preserves_duplicate_timestamp(self):
+        for create in (hdop_summary, radio_summary):
+            with self.subTest(kind=create().kind):
+                newer = create(window_id="8000000000000000", started_at_ms=20)
+                late = create(window_id="7fffffffffffffff", started_at_ms=4294967290)
+                self.assertIs(self.database.save_metric_summary(newer), MetricSaveResult.INSERTED)
+                self.assertIs(self.database.save_metric_summary(late), MetricSaveResult.INSERTED)
+                original_rows = metric_rows(self.database)
+                self.assertIs(self.database.save_metric_summary(newer), MetricSaveResult.DUPLICATE)
+                self.assertEqual(metric_rows(self.database), original_rows)
+                kind = newer.kind.lower()
+                self.assertEqual(self.database.link_metrics(1, 1)["windows"][kind], [original_rows[-2]])
+                self.assertEqual(self.database.link_metrics(1, 2)["windows"][kind], original_rows[-2:])
+
+    def test_link_metrics_keeps_the_latest_observed_session_for_each_producer(self):
+        for create in (hdop_summary, radio_summary):
+            with self.subTest(kind=create().kind):
+                old = create(session_id="f" * 16, window_id="0000000000000010")
+                new = create(session_id="0" * 15 + "1", window_id="0000000000000001")
+                other = replace(old, producer_id="OTHER")
+                delayed_old = replace(old, window_id="0000000000000011")
+                for summary in (old, new, other, delayed_old):
+                    self.assertIs(self.database.save_metric_summary(summary), MetricSaveResult.INSERTED)
+                kind = old.kind.lower()
+                for limit in (1, 10):
+                    windows = self.database.link_metrics(1, limit)["windows"][kind]
+                    self.assertCountEqual(
+                        [(row["producer_id"], row["session_id"], row["window_id"]) for row in windows],
+                        [(summary.producer_id, summary.session_id, summary.window_id) for summary in (new, other)],
+                    )
+                self.assertEqual(len([row for row in metric_rows(self.database) if row["kind"] == old.kind]), 4)
+
     def test_direct_writes_validate_before_sqlite_type_affinity(self):
         original = hdop_summary()
         self.assertIs(self.database.save_metric_summary(original), MetricSaveResult.INSERTED)
