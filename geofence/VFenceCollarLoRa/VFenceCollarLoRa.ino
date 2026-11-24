@@ -802,9 +802,13 @@ uint8_t buildStateFlags() {
   return flags;
 }
 
-void scheduleNextTelemetry() {
-  const uint32_t base = params.telemetryIntervalS * 1000UL;
-  nextTelemetryAtMs = millis() + base + random(0, 3001);
+void scheduleNextTelemetry(uint32_t now) {
+  if (COUNTED_POSITION_ENABLED) {
+    const uint32_t base = params.telemetryIntervalS * 1000UL;
+    nextTelemetryAtMs = now + base + random(0, 3001);
+  } else {
+    nextTelemetryAtMs = now + 10000UL;
+  }
 }
 
 void sendTelemetryPacket() {
@@ -1011,7 +1015,7 @@ void processConfig(const PacketView& packet) {
         return;
       }
     }
-    scheduleNextTelemetry();
+    if (COUNTED_POSITION_ENABLED) scheduleNextTelemetry(millis());
     ackIncoming(packet);
     Serial.println("[CONFIG] parametros atualizados");
     return;
@@ -1275,7 +1279,7 @@ void setup() {
   geofence.setThresholds(params.muitoPertoM, params.pertoM);
 
   gpsMonitorStartMs = millis();
-  scheduleNextTelemetry();
+  scheduleNextTelemetry(millis());
 
   Serial.println();
   Serial.println("========================================");
@@ -1333,9 +1337,10 @@ void loop() {
     radioProfile.service(millis(), busy, [](uint8_t profile) { return applyLoRaProfile(LoRa, profile); });
   }
 
-  if (static_cast<int32_t>(millis() - nextTelemetryAtMs) >= 0) {
+  const uint32_t telemetryNow = millis();
+  if (static_cast<int32_t>(telemetryNow - nextTelemetryAtMs) >= 0) {
     sendTelemetryPacket();
-    scheduleNextTelemetry();
+    scheduleNextTelemetry(COUNTED_POSITION_ENABLED ? millis() : telemetryNow);
   }
 
   serviceHdopWindow(millis());
