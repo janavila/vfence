@@ -1,4 +1,4 @@
-"""Display VFence FPGA bench-test results from a dedicated Serial port."""
+"""Display VFence FPGA bench-test results from Serial or standard input."""
 
 import argparse
 import os
@@ -11,11 +11,15 @@ GATEWAY_PORT = "/dev/ttyUSB0"
 RESULT = re.compile(rb"VFENCE\|P([0-3])\|([0-7])\|([01])")
 
 
-def read_results(port):
+def read_results(port, *, stop_at_eof=False):
     line = bytearray()
     oversized = False
+    read_chunk = port.read1 if stop_at_eof else port.read
     while True:
-        for byte in port.read(128):
+        chunk = read_chunk(128)
+        if not chunk and stop_at_eof:
+            return
+        for byte in chunk:
             if byte == ord("\n"):
                 match = RESULT.fullmatch(line.removesuffix(b"\r")) if not oversized else None
                 if match:
@@ -28,10 +32,21 @@ def read_results(port):
                 line.append(byte)
 
 
+def show_results(source, *, stop_at_eof=False):
+    for profile, reason, critical in read_results(source, stop_at_eof=stop_at_eof):
+        print(f"Perfil=P{profile} | Motivo={reason} | Alerta crítico={critical}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("port", help="Dedicated FPGA port, preferably /dev/serial/by-id/...")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("port", nargs="?", help="Dedicated FPGA port, preferably /dev/serial/by-id/...")
+    source.add_argument("--stdin", action="store_true", help="Read FPGA results from a pipe, without opening Serial")
     args = parser.parse_args()
+    if args.stdin:
+        show_results(sys.stdin.buffer, stop_at_eof=True)
+        return 0
+
     if os.path.realpath(args.port) == os.path.realpath(GATEWAY_PORT):
         parser.error(f"{GATEWAY_PORT} is reserved for the LoRa Gateway")
 
@@ -40,8 +55,7 @@ def main():
     try:
         with serial.Serial(args.port, 115200, timeout=0.25, exclusive=True) as port:
             print(f"FPGA em {args.port} (115200 8N1)", flush=True)
-            for profile, reason, critical in read_results(port):
-                print(f"Perfil=P{profile} | Motivo={reason} | Alerta crítico={critical}", flush=True)
+            show_results(port)
     except KeyboardInterrupt:
         return 0
     except serial.SerialException as exc:
