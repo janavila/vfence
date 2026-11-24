@@ -16,6 +16,18 @@ def test_fence_editor_page():
         assert response.status_code==200
         assert 'Editor de cerca' in response.text
 
+def test_fpga_page_and_navigation():
+    client = TestClient(app)
+    page = client.get('/fpga')
+    assert page.status_code == 200
+    assert 'Diagnóstico FPGA' in page.text
+    assert 'Nenhum envio real registrado' in page.text
+    assert 'Nenhuma resposta real registrada' in page.text
+    for path in ('/', '/fences'):
+        assert '<a href="/fpga">FPGA</a>' in client.get(path).text
+    for path in ('/static/css/fpga.css', '/static/js/fpga.js'):
+        assert client.get(path).status_code == 200
+
 def test_dashboard_uses_local_leaflet_assets():
     with TestClient(app) as client:
         response=client.get('/')

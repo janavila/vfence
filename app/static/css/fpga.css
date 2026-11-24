@@ -1,0 +1,84 @@
+.fpga-page .primary-nav { margin-left: auto; }
+.fpga-workspace { max-width: 1280px; }
+.fpga-heading, .fpga-panel-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px 24px;
+}
+.fpga-heading h2 { margin: 0; font-size: 26px; font-weight: 600; }
+.fpga-chooser { display: flex; align-items: center; gap: 10px; }
+.fpga-chooser label { font-weight: 600; }
+.fpga-chooser select {
+  min-width: 136px;
+  padding: 8px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--surface);
+  font: inherit;
+}
+.fpga-status { margin: 12px 0 16px; color: var(--muted); }
+.fpga-status[data-warning="true"] { color: #795419; }
+.fpga-section { margin-top: 24px; }
+.fpga-workspace h3 { margin: 0 0 10px; font-size: 16px; font-weight: 600; }
+.fpga-workspace h4 { margin: 0; font-size: 14px; font-weight: 600; }
+.fpga-metrics, .fpga-diagnostics { display: grid; gap: 14px; }
+.fpga-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.fpga-diagnostics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.fpga-panel {
+  min-width: 0;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+.fpga-metrics h4 span { margin-left: 6px; color: var(--muted); font-size: 12px; font-weight: 400; }
+.fpga-value { margin: 12px 0; font: 600 20px/1.4 var(--mono); overflow-wrap: anywhere; }
+.fpga-panel dl { margin: 0; }
+.fpga-panel dl > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr);
+  gap: 12px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border);
+}
+.fpga-panel dt { color: var(--muted); }
+.fpga-panel dd { margin: 0; overflow-wrap: anywhere; }
+.fpga-unit dl { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }
+.fpga-unit dl > div { display: block; border: 0; padding: 0; }
+.fpga-unit dt { margin-bottom: 6px; font-size: 12px; }
+.fpga-unit dd { font-weight: 600; }
+.fpga-panel-heading h3 { margin-bottom: 4px; }
+.fpga-panel-heading p, .fpga-input-detail, .fpga-empty { margin: 0; color: var(--muted); }
+.fpga-input-detail { margin: 12px 0; }
+.fpga-badge {
+  display: inline-block;
+  padding: 4px 8px;
+  border-radius: 4px;
+  background: #f2f4f3;
+  color: #4d5a54;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.fpga-badge[data-state="Válido"] { background: var(--primary-soft); color: var(--primary); }
+.fpga-badge[data-state="Inválido"], .fpga-badge[data-state="Sem correlação"] { background: #faf2e1; color: #795419; }
+.fpga-scroll { max-width: 100%; overflow-x: auto; }
+.fpga-table { width: 100%; border-collapse: collapse; text-align: left; }
+.fpga-table th, .fpga-table td { padding: 9px 12px; border-bottom: 1px solid var(--border); }
+.fpga-table thead { background: var(--page); }
+.fpga-table tbody tr:last-child td { border-bottom: 0; }
+.fpga-history-title { padding-top: 14px; border-top: 1px solid var(--border); }
+.fpga-empty { padding-top: 6px; }
+
+@media (max-width: 980px) {
+  .fpga-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 680px) {
+  .fpga-metrics, .fpga-diagnostics { grid-template-columns: minmax(0, 1fr); }
+  .fpga-unit dl { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .fpga-table th, .fpga-table td { padding: 7px 6px; }
+  .fpga-page .primary-nav { gap: 0; }
+}

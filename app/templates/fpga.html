@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#f8faf9">
+  <title>FPGA · VFence Monitor</title>
+  <link rel="stylesheet" href="/static/css/style.css?v=8">
+  <link rel="stylesheet" href="/static/css/fpga.css?v=1">
+  <script src="/static/js/fpga.js?v=1" defer></script>
+</head>
+<body class="fpga-page">
+  <header class="app-header">
+    <div class="header-inner">
+      <div class="brand"><span class="brand-symbol">VF</span><div><h1>VFence Monitor</h1><span>v1.0</span></div></div>
+      <nav class="primary-nav" aria-label="Navegação principal"><a href="/">Monitoramento</a><a href="/fences">Cercas</a><a href="/fpga" class="active" aria-current="page">FPGA</a></nav>
+    </div>
+  </header>
+
+  <main class="workspace fpga-workspace">
+    <div class="fpga-heading">
+      <h2>Diagnóstico FPGA</h2>
+      <div class="fpga-chooser">
+        <label for="fpga-collar">Coleira</label>
+        <select id="fpga-collar" disabled><option value="">Carregando…</option></select>
+      </div>
+    </div>
+    <p class="fpga-status" id="fpga-api-status" role="status">Consultando a Base…</p>
+
+    <section class="fpga-panel fpga-unit" aria-label="Estado operacional da coleira">
+      <dl id="fpga-unit"></dl>
+    </section>
+
+    <section class="fpga-section" aria-labelledby="fpga-metrics-title">
+      <h3 id="fpga-metrics-title">Dados disponíveis</h3>
+      <div class="fpga-metrics">
+        <article class="fpga-panel">
+          <h4>HDOP <span>60 s · Coleira</span></h4>
+          <p class="fpga-value" id="fpga-hdop-value">Sem registro</p>
+          <dl id="fpga-hdop"></dl>
+        </article>
+        <article class="fpga-panel">
+          <h4>RADIO <span>60 s · Gateway</span></h4>
+          <p class="fpga-value" id="fpga-radio-value">Sem registro</p>
+          <dl id="fpga-radio"></dl>
+        </article>
+        <article class="fpga-panel">
+          <h4>PDR <span>Intervalo observado</span></h4>
+          <p class="fpga-value" id="fpga-pdr-value">Sem registro</p>
+          <dl id="fpga-pdr"></dl>
+        </article>
+      </div>
+    </section>
+
+    <section class="fpga-panel fpga-section" aria-labelledby="fpga-input-title">
+      <div class="fpga-panel-heading">
+        <div>
+          <h3 id="fpga-input-title">Prévia da entrada para votação</h3>
+          <p>Consulta somente leitura. Nenhum dado desta prévia é enviado ao FPGA.</p>
+        </div>
+        <strong class="fpga-badge" id="fpga-sufficiency">Dados insuficientes</strong>
+      </div>
+      <p id="fpga-input-detail" class="fpga-input-detail">Aguardando métricas da Base.</p>
+      <div class="fpga-scroll" tabindex="0" role="region" aria-label="Campos de entrada para votação">
+        <table class="fpga-table">
+          <thead><tr><th scope="col">Campo RTL</th><th scope="col">Valor disponível</th><th scope="col">Origem</th><th scope="col">Estado</th></tr></thead>
+          <tbody id="fpga-input"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <div class="fpga-diagnostics fpga-section">
+      <section class="fpga-panel" aria-labelledby="fpga-link-title">
+        <h3 id="fpga-link-title">Comunicação FPGA</h3>
+        <dl>
+          <div><dt>Integração</dt><dd>Sem monitoramento operacional</dd></div>
+          <div><dt>Último pacote enviado</dt><dd>Nenhum envio real registrado</dd></div>
+          <div><dt>Última resposta recebida</dt><dd>Nenhuma resposta real registrada</dd></div>
+          <div><dt>Erros e timeouts</dt><dd>Sem dados de monitoramento</dd></div>
+        </dl>
+        <h4 class="fpga-history-title">Histórico de comunicação</h4>
+        <p class="fpga-empty">Nenhum registro operacional.</p>
+      </section>
+      <section class="fpga-panel" aria-labelledby="fpga-result-title">
+        <h3 id="fpga-result-title">Resultado da votação</h3>
+        <dl>
+          <div><dt>Perfil recomendado</dt><dd>Indisponível</dd></div>
+          <div><dt>Motivo da recomendação</dt><dd>Indisponível</dd></div>
+          <div><dt>Alerta crítico</dt><dd>Indisponível</dd></div>
+          <div><dt>Votos P0, P1, P2 e P3</dt><dd>Indisponíveis</dd></div>
+          <div><dt>Horário da resposta</dt><dd>Indisponível</dd></div>
+          <div><dt>Validação do resultado</dt><dd>Aguardando integração</dd></div>
+          <div><dt>Perfil aplicado pela votação</dt><dd>Indisponível</dd></div>
+        </dl>
+      </section>
+    </div>
+  </main>
+</body>
+</html>
