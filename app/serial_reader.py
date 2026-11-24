@@ -57,6 +57,10 @@ _GATEWAY_EVENT_KINDS = {"event", "collar_state", "offline"}
 _EVENT_SQLITE_RETRY_SECONDS = (0.05, 0.2)
 _METRIC_ACK_CAPACITY = 16
 _METRIC_ACK_WRITE_SECONDS = 0.25
+_GATEWAY_METRIC_ACK_LOG = re.compile(
+    r"\[ACK SQLITE\] \[GATEWAY\] \[COL [0-9]{3}\] tipo=(?:HDOP|RADIO) "
+    r"sessao=[0-9a-f]{16} janela=[0-9a-f]{16} identidade validada, pendencia consumida"
+)
 _SERIAL_RESYNC = b"\x00\n"
 _JSON_STRING = r'"(?:[^"\\]|\\.)*"'
 _JSON_TOKEN = re.compile(_JSON_STRING + r"|[\[\]{}]")
@@ -539,7 +543,10 @@ class SerialReader:
                 # Linhas humanas são diagnóstico. Só os formatos históricos entram no parser V1.
                 if not (text.startswith("V1|") or text.lower().startswith("recebido:")):
                     if not at_timeout:
-                        self._diagnostic("[RAW GATEWAY] Linha de diagnostico | Caracteres: %s", len(text))
+                        if _GATEWAY_METRIC_ACK_LOG.fullmatch(text):
+                            logger.info("%s", text)
+                        else:
+                            self._diagnostic("[RAW GATEWAY] Linha de diagnostico | Caracteres: %s", len(text))
                     return _LineResult.UNRECOGNIZED
                 packet = parse_message(line, max_length=self.config.max_line_length)
                 if packet is None:
