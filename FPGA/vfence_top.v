@@ -1,7 +1,10 @@
 // VFence top: uma UO global, recebe UMA agregacao por pulso sample_valid.
 // O Raspberry/Nios deve enviar ate 1 amostra por coleira por minuto.
 // Registradores Avalon-MM, UART e comunicacao com Raspberry sao etapa posterior.
-module vfence_top (
+module vfence_top #(
+    parameter integer MIN_VALID_VOTES = 3,
+    parameter integer MIN_VOTING_MINUTES = 2
+) (
     input  wire               clk,
     input  wire               reset_n,
     input  wire               sample_valid,
@@ -44,7 +47,10 @@ module vfence_top (
         .capture_normal(capture_normal), .capture_critical(capture_critical),
         .clear_window(clear_window)
     );
-    vfence_operativa u_operativa (
+    vfence_operativa #(
+        .MIN_VALID_VOTES(MIN_VALID_VOTES),
+        .MIN_VOTING_MINUTES(MIN_VOTING_MINUTES)
+    ) u_operativa (
         .clk(clk), .reset_n(reset_n), .current_profile(current_profile),
         .collar_id(collar_id), .minute_index(minute_index),
         .pdr_x100(pdr_x100), .snr_x100(snr_x100),

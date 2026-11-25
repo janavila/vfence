@@ -3,7 +3,10 @@
 // 1 voto elegivel por (collar_id, minuto). A ordem de chegada nao importa.
 // Raspberry fornece dados agregados de 60 segundos e fechamento de 5 minutos.
 // HDOP e qualidade GNSS, NAO mede qualidade LoRa; peso de 10% e experimental.
-module vfence_operativa (
+module vfence_operativa #(
+    parameter integer MIN_VALID_VOTES = 3,
+    parameter integer MIN_VOTING_MINUTES = 2
+) (
     input  wire               clk,
     input  wire               reset_n,
     input  wire [1:0]         current_profile,
@@ -39,7 +42,7 @@ module vfence_operativa (
     output reg                critical_alert
 );
     // Razoes: 000=manter, 001=subir, 010=descer, 011=critico,
-    // 100=sem votos, 101=empate. Referem-se a recomendacao, nao aplicacao.
+    // 100=dados insuficientes, 101=empate. Critico apenas sinaliza alerta.
     wire hdop_valid = metrics_valid[3];
     wire pdr_valid  = metrics_valid[2];
     wire snr_valid  = metrics_valid[1];
@@ -48,8 +51,9 @@ module vfence_operativa (
     // Um bit por minuto, por coleira. Impede votos repetidos/retransmitidos
     // dentro da janela (sem precisar de 254 nucleos independentes).
     reg [4:0] seen_by_collar [0:255];
-    reg       prev_pdr_critical [0:255];
-    reg [2:0] prev_pdr_minute [0:255];
+    reg [4:0] pdr_seen_by_collar [0:255];
+    reg [4:0] low_pdr_by_collar [0:255];
+    reg [4:0] voting_minutes;
     integer i;
 
     wire collar_ok = (collar_id >= 8'd1) && (collar_id <= 8'd254);
@@ -58,6 +62,10 @@ module vfence_operativa (
                        seen_by_collar[collar_id][minute_index];
     wire accept_sample = process_sample && collar_ok && minute_ok && !seen_before;
     assign duplicate_debug = seen_before;
+    wire accept_pdr = process_sample && collar_ok && minute_ok &&
+                      pdr_valid && (pdr_x100 <= 16'd10000) &&
+                      !pdr_seen_by_collar[collar_id][minute_index];
+    wire [4:0] minute_bit = 5'b00001 << minute_index;
 
     // Limiares nominais historicos P0..P3 (calibraveis em campo).
     reg signed [15:0] snr_limit;
@@ -139,7 +147,8 @@ module vfence_operativa (
     // Sem HDOP valido nao produz voto normal: nao transformar GNSS invalido
     // em avaliacao de qualidade ruim. O alerta critico de PDR e independente.
     wire voto_valido = hdop_valid && pdr_valid && snr_valid && rssi_valid &&
-                        (sample_count != 8'd0) && (pdr_x100 <= 16'd10000);
+                        (sample_count != 8'd0) && (pdr_x100 <= 16'd10000) &&
+                        (hdop_x100 != 16'hffff);
 
     // A salvaguarda de PDR baixo continua independente da equacao.
     wire aumentar = (score_pdr < 2'd2) || (q < 9'd175);
@@ -159,11 +168,9 @@ module vfence_operativa (
 
     // Critico: DUAS janelas consecutivas de PDR<50% DA MESMA COLEIRA.
     // Nao mistura duas coleiras nem dois resumos do mesmo minuto.
-    assign critical_next = accept_sample && pdr_valid &&
-                           (pdr_x100 < 16'd5000) &&
-                           (minute_index != 3'd0) &&
-                           prev_pdr_critical[collar_id] &&
-                           (prev_pdr_minute[collar_id] == (minute_index - 3'd1));
+    wire [4:0] adjacent_minutes = (minute_bit << 1) | (minute_bit >> 1);
+    assign critical_next = accept_pdr && (pdr_x100 < 16'd5000) &&
+                           ((low_pdr_by_collar[collar_id] & adjacent_minutes) != 5'b0);
 
     // Vitoria por maior numero de votos; empate ou nenhum voto: manter.
     wire p0_wins = (votos_p0 > votos_p1) && (votos_p0 > votos_p2) && (votos_p0 > votos_p3);
@@ -172,8 +179,12 @@ module vfence_operativa (
     wire p3_wins = (votos_p3 > votos_p0) && (votos_p3 > votos_p1) && (votos_p3 > votos_p2);
     wire [1:0] winner = p0_wins ? 2'd0 : p1_wins ? 2'd1 :
                         p2_wins ? 2'd2 : p3_wins ? 2'd3 : current_profile;
-    wire no_votes = (votos_p0 == 11'd0) && (votos_p1 == 11'd0) &&
-                    (votos_p2 == 11'd0) && (votos_p3 == 11'd0);
+    wire [2:0] voting_minute_count =
+        {2'b0, voting_minutes[0]} + {2'b0, voting_minutes[1]} +
+        {2'b0, voting_minutes[2]} + {2'b0, voting_minutes[3]} +
+        {2'b0, voting_minutes[4]};
+    wire sufficient = (eval_count >= MIN_VALID_VOTES) &&
+                      (voting_minute_count >= MIN_VOTING_MINUTES);
     wire unique_winner = p0_wins || p1_wins || p2_wins || p3_wins;
 
     always @(posedge clk or negedge reset_n) begin
@@ -183,14 +194,15 @@ module vfence_operativa (
             votos_p2 <= 11'd0;
             votos_p3 <= 11'd0;
             eval_count <= 11'd0;
+            voting_minutes <= 5'b0;
             recommended_profile <= 2'd0;
             decision_reason <= 3'd0;
             result_ready <= 1'b0;
             critical_alert <= 1'b0;
             for (i=0; i<256; i=i+1) begin
                 seen_by_collar[i] <= 5'b00000;
-                prev_pdr_critical[i] <= 1'b0;
-                prev_pdr_minute[i] <= 3'd0;
+                pdr_seen_by_collar[i] <= 5'b0;
+                low_pdr_by_collar[i] <= 5'b0;
             end
         end else if (clear_window) begin
             votos_p0 <= 11'd0;
@@ -198,39 +210,41 @@ module vfence_operativa (
             votos_p2 <= 11'd0;
             votos_p3 <= 11'd0;
             eval_count <= 11'd0;
+            voting_minutes <= 5'b0;
             result_ready <= 1'b0;
             critical_alert <= 1'b0;
             // Recomendada e motivo continuam legiveis apos result_ack.
             for (i=0; i<256; i=i+1) begin
                 seen_by_collar[i] <= 5'b00000;
-                prev_pdr_critical[i] <= 1'b0;
-                prev_pdr_minute[i] <= 3'd0;
+                pdr_seen_by_collar[i] <= 5'b0;
+                low_pdr_by_collar[i] <= 5'b0;
             end
         end else begin
-            if (accept_sample) begin
+            if (accept_pdr) begin
+                pdr_seen_by_collar[collar_id][minute_index] <= 1'b1;
+                low_pdr_by_collar[collar_id][minute_index] <= (pdr_x100 < 16'd5000);
+            end
+            if (accept_sample && voto_valido) begin
                 seen_by_collar[collar_id][minute_index] <= 1'b1;
                 eval_count <= eval_count + 11'd1;
-                prev_pdr_critical[collar_id] <= pdr_valid && (pdr_x100 < 16'd5000);
-                prev_pdr_minute[collar_id] <= minute_index;
-                if (voto_valido) begin
-                    case (voto_perfil)
-                        2'd0: votos_p0 <= votos_p0 + 11'd1;
-                        2'd1: votos_p1 <= votos_p1 + 11'd1;
-                        2'd2: votos_p2 <= votos_p2 + 11'd1;
-                        default: votos_p3 <= votos_p3 + 11'd1;
-                    endcase
-                end
+                voting_minutes[minute_index] <= 1'b1;
+                case (voto_perfil)
+                    2'd0: votos_p0 <= votos_p0 + 11'd1;
+                    2'd1: votos_p1 <= votos_p1 + 11'd1;
+                    2'd2: votos_p2 <= votos_p2 + 11'd1;
+                    default: votos_p3 <= votos_p3 + 11'd1;
+                endcase
             end
             if (capture_critical) begin
-                recommended_profile <= perfil_acima;
+                recommended_profile <= current_profile;
                 decision_reason <= 3'b011;
                 critical_alert <= 1'b1;
                 result_ready <= 1'b1;
             end else if (capture_normal) begin
-                recommended_profile <= winner;
+                recommended_profile <= sufficient ? winner : current_profile;
                 critical_alert <= 1'b0;
                 result_ready <= 1'b1;
-                if (no_votes)
+                if (!sufficient)
                     decision_reason <= 3'b100;
                 else if (!unique_winner)
                     decision_reason <= 3'b101;

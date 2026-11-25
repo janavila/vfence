@@ -1389,9 +1389,6 @@ static void processHdopSummary(const PacketView& packet, uint32_t receivedAtMs) 
 static void emitPositionStatus(const PacketView& packet, const TelemetryPayload& d, int rssi,
                                float snr, bool hasRadioMetrics) {
   CollarState& c = collars[packet.header.collarId];
-  if (hasRadioMetrics && !packet.header.retry) {
-    accumulateRadioSample(c.radio, packet.header.sequence, rssi, snr);
-  }
   // A sequence e global por coleira e tambem e consumida por EVENT/CONTROL.
   // Portanto, saltos entre duas TELEMETRY nao significam necessariamente perda.
   c.lastTelemetrySequence = packet.header.sequence;
@@ -1454,6 +1451,9 @@ void processTelemetry(const PacketView& packet, int rssi, float snr,
   if (!decodeTelemetry(packet, position)) {
     gatewayOutput.println("[TELEMETRY] payload POSITION_STATUS invalido");
     return;
+  }
+  if (hasRadioMetrics && !packet.header.retry) {
+    accumulateRadioSample(collars[packet.header.collarId].radio, packet.header.sequence, rssi, snr);
   }
   emitPositionStatus(packet, position, rssi, snr, hasRadioMetrics);
 }
@@ -1788,7 +1788,11 @@ void processIncomingPacket(const uint8_t* data, size_t len,
     // ONLINE means a valid contact for this subtype, even without a GNSS fix
     // or when this ordinal does not contribute to the PDR window.
     markCollarSeen(collarId, rssi, snr, hasRadioMetrics);
-    if (hasRadioMetrics) pdrSlots[collarId].tracker.observe(tag, receivedAtMs, radioTransition.active);
+    if (hasRadioMetrics &&
+        pdrSlots[collarId].tracker.observe(tag, receivedAtMs, radioTransition.active) &&
+        tag.profileId == radioTransition.active) {
+      accumulateRadioSample(collars[collarId].radio, packet.header.sequence, rssi, snr);
+    }
     emitPositionStatus(legacy, position, rssi, snr, hasRadioMetrics);
     return;
   }

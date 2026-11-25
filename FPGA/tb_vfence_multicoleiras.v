@@ -194,14 +194,14 @@ module tb_vfence_multicoleiras;
         end
         avaliar(8'd1,3'd1,16'd4900,-1800,8'd136,16'd150,4'b1111);
         @(posedge clk); #1;
-        conferir_final(11'd0,11'd0,11'd3,11'd0,11'd3,2'd2,3'b011,1'b1);
+        conferir_final(11'd0,11'd0,11'd3,11'd0,11'd3,2'd1,3'b011,1'b1);
         confirmar();
 
         $display("=== TESTE 4: HDOP INVALIDO NAO GERA VOTO ===");
         for (minuto=0; minuto<5; minuto=minuto+1)
             avaliar(8'd1,minuto,16'd9800,-500,8'd105,16'd100,4'b0111);
         fechar();
-        conferir_final(11'd0,11'd0,11'd0,11'd0,11'd5,2'd1,3'b100,1'b0);
+        conferir_final(11'd0,11'd0,11'd0,11'd0,11'd0,2'd1,3'b100,1'b0);
         confirmar();
 
         $display("=== TESTE 5: ID INVALIDO E MINUTO INVALIDO ===");
@@ -210,6 +210,49 @@ module tb_vfence_multicoleiras;
         avaliar(8'd1,3'd5,16'd9800,-500,8'd105,16'd100,4'b1111);
         fechar();
         conferir_final(11'd0,11'd0,11'd0,11'd0,11'd0,2'd1,3'b100,1'b0);
+        confirmar();
+
+        $display("=== SUFICIENCIA, CORRECAO E LIMITES ===");
+        fechar();
+        conferir_final(0,0,0,0,0,1,4,0);
+        confirmar();
+        avaliar(1,0,7800,-1100,115,140,4'b1111);
+        fechar();
+        conferir_final(0,0,1,0,1,1,4,0);
+        confirmar();
+        avaliar(1,0,7800,-1100,115,140,4'b1111);
+        avaliar(2,0,7800,-1100,115,140,4'b1111);
+        fechar();
+        conferir_final(0,0,2,0,2,1,4,0);
+        confirmar();
+        avaliar(1,0,7800,-1100,115,140,4'b1111);
+        avaliar(2,0,7800,-1100,115,140,4'b1111);
+        avaliar(3,0,7800,-1100,115,140,4'b1111);
+        fechar();
+        conferir_final(0,0,3,0,3,1,4,0);
+        confirmar();
+        avaliar(1,2,7800,-1100,115,140,4'b1111);
+        avaliar(1,0,7800,-1100,115,140,4'b0111);
+        avaliar(1,0,7800,-1100,115,16'hffff,4'b1111);
+        avaliar(1,0,10001,-1100,115,140,4'b1111);
+        avaliar(1,0,7800,-1100,115,140,4'b1111);
+        avaliar(1,1,7800,-1100,115,140,4'b1111);
+        fechar();
+        conferir_final(0,0,3,0,3,2,1,0);
+        confirmar();
+        avaliar(1,0,7800,-1100,115,140,4'b1111);
+        avaliar(2,0,7800,-1100,115,140,4'b1111);
+        avaliar(1,1,7800,-1100,115,140,4'b1111);
+        fechar();
+        conferir_final(0,0,3,0,3,2,1,0);
+        confirmar();
+
+        $display("=== PDR CRITICO INDEPENDENTE, DEDUPLICADO E FORA DE ORDEM ===");
+        avaliar(1,1,4900,-32768,255,16'hffff,4'b0100);
+        avaliar(1,1,9800,32767,0,100,4'b0100);
+        avaliar(1,0,4900,-32768,255,16'hffff,4'b0100);
+        @(posedge clk); #1;
+        conferir_final(0,0,0,0,0,1,3,1);
         confirmar();
 
         $display("===============================================================");

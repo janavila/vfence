@@ -245,9 +245,18 @@ class Database:
 
     def list_pdr(self, collar_id: int, limit: int) -> list[dict]:
         with self._lock, self.connect() as db:
+            # The session IDs are random. A late row from a known old session
+            # must not displace the newest observed session or window.
             rows = db.execute("""
-                SELECT * FROM pdr_windows WHERE collar_id = ?
-                ORDER BY persisted_at DESC, rowid DESC LIMIT ?
+                WITH sessions AS (
+                    SELECT gateway_id, gateway_session_id, MIN(rowid) AS first_seen
+                    FROM pdr_windows
+                    GROUP BY gateway_id, gateway_session_id
+                )
+                SELECT report.* FROM pdr_windows AS report
+                JOIN sessions USING (gateway_id, gateway_session_id)
+                WHERE report.collar_id = ?
+                ORDER BY sessions.first_seen DESC, report.window_id DESC LIMIT ?
                 """, (collar_id, limit)).fetchall()
         return [{**dict(row), "valid": bool(row["valid"])} for row in rows]
 

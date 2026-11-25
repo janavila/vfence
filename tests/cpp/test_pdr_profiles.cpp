@@ -122,6 +122,51 @@ static void sessionCases() {
   check(wrapped.closeWindow(), 2, 2, 10000);
 }
 
+static void minuteCadenceCases() {
+  // Exhaust every five-minute loss pattern for two independent collars.
+  // At one counted position per minute, neither can form an observed interval.
+  for (unsigned first = 0; first < 32; ++first) {
+    for (unsigned second = 0; second < 32; ++second) {
+      PositionPdr collars[2];
+      const unsigned deliveries[] = {first, second};
+      for (unsigned minute = 0; minute < 5; ++minute) {
+        for (unsigned id = 0; id < 2; ++id) {
+          const bool received = (deliveries[id] & (1u << minute)) != 0;
+          if (received) {
+            const PositionDeliveryTag tag{id + 1, minute + 1, 0};
+            assert(collars[id].observe(tag, minute * PDR_WINDOW_MS + 500, 0));
+            assert(!collars[id].observe(tag, minute * PDR_WINDOW_MS + 501, 0));
+          }
+          const auto result = collars[id].closeWindow();
+          assert(result.reason == (received ? PdrReason::ONE_SAMPLE : PdrReason::NO_SAMPLES));
+          assert(result.received == unsigned(received) && result.estimatedTx == 0);
+        }
+      }
+    }
+  }
+
+  PositionPdr tracker;
+  assert(tracker.observe({1, 10, 0}, 100, 0));
+  assert(tracker.closeWindow().reason == PdrReason::ONE_SAMPLE);
+  assert(tracker.observe({1, 11, 0}, 60100, 0));
+  assert(!tracker.observe({1, 10, 0}, 60101, 0)); // Late after the first window closed.
+  assert(tracker.observe({1, 13, 0}, 60200, 0));
+  check(tracker.closeWindow(), 2, 3, 6667);
+
+  // The same wall-clock loss on a fast link is measurable between anchors.
+  PositionPdr good, degraded;
+  for (unsigned minute = 0; minute < 5; ++minute) {
+    const auto time = minute * PDR_WINDOW_MS;
+    const auto sequence = minute * 3;
+    for (unsigned i = 0; i < 3; ++i) {
+      assert(good.observe({1, sequence + i, 0}, time + i * 10000, 0));
+      if (i != 1) assert(degraded.observe({2, sequence + i, 0}, time + i * 10000, 0));
+    }
+    check(good.closeWindow(), 3, 3, 10000);
+    check(degraded.closeWindow(), 2, 3, 6667);
+  }
+}
+
 static void codecCase() {
   uint8_t original[MAX_PACKET_SIZE], wire[MAX_PACKET_SIZE], oldPayload[LEGACY_POSITION_PAYLOAD_SIZE];
   const TelemetryPayload pos{{COORD_UNAVAILABLE, COORD_UNAVAILABLE}, U16_UNAVAILABLE,
@@ -220,6 +265,7 @@ static void profileCases() {
 }
 
 int main() {
+  minuteCadenceCases();
   pdrCases();
   sessionCases();
   codecCase();

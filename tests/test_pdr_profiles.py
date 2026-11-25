@@ -44,6 +44,58 @@ def pdr_reader(tmp_path):
     return SerialReader(config, database, RecordingHub()), database
 
 
+def test_pdr_history_uses_session_and_window_sequence(pdr_reader):
+    _, database = pdr_reader
+    frame = {
+        "schema": "vfence.gateway.pdr.v1", "kind": "pdr_window_summary", "collarId": 1,
+        "collarSessionId": "0000000000000001", "durationMs": 60000, "profileId": 0,
+        "receivedCount": 2, "estimatedTxCount": 2, "estimatedLostCount": 0,
+        "pdrX100": 10000, "valid": True, "reason": "ok",
+    }
+
+    def save(session, window, start):
+        summary = parse_pdr_summary(dict(
+            frame, gatewaySessionId=f"{session:016x}", windowId=f"{window:016x}", startedAtMs=start,
+        ))
+        return database.save_pdr_summary("GW-HOST", summary)
+
+    assert save(90, 2, 0xFFFF_FF00) is MetricSaveResult.INSERTED
+    assert save(1, 2, 60000) is MetricSaveResult.INSERTED
+    assert save(90, 3, 59744) is MetricSaveResult.INSERTED  # Delayed, with a wrapped clock.
+    assert save(1, 1, 0) is MetricSaveResult.INSERTED
+    before = database.list_pdr(1, 10)
+    assert save(1, 2, 60000) is MetricSaveResult.DUPLICATE
+    assert database.list_pdr(1, 10) == before
+    assert [(int(row["gateway_session_id"], 16), int(row["window_id"], 16)) for row in before] == [
+        (1, 2), (1, 1), (90, 3), (90, 2),
+    ]
+    assert database.link_metrics(1, 1)["windows"]["pdr"] == before[:1]
+
+
+def test_pdr_absence_is_distinct_from_full_delivery(pdr_reader):
+    _, database = pdr_reader
+    measured = {
+        "schema": "vfence.gateway.pdr.v1", "kind": "pdr_window_summary", "collarId": 1,
+        "gatewaySessionId": "0000000000000009", "windowId": "0000000000000001",
+        "collarSessionId": "0000000000000001", "startedAtMs": 0, "durationMs": 60000,
+        "profileId": 0, "receivedCount": 2, "estimatedTxCount": 2, "estimatedLostCount": 0,
+        "pdrX100": 10000, "valid": True, "reason": "ok",
+    }
+    assert database.list_pdr(1, 5) == []
+    assert database.save_pdr_summary("GW-HOST", parse_pdr_summary(measured)) is MetricSaveResult.INSERTED
+    empty = dict(measured, windowId="0000000000000002", startedAtMs=60000, collarSessionId=None,
+                 profileId=None, receivedCount=0, estimatedTxCount=None, estimatedLostCount=None,
+                 pdrX100=None, valid=False, reason="no_samples")
+    assert database.save_pdr_summary("GW-HOST", parse_pdr_summary(empty)) is MetricSaveResult.INSERTED
+    no_packets, full_delivery = database.list_pdr(1, 5)
+    assert no_packets["pdr_x100"] is None and not no_packets["valid"]
+    assert full_delivery["pdr_x100"] == 10000 and full_delivery["valid"]
+    with pytest.raises(ValueError):
+        parse_pdr_summary(dict(empty, pdrX100=0))
+    with pytest.raises(ValueError):
+        parse_pdr_summary(dict(measured, pdrX100=0))
+
+
 @pytest.mark.asyncio
 async def test_host_frames_round_trip_and_idempotency(pdr_frames, pdr_reader):
     reader, database = pdr_reader
