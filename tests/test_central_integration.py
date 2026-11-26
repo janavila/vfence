@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -276,6 +277,118 @@ async def test_gateway_app_telemetry_enters_database_and_outbox():
     assert hub.messages[-1]["type"] == "telemetry"
 
 
+async def test_windows_sync_recovers_network_and_lost_commit_against_central(tmp_path, monkeypatch, caplog):
+    from app.fpga_service import FpgaService
+
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "web"))
+    config = base_config(windows_base=True, known_collar_ids=("COL01",), base_token="isolated-central-test-key",
+                         metrics_gateway_id="test-gateway", metrics_installation_id="test-site")
+    for key, value in {"BASE_ID": config.base_id, "BASE_TOKEN": config.base_token,
+                       "DATA_DIR": str(tmp_path / "central"), "COLARES_CONHECIDOS": "COL01",
+                       "AUTH_ENABLED": "false", "DATABASE_URL": ""}.items():
+        monkeypatch.setenv(key, value)
+    from backend.config import load_settings
+    from backend.main import create_app
+
+    central = create_app(settings=load_settings(env_file=None), log_to_file=False)
+    base = Database(f"sqlite:///{tmp_path / 'base.db'}")
+    base.initialize()
+    hub = Hub()
+    reader = SerialReader(config, base, hub)
+    reader.state.status = "online"
+    fpga = FpgaService(config, base, reader)
+
+    async def ingest(local_sequence):
+        assert await reader.process_line('[APP] ' + json.dumps({
+            "schema": "vfence.gateway.serial.v1", "kind": "telemetry", "collarId": 1,
+            "sequence": local_sequence, "latitude": -31.3, "longitude": -54.0, "gpsValid": True,
+            "inside": True, "rssi": -90, "snr": 7.5, "hdop": 0.9,
+        }))
+
+    class UnstableTransport(httpx.AsyncBaseTransport):
+        def __init__(self):
+            self.app = httpx.ASGITransport(app=central)
+            self.mode = "online"
+            self.committed = None
+
+        async def handle_async_request(self, request):
+            assert request.headers["Authorization"] == "Bearer " + config.base_token
+            if self.mode == "offline":
+                raise httpx.ConnectError("network unavailable", request=request)
+            if self.mode == "unavailable":
+                return httpx.Response(503)
+            if self.mode == "invalid_token":
+                request.headers["Authorization"] = "Bearer invalid-test-token"
+            response = await self.app.handle_async_request(request)
+            if request.url.path == "/api/edge/batch":
+                if self.mode == "lost_ack":
+                    assert response.status_code == 200
+                    self.committed = json.loads(request.content)
+                    await response.aclose()
+                    raise httpx.ReadError("response lost after remote COMMIT", request=request)
+                if self.committed is not None:
+                    attempted = json.loads(request.content)
+                    assert attempted["generation"] == self.committed["generation"]
+                    assert attempted["items"][:len(self.committed["items"])] == self.committed["items"]
+                    self.committed = None
+            return response
+
+    async with central.router.lifespan_context(central):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=central), base_url="http://central.test") as producer:
+            published = await producer.post("/api/fences", json={
+                "name": "Teste", "margin_attention_m": 8, "margin_critical_m": 5,
+                "points": [{"lat": lat, "lon": lon} for lat, lon in (
+                    (-31.3058, -54.0646), (-31.3058, -54.0633),
+                    (-31.3066, -54.0633), (-31.3066, -54.0646),
+                )],
+            })
+            assert published.status_code == 201
+            transport = UnstableTransport()
+            serial = FakeSerial()
+            sync = CentralSyncService(config, base, serial, hub, CentralClient(
+                config.central_base_url, config.base_token, 1, transport))
+            assert sync.as_dict()["phase"] == "connecting"
+            await ingest(1)
+            await sync._run_sync_iteration()
+            assert sync.as_dict()["phase"] == "synchronized" and serial.sent == [("COL01", 1)]
+            deliveries = (await producer.get("/api/fences/1/deliveries")).json()
+            assert deliveries[0]["status_label"] == "Confirmada"
+
+            # Network failure, a distinct server failure, and a real routing/auth check.
+            for mode, phase in (("offline", "network_unavailable"), ("unavailable", "server_unavailable"),
+                                ("invalid_token", "awaiting_credential")):
+                transport.mode = mode
+                assert await sync._run_sync_iteration() > 0
+                assert sync.as_dict()["phase"] == phase and sync.as_dict()["authenticated"] is False
+            await ingest(2)
+            assert await reader.process_line('[APP] {"schema":"vfence.gateway.serial.v1","kind":"event",'
+                                             '"collarId":1,"subtype":"GPS_LOST","sequence":22}')
+            # Serial metric commit and FPGA-facing data stay local during HTTP 401.
+            evidence = dict(schema="vfence.gateway.evidence.v1", kind="metric_evidence", collarId=1,
+                            gatewaySessionId="1" * 16, collarSessionId="2" * 16, windowId="0" * 15 + "1",
+                            startedAtMs=60000, durationMs=60000, profileId=0, txFirst=0, txLast=10,
+                            receivedCount=8, pdrX100=8000, radioCount=8, rssiX100=-9000, snrX100=750,
+                            hdopCount=2, hdopX100=90)
+            assert await reader.process_line(b"[APP] " + json.dumps(evidence).encode() + b"\n")
+            assert fpga.records([1])[1]["pdr"][0]["pdr_x100"] == 8000
+            assert base.get_collar("COL01")["last_sequence"] == 2 and base.outbox_size() > 0
+
+            transport.mode = "lost_ack"
+            await sync._run_sync_iteration()
+            assert transport.committed and base.outbox_size() > 0
+            transport.mode = "online"
+            await sync._run_sync_iteration()
+            assert transport.committed is None
+            assert sync.as_dict()["phase"] == "reconnected" and sync.as_dict()["authenticated"] is True
+            await sync._run_sync_iteration()
+            assert base.outbox_size() == 0 and serial.sent == [("COL01", 1)]
+            with central.state.db.connect() as connection:
+                assert connection.execute("SELECT COUNT(*) AS total FROM telemetry").fetchone()["total"] == 2
+                assert connection.execute("SELECT last_heartbeat FROM bases").fetchone()["last_heartbeat"]
+                assert connection.execute("SELECT COUNT(*) AS total FROM events WHERE kind='gps_lost'").fetchone()["total"] == 1
+    assert "isolated-central-test-key" not in caplog.text
+
+
 class FakeCentral:
     def __init__(self):
         self.fence = contract_fence()
@@ -303,6 +416,36 @@ class FakeSerial:
     async def send_fence(self, collar_id, fence):
         self.sent.append((collar_id, fence["version"]))
         return True, "confirmed"
+
+
+async def test_worker_retries_same_network_failure_without_restart_or_repeated_log(caplog):
+    config = base_config()
+    database = Database("sqlite:///:memory:")
+    database.initialize()
+    requests = 0
+    backoff = []
+
+    async def handle(request):
+        nonlocal requests
+        if request.url.path.endswith("/heartbeat"):
+            requests += 1
+            if requests <= 2:
+                if requests == 2:
+                    backoff.append(worker.next_retry_at)
+                raise httpx.ConnectError("offline", request=request)
+            backoff.append(worker.next_retry_at)
+            return httpx.Response(200, json={"desired_fence_version": None, "server_time": "2026-10-09T12:00:00Z"})
+        batch = json.loads(request.content)
+        await worker.stop()
+        return httpx.Response(200, json={"generation": batch["generation"],
+                                          "acked_sequences": [item["edge_seq"] for item in batch["items"]]})
+
+    worker = CentralSyncService(config, database, FakeSerial(), Hub(), client=CentralClient(
+        config.central_base_url, config.base_token, 1, httpx.MockTransport(handle)))
+    await asyncio.wait_for(worker.run(), 3)
+    assert requests == 3 and worker.status == "online"
+    assert backoff[0] < backoff[1] and worker.next_retry_at is None
+    assert caplog.text.count("SEM CONEXAO COM A CENTRAL") == 1
 
 
 async def test_sync_downloads_delivers_to_multiple_collars_and_clears_outbox(caplog):

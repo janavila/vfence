@@ -1,5 +1,7 @@
 #pragma once
 
+#include <memory>
+#include <new>
 #include <stdio.h>
 #include "pdr_window.h"
 
@@ -9,6 +11,33 @@ struct PdrReport {
   PdrWindowResult result;
   uint64_t windowId;
   uint32_t startedAtMs;
+};
+
+struct LegacyPdrSlot {
+  PositionPdr tracker;
+  PdrReport latest{};
+  bool pending = false;
+  bool hasReport = false;
+};
+
+// A slot is needed only after a radio frame carrying the legacy counter.
+// Keep it for the entire boot so inactive IDs retain their deduplication
+// frontier and retired sessions. The proven PDR path has its own storage.
+class LegacyPdrSlots {
+ public:
+  LegacyPdrSlot* find(uint8_t collar) const {
+    return collar && collar < UINT8_MAX ? slots_[collar].get() : nullptr;
+  }
+
+  LegacyPdrSlot* acquire(uint8_t collar) {
+    if (!collar || collar == UINT8_MAX) return nullptr;
+    auto& slot = slots_[collar];
+    if (!slot) slot.reset(new (std::nothrow) LegacyPdrSlot{});
+    return slot.get();
+  }
+
+ private:
+  std::unique_ptr<LegacyPdrSlot> slots_[255]{};
 };
 
 inline size_t formatPdrReport(const PdrReport& report, uint64_t gatewaySession, unsigned collarId,

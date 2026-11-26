@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Eventos | VFence</title><link rel="icon" href="/static/VFence.png">
+  <link rel="stylesheet" href="/css/style.css"><link rel="stylesheet" href="/css/visitante.css">
+  <link rel="stylesheet" href="/css/produtor.css"><link rel="stylesheet" href="/css/gestao.css">
+</head>
+<body class="visitor-page producer-area management-area">
+<!-- area-header -->
+<main class="visitor-container visitor-main">
+  <div class="visitor-intro"><div><h1>Eventos</h1><p>Consulte os acontecimentos registrados e os avisos que continuam ativos.</p></div></div>
+  <section class="visitor-panel"><div class="visitor-panel-heading"><div><h2>Acontecimentos registrados</h2><p id="events-timezone"></p></div></div>
+    <form id="management-events-form" class="management-filters">
+      <label>Animal ou coleira <select id="management-events-collar"><option value="">Todas</option></select></label>
+      <label>Data inicial <input type="date" id="management-events-start"></label>
+      <label>Data final <input type="date" id="management-events-end"></label>
+      <label>Tipo <select id="management-events-kind"><option value="">Todos</option></select></label>
+      <button class="button primary" disabled type="submit">Filtrar eventos</button>
+    </form>
+    <p id="management-events-status" role="status"></p>
+    <ul class="visitor-alerts" id="management-events-list"></ul>
+    <button type="button" class="button visitor-secondary" id="management-events-more" hidden>Carregar eventos anteriores</button>
+  </section>
+  <section class="visitor-panel"><div class="visitor-panel-heading"><h2>Avisos ativos</h2></div><ul class="visitor-alerts" id="management-events-active"></ul></section>
+</main>
+<footer class="visitor-footer">VFence — Sistema inteligente de cercamento virtual</footer>
+<script type="module" src="/js/gestao-eventos.js"></script>
+</body>
+</html>

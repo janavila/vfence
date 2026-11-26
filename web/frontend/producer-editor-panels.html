@@ -1,0 +1,22 @@
+  <div class="visitor-intro">
+    <div><h1>Minhas Cercas</h1><p>Crie, edite e gerencie suas cercas virtuais.</p></div>
+    <div class="button-row producer-editor-actions">
+      <a class="button primary" href="/produtor/cercas">Nova cerca</a>
+      <a class="button visitor-secondary" id="producer-edit-active" hidden>Editar cerca atual</a>
+      <a class="button visitor-secondary" id="producer-track-active" hidden>Acompanhar cerca atual</a>
+      <a class="button visitor-secondary" href="#producer-drafts">Rascunhos</a>
+      <a class="button visitor-secondary" href="#producer-versions">Histórico</a>
+    </div>
+  </div>
+  <p id="producer-editor-state" class="producer-editor-state" role="status"></p>
+<!-- producer-fence-history -->
+  <section class="visitor-panel" id="producer-drafts" aria-labelledby="producer-drafts-title">
+    <div class="visitor-panel-heading"><h2 id="producer-drafts-title">Rascunhos salvos</h2></div>
+    <ul class="visitor-alerts producer-saved" id="draft-list"></ul>
+  </section>
+  <section class="visitor-panel" id="producer-versions" aria-labelledby="producer-versions-title">
+    <div class="visitor-panel-heading"><h2 id="producer-versions-title">Histórico de cercas</h2></div>
+    <p class="notice info" id="fences-feedback" role="status">Carregando cercas…</p>
+    <ul class="visitor-alerts producer-saved" id="published-list"></ul>
+  </section>
+  <script type="module" src="/js/my-fences.js"></script>

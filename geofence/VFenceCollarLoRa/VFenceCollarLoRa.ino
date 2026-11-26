@@ -15,6 +15,7 @@
 #include "vfence_geofence.h"
 #include "vfence_fence_transfer.h"
 #include "../../firmware_common/profile_transition.h"
+#include "../../firmware_common/metric_evidence.h"
 
 using namespace vfence;
 
@@ -156,6 +157,30 @@ bool initLoRa() {
   return true;
 }
 
+// Counter of local TX completions for this boot. This is independent of the
+// sequence used for events, acknowledgements and reliable retransmissions.
+static uint32_t completedLoRaTransmissions = 0;
+static uint64_t hdopSessionId = 0;
+static CollarMetricClock evidenceClock;
+static MetricProof evidenceQueue[EVIDENCE_HISTORY];
+static uint8_t evidenceHead = 0, evidenceCount = 0;
+static uint32_t clockRequestNonce = 0, clockRequestSent = 0, nextClockRequest = 0, nextProofTx = 0;
+static bool clockRequestPending = false;
+
+static void updateMetricWindows(uint32_t now) {
+  if (!PROVEN_METRICS_ENABLED) return;
+  evidenceClock.service(now, radioProfile.active, hdopSessionId, completedLoRaTransmissions,
+      [](const MetricProof& proof) {
+        if (evidenceCount == EVIDENCE_HISTORY) {
+          evidenceHead = (evidenceHead + 1) % EVIDENCE_HISTORY;
+          --evidenceCount;
+          collarTerminal.print(Serial, "[AVISO] PDR comprovado: fila de janelas cheia\n");
+        }
+        evidenceQueue[(evidenceHead + evidenceCount) % EVIDENCE_HISTORY] = proof;
+        ++evidenceCount;
+      });
+}
+
 bool transportSend(const uint8_t* data, size_t len, bool logPacket = true) {
   if (!data || len == 0 || len > MAX_PACKET_SIZE) return false;
 
@@ -165,6 +190,17 @@ bool transportSend(const uint8_t* data, size_t len, bool logPacket = true) {
     collarTerminal.print(Serial, "[TX LoRa %u bytes] %s\n", unsigned(len), hex);
   }
 
+  updateMetricWindows(millis());
+  uint8_t wrapped[EVIDENCE_PACKET_MAX];
+  const auto* window = PROVEN_METRICS_ENABLED ? evidenceClock.window() : nullptr;
+  if (window) {
+    const MetricAttempt attempt{window->gateway, hdopSessionId, window->id,
+                                completedLoRaTransmissions + 1, window->profile};
+    const auto size = wrapMetricAttempt(wrapped, sizeof(wrapped), data, len, attempt);
+    if (!size) return false;
+    data = wrapped;
+    len = size;
+  }
   // SX1276 e half-duplex: sai de RX, transmite e volta imediatamente a RX.
   LoRa.idle();
   if (LoRa.beginPacket() == 0) {
@@ -174,6 +210,7 @@ bool transportSend(const uint8_t* data, size_t len, bool logPacket = true) {
 
   const size_t written = LoRa.write(data, len);
   const int result = LoRa.endPacket();
+  if (result == 1) ++completedLoRaTransmissions;
   LoRa.receive();
   lastLoRaTxMs = millis();
 
@@ -508,7 +545,6 @@ struct HdopWindowSummary {
   bool hdopMeanValid;
 };
 
-static uint64_t hdopSessionId = 0;
 static uint64_t hdopNextWindowId = 1;
 static HdopWindowSummary hdopSummaries[HDOP_SUMMARY_CAPACITY];
 static uint8_t hdopSummaryHead = 0;
@@ -565,6 +601,11 @@ static void enqueueHdopSummary(uint32_t startedAtMs) {
 static void serviceHdopWindow(uint32_t now) {
   const uint32_t elapsed = now - hdopWindowStartMs;
   if (elapsed < HDOP_WINDOW_MS) return;
+  if (COLLAR_TERMINAL_DETAIL) {
+    collarTerminal.print(Serial, "[TX LoRa] [COL %03u] sessao=%016llx total_tx_concluido=%lu t=%lu\n",
+        unsigned(COLLAR_ID), static_cast<unsigned long long>(hdopSessionId),
+        static_cast<unsigned long>(completedLoRaTransmissions), static_cast<unsigned long>(now));
+  }
 
   const uint32_t completedWindows = elapsed / HDOP_WINDOW_MS;
   // Em atrasos longos, avancar os IDs e materializar so o que cabe na fila.
@@ -633,6 +674,8 @@ static void sampleUpdatedHdop(uint32_t now, bool eligibleGga) {
   const int32_t hdopX100 = gps.hdop.value();
   if (!eligibleGga || hdopX100 < 0 || hdopX100 >= U16_UNAVAILABLE) return;
 
+  updateMetricWindows(now);
+  evidenceClock.hdop(now, static_cast<uint16_t>(hdopX100));
   serviceHdopWindow(now);
   const uint8_t slot = (now - hdopWindowStartMs) / HDOP_SAMPLE_INTERVAL_MS;
   // Usar a primeira amostra valida de cada segundo. As demais sao descartadas.
@@ -1114,6 +1157,70 @@ void processIncomingPacket(const uint8_t* data, size_t len) {
   }
 }
 
+static bool handleEvidenceDownlink(const uint8_t* data, size_t length, uint32_t now) {
+  if (!PROVEN_METRICS_ENABLED) return false;
+  PacketView packet;
+  if (!decodePacket(data, length, packet) || packet.header.collarId != COLLAR_ID) return false;
+  const auto* p = packet.payload;
+  if (evidenceControl(packet, METRIC_CLOCK)) {
+    if (packet.payloadLength == 40 && p[2] == 2 && clockRequestPending &&
+        readU32BE(p + 3) == clockRequestNonce && evidenceRead64(p + 32) == hdopSessionId) {
+      updateMetricWindows(now);
+      const MetricWindow observed{evidenceRead64(p + 7), evidenceRead64(p + 15), readU32BE(p + 23), p[31]};
+      if (evidenceClock.observe(observed, readU32BE(p + 27), clockRequestSent, now, radioProfile.active)) {
+        while (evidenceCount) {
+          const auto& first = evidenceQueue[evidenceHead].window;
+          if (first.gateway == observed.gateway && first.profile == observed.profile &&
+              (first.id > observed.id || observed.id - first.id < EVIDENCE_HISTORY)) break;
+          evidenceHead = (evidenceHead + 1) % EVIDENCE_HISTORY;
+          --evidenceCount;
+        }
+      }
+      clockRequestPending = false;
+    }
+    return true;
+  }
+  if (evidenceControl(packet, METRIC_PROOF)) {
+    MetricProof ack;
+    if (evidenceCount && decodeMetricProof(packet, ack, true)) {
+      const auto& head = evidenceQueue[evidenceHead];
+      if (head.boot == ack.boot && head.window.gateway == ack.window.gateway && head.window.id == ack.window.id) {
+        evidenceHead = (evidenceHead + 1) % EVIDENCE_HISTORY;
+        --evidenceCount;
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+static void serviceCollarEvidence(uint32_t now) {
+  if (!PROVEN_METRICS_ENABLED) return;
+  updateMetricWindows(now);
+  if (hdopConfigGuard || now - lastLoRaTxMs < 500 ||
+      static_cast<int32_t>(nextTelemetryAtMs - now) < 1500) return;
+  for (const auto& tx : pendingTx) if (tx.active) return;
+
+  uint8_t packet[MAX_PACKET_SIZE];
+  if (metricDue(now, nextClockRequest)) {
+    ++clockRequestNonce;
+    nextClockRequest = now + random(21000, 31001);
+    const size_t size = encodeMetricClock(packet, sizeof(packet), COLLAR_ID, allocateSequence(),
+                                          clockRequestNonce, hdopSessionId);
+    clockRequestSent = millis();
+    clockRequestPending = size && transportSend(packet, size, false);
+    return;
+  }
+  const auto* active = evidenceClock.window();
+  if (!active || !evidenceCount || !metricDue(now, nextProofTx)) return;
+  const auto& proof = evidenceQueue[evidenceHead];
+  if (proof.window.gateway != active->gateway || proof.window.profile != active->profile ||
+      proof.window.id >= active->id) return;
+  const auto size = encodeMetricProof(packet, sizeof(packet), COLLAR_ID, allocateSequence(), proof);
+  nextProofTx = now + random(3500, 7001);
+  if (size) transportSend(packet, size, false);
+}
+
 void pollLoRaReceive() {
   const int packetSize = LoRa.parsePacket();
   if (packetSize <= 0) return;
@@ -1131,6 +1238,7 @@ void pollLoRaReceive() {
 
   const int rssi = LoRa.packetRssi();
   const float snr = LoRa.packetSnr();
+  const uint32_t receivedAt = millis();
 
   if (oversized) {
     collarTerminal.print(Serial, "[RX LoRa] pacote maior que MAX_PACKET_SIZE: %d\n", packetSize);
@@ -1144,7 +1252,7 @@ void pollLoRaReceive() {
                          unsigned(COLLAR_ID), unsigned(count), rssi, static_cast<double>(snr), hex);
   }
 
-  processIncomingPacket(data, count);
+  if (!handleEvidenceDownlink(data, count, receivedAt)) processIncomingPacket(data, count);
 }
 
 // Mantemos a injecao pela Serial para diagnostico, mesmo com LoRa real.
@@ -1245,6 +1353,7 @@ void serviceGpsTimeout() {
 void setup() {
   Serial.begin(115200);
   esp_fill_random(&hdopSessionId, sizeof(hdopSessionId));
+  nextClockRequest = millis() + random(1000, 6001);
   delay(1500);
 
   randomSeed(static_cast<uint32_t>(micros()));
@@ -1345,5 +1454,6 @@ void loop() {
 
   serviceHdopWindow(millis());
   serviceHdopSummaryTx(millis());
+  serviceCollarEvidence(millis());
   serviceCollarTerminalSummary(millis());
 }

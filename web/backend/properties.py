@@ -55,21 +55,28 @@ def load_properties(path: Path, defaults: Settings) -> list[Property]:
             base_id=entry["base_id"], base_token=_read_env(entry, "base_token_env"),
             admin_user=entry["admin_user"], admin_password=_read_env(entry, "admin_password_env"),
             session_secret=_read_env(entry, "session_secret_env"), known_collars=tuple(collars),
+            producer_user=entry.get("producer_user", ""),
+            producer_password=_read_env(entry, "producer_password_env") if "producer_password_env" in entry else "",
             base_lat=float(entry.get("base_lat", defaults.base_lat)),
             base_lon=float(entry.get("base_lon", defaults.base_lon)),
+            property_timezone=entry.get("timezone", defaults.property_timezone),
         )
         if not (-90 <= settings.base_lat <= 90 and -180 <= settings.base_lon <= 180):
             raise ValueError("invalid property coordinates")
+        if not isinstance(settings.property_timezone, str) or not settings.property_timezone.strip():
+            raise ValueError("invalid property timezone")
         properties.append(Property(entry["property_id"], entry["hostname"], settings))
     return properties
 
 
 def create_property_app(properties: list[Property], *, log_to_file: bool = False) -> Starlette:
     from backend.main import create_app
+    from backend.config import _check
 
     if not properties:
         raise ValueError("no properties configured")
     for prop in properties:
+        _check(prop.settings)
         if (not _SCOPE.fullmatch(prop.property_id) or not _HOST.fullmatch(prop.hostname) or
                 not _SCOPE.fullmatch(prop.settings.base_id) or not prop.settings.auth_enabled or
                 not prop.settings.admin_user or not prop.settings.admin_password or

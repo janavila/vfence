@@ -12,8 +12,10 @@ from enum import Enum
 from functools import partial
 from heapq import heapify
 from itertools import count, cycle
+from io import BytesIO
 
 from app.database import GatewayEventConflictError, MetricSaveResult
+from app.metric_evidence import EVIDENCE_KIND, EVIDENCE_SCHEMA, parse_evidence
 from app.metric_protocol import (
     HDOP_SUMMARY_KIND,
     METRIC_LINE_MAX_BYTES,
@@ -66,7 +68,7 @@ _JSON_STRING = r'"(?:[^"\\]|\\.)*"'
 _JSON_TOKEN = re.compile(_JSON_STRING + r"|[\[\]{}]")
 _JSON_STRING_MEMBER = re.compile(r"\s*:\s*(" + _JSON_STRING + ")")
 _IMMEDIATE_APP_KINDS = {"command_response", "fence_transfer"}
-_FRAMED_SUMMARIES = METRIC_SUMMARY_KINDS | {PDR_KIND}
+_FRAMED_SUMMARIES = METRIC_SUMMARY_KINDS | {PDR_KIND, EVIDENCE_KIND}
 _SAFE_FRAME_REJECTIONS = {
     "mensagem [APP] deve ser um objeto JSON",
     "resumo exige prefixo [APP] e terminador LF ou CRLF",
@@ -139,7 +141,15 @@ class SerialReader:
             serial_port="mock" if config.mock_serial else config.serial_port
         )
         self._stop = asyncio.Event()
+        self._serial_released = asyncio.Event()
+        self._serial_resume = asyncio.Event()
+        self._serial_resume.set()
+        self._serial_wake = asyncio.Event()
+        self.serial_generation = 0
         self._connection = None
+        self._startup_serial = None
+        self._windows_serial_reopen = None
+        self._windows_reopened = None
         self._write_lock = asyncio.Lock()
         self._request_lock = asyncio.Lock()
         self._fence_lock = asyncio.Lock()
@@ -150,6 +160,7 @@ class SerialReader:
         self._fence_collar_id: int | None = None
         self._fence_version: int | None = None
         self.collar_status: dict[int, dict] = {}
+        self.detected_collar_ids: set[int] = set()
         self.collar_contacts: dict[str, dict] = {}
         self.collar_gnss: dict[str, dict] = {}
         self.last_response_at: str | None = None
@@ -191,7 +202,9 @@ class SerialReader:
         self._legacy_work_error = None
         worker = asyncio.create_task(self._work_loop(queue), name="vfence-serial-storage")
         ack_writer = None
-        if getattr(self.config, "metrics_serial_ack_enabled", False):
+        # A Windows Gateway can first acquire its metric identities after the
+        # HTTP service is already running. Admission still checks the flag.
+        if getattr(self.config, "windows_base", False) or getattr(self.config, "metrics_serial_ack_enabled", False):
             self._metric_acks = asyncio.Queue(maxsize=_METRIC_ACK_CAPACITY)
             self._refused_metric_acks = 0
             ack_writer = asyncio.create_task(
@@ -218,6 +231,31 @@ class SerialReader:
 
     async def stop(self):
         self._stop.set()
+        self._serial_resume.set()
+        self._serial_wake.set()
+
+    async def release_serial(self) -> None:
+        if self.config.mock_serial:
+            raise ValueError("Gateway simulado")
+        if self._serial_resume.is_set():
+            self._serial_released.clear()
+            self._serial_resume.clear()
+            self._serial_wake.set()
+            if getattr(self.config, "windows_base", False):
+                self._cancel_windows_io()
+        await asyncio.wait_for(self._serial_released.wait(), 10)
+
+    def _cancel_windows_io(self) -> None:
+        connection = self._connection
+        for name in ("cancel_write", "cancel_read"):
+            cancel = getattr(connection, name, None)
+            if cancel is not None:
+                with suppress(OSError):
+                    cancel()
+
+    def resume_serial(self) -> None:
+        self._serial_resume.set()
+        self._serial_wake.set()
 
     async def _submit_work(self, operation: Callable[[], Awaitable[bool | None]], *,
                            priority: int = _LEGACY_WORK_PRIORITY, description: str = "") -> bool:
@@ -366,10 +404,56 @@ class SerialReader:
             except asyncio.TimeoutError:
                 pass
 
+    def adopt_windows_serial(self, connection, backlog: bytes, *, detached: bool = False) -> None:
+        if not getattr(self.config, "windows_base", False) or connection.port != self.config.serial_port:
+            raise ValueError("Porta da descoberta não corresponde ao Gateway configurado")
+        self._startup_serial = (None if detached else connection), backlog
+
+    async def _replay_startup_serial(self, backlog: bytes, *, detached: bool = False) -> None:
+        for line in BytesIO(backlog):
+            if detached and not line.endswith(b"\n"):
+                # Never join a fragment from the old connection to a new stream.
+                break
+            await self._process_serial_chunk(line)
+            if self._work_queue is not None:
+                await self._work_queue.join()
+            if self._metric_acks is not None:
+                await self._metric_acks.join()
+
+    def set_windows_serial_reopen(self, factory, *, reopened=None) -> None:
+        self._windows_serial_reopen = factory
+        self._windows_reopened = reopened
+
+    @property
+    def serial_port(self):
+        return self.state.serial_port
+
+    async def _remember_windows_collar(self, collar_id: int, at: datetime) -> None:
+        if (not getattr(self.config, "windows_base", False) or self.config.mock_serial
+                or collar_id in self.detected_collar_ids or not 1 <= collar_id <= 254):
+            return
+        try:
+            await asyncio.to_thread(self.database.detect_windows_collar, collar_id, at.isoformat())
+        except sqlite3.Error:
+            logger.warning("[BASE] SQLite | registro de descoberta pendente")
+            return
+        self.detected_collar_ids.add(collar_id)
+        logger.info("[BASE] COL%02d | detectada pelo Gateway", collar_id)
+
     async def _run_serial(self):
         opened_before = False
+        windows = getattr(self.config, "windows_base", False)
         while not self._stop.is_set():
+            if not self._serial_resume.is_set():
+                self.state.status = "offline"
+                self.state.error = "Porta liberada para o Monitor Serial"
+                self._serial_released.set()
+                await self.hub.broadcast({"type": "gateway", "data": self.as_dict()})
+                await self._serial_resume.wait()
+                continue
             connection = None
+            probe = None
+            backlog = b""
             try:
                 import serial
 
@@ -379,12 +463,44 @@ class SerialReader:
                 elif self.terminal_detail:
                     logger.info("[BASE] USB | tentativa de abertura porta=%s",
                                 base_value(self.config.serial_port))
-                connection = await asyncio.to_thread(
-                    serial.Serial,
-                    self.config.serial_port,
-                    self.config.serial_baud,
-                    timeout=1,
-                )
+                if windows and self._startup_serial is not None:
+                    connection, backlog = self._startup_serial
+                    self._startup_serial = None
+                elif windows and self._windows_serial_reopen is not None:
+                    # A Windows handle opened in a worker still needs closing
+                    # if the application is cancelled before taking ownership.
+                    opening = asyncio.create_task(asyncio.to_thread(self._windows_serial_reopen))
+                    try:
+                        connection, backlog = await asyncio.shield(opening)
+                    except asyncio.CancelledError:
+                        with suppress(Exception):
+                            connection, _ = await opening
+                        raise
+                    if self._windows_reopened is not None:
+                        self._windows_reopened()
+                else:
+                    connection = await asyncio.to_thread(
+                        serial.Serial,
+                        self.config.serial_port,
+                        self.config.serial_baud,
+                        timeout=1,
+                        **({"write_timeout": 2} if windows else {}),
+                    )
+                if windows and connection is None:
+                    # Persist the verified capture with _connection still unset,
+                    # so transport acknowledgements wait for a genuine resend.
+                    await self._replay_startup_serial(backlog, detached=True)
+                    raise ConnectionError("Gateway desconectou durante a descoberta")
+                if windows:
+                    self.state.serial_port = getattr(connection, "port", self.state.serial_port)
+                    try:
+                        connection.timeout = 1
+                        connection.write_timeout = 2
+                    except OSError:
+                        await self._replay_startup_serial(backlog, detached=True)
+                        raise
+                if not self._serial_resume.is_set():
+                    continue
                 # Evita resets causados pelas linhas de controle em algumas
                 # placas ESP32. Falhar aqui não impede o uso da Serial.
                 try:
@@ -393,33 +509,46 @@ class SerialReader:
                 except Exception as exc:
                     self._diagnostic("[BASE] USB | falha ao desativar DTR/RTS: %s", type(exc).__name__)
                 self._connection = connection
+                self.serial_generation += 1
                 self.last_response_at = None
                 self.collar_contacts.clear()
                 self.effective_profile = None
                 self._serial_needs_separator = connection
-                self.state.status = "online"
-                self.state.error = None
+                self.state.status = "offline" if windows else "online"
+                self.state.error = "Porta aberta; aguardando resposta do Gateway" if windows else None
                 self.connection_error_kind = None
                 logger.info("%s", base_block(
                     "USB / GATEWAY",
-                    f"Porta: {self.config.serial_port} | Baud: {self.config.serial_baud}",
+                    f"Porta: {self.serial_port} | Baud: {self.config.serial_baud}",
                     f"Estado: {'PORTA REABERTA' if opened_before else 'PORTA ABERTA'}",
                 ))
                 opened_before = True
-                if self.config.central_sync_enabled:
-                    await self._submit_work(partial(self._persist_link_event, "gateway_online",
-                                                   datetime.now(timezone.utc).isoformat(),
-                                                   self.config.serial_port))
-                await self.hub.broadcast(
-                    {"type": "gateway", "data": self.as_dict()}
-                )
-                if getattr(self.config, "event_serial_commit_enabled", False):
-                    await self._send_serial_commit_command(connection, "ENABLE_EVENT_COMMIT", deliveryVersion=1)
-                if getattr(self.config, "pdr_serial_commit_enabled", False) and getattr(self.config, "metrics_gateway_id", ""):
-                    await self._send_serial_commit_command(connection, "ENABLE_PDR_COMMIT", deliveryVersion=2)
+                if windows:
+                    await self.hub.broadcast({"type": "gateway", "data": self.as_dict()})
+                    if backlog:
+                        # Feed the normal parser before a new status request can
+                        # correlate with an old reply. Keep a partial LF record
+                        # attached to its connection for the next physical read.
+                        await self._replay_startup_serial(backlog)
+                    probe = asyncio.create_task(self._verify_windows_gateway(connection))
+                else:
+                    await self._announce_gateway(connection)
 
-                while not self._stop.is_set():
-                    chunk = await asyncio.to_thread(self._read_serial_chunk, connection)
+                while not self._stop.is_set() and self._serial_resume.is_set():
+                    if probe is not None and probe.done():
+                        await probe
+                        probe = None
+                    if windows:
+                        read = asyncio.create_task(asyncio.to_thread(self._read_serial_chunk, connection))
+                        try:
+                            chunk = await asyncio.shield(read)
+                        except asyncio.CancelledError:
+                            self._cancel_windows_io()
+                            with suppress(Exception):
+                                await read
+                            raise
+                    else:
+                        chunk = await asyncio.to_thread(self._read_serial_chunk, connection)
                     if self._legacy_work_error is not None:
                         failure, self._legacy_work_error = self._legacy_work_error, None
                         raise failure
@@ -437,7 +566,7 @@ class SerialReader:
                         title = "ERRO | USB / GATEWAY"
                         status = "CONEXAO SERIAL INTERROMPIDA" if connection is not None else "FALHA DE ABERTURA"
                     logger.warning("%s", base_block(
-                        title, f"Porta: {self.config.serial_port} | Estado: {status}",
+                        title, f"Porta: {self.serial_port} | Estado: {status}",
                         f"Motivo: {base_value(exc)}", critical=True,
                     ))
                     if self.config.central_sync_enabled:
@@ -450,20 +579,58 @@ class SerialReader:
                     {"type": "gateway", "data": self.as_dict()}
                 )
             finally:
+                if probe is not None:
+                    probe.cancel()
+                    await asyncio.gather(probe, return_exceptions=True)
                 self._connection = None
                 self._serial_needs_separator = None
                 self._serial_line.clear()
                 self._discard_until_lf = False
                 self._fail_pending("serial_disconnected")
                 if connection is not None:
-                    await asyncio.to_thread(connection.close)
+                    if windows:
+                        async with self._write_lock:
+                            await asyncio.to_thread(connection.close)
+                    else:
+                        await asyncio.to_thread(connection.close)
+
+            if not self._serial_resume.is_set():
+                continue
 
             try:
                 await asyncio.wait_for(
-                    self._stop.wait(), timeout=self.config.reconnect_seconds
+                    self._serial_wake.wait(), timeout=self.config.reconnect_seconds
                 )
             except asyncio.TimeoutError:
                 pass
+            self._serial_wake.clear()
+
+    async def _announce_gateway(self, connection) -> None:
+        if self.config.central_sync_enabled:
+            await self._submit_work(partial(self._persist_link_event, "gateway_online",
+                                           datetime.now(timezone.utc).isoformat(), self.serial_port))
+        await self.hub.broadcast({"type": "gateway", "data": self.as_dict()})
+        if getattr(self.config, "event_serial_commit_enabled", False):
+            await self._send_serial_commit_command(connection, "ENABLE_EVENT_COMMIT", deliveryVersion=1)
+        if getattr(self.config, "pdr_serial_commit_enabled", False) and getattr(self.config, "metrics_gateway_id", ""):
+            await self._send_serial_commit_command(connection, "ENABLE_PDR_COMMIT", deliveryVersion=2)
+
+    async def _verify_windows_gateway(self, connection) -> None:
+        while self._serial_resume.is_set() and not self._stop.is_set():
+            try:
+                response = await self.send_gateway_command("GET_STATUS", timeout_seconds=2, _verify=True)
+                if response.get("command") == "GET_STATUS" and response.get("ok") is True:
+                    break
+            except (OSError, TimeoutError):
+                pass
+            await asyncio.sleep(1)
+        if not self._serial_resume.is_set() or self._stop.is_set() or connection is not self._connection:
+            return
+        self.state.status = "online"
+        self.state.error = None
+        self.last_response_at = datetime.now(timezone.utc).isoformat()
+        logger.info("[BASE] USB / GATEWAY | GET_STATUS confirmado")
+        await self._announce_gateway(connection)
 
     @staticmethod
     def _read_serial_chunk(connection) -> bytes:
@@ -676,7 +843,12 @@ class SerialReader:
                 raise ValueError(f"resumo excede {METRIC_LINE_MAX_BYTES} bytes")
             if len(pairs) != len(data):
                 raise ValueError("chave JSON duplicada no resumo")
-            schemas = (PDR_SCHEMA, PDR_COMMIT_SCHEMA) if data.get("kind") == PDR_KIND else (GATEWAY_SERIAL_SCHEMA,)
+            if data.get("kind") == PDR_KIND:
+                schemas = (PDR_SCHEMA, PDR_COMMIT_SCHEMA)
+            elif data.get("kind") == EVIDENCE_KIND:
+                schemas = (EVIDENCE_SCHEMA,)
+            else:
+                schemas = (GATEWAY_SERIAL_SCHEMA,)
             if data.get("schema") not in schemas:
                 raise ValueError("schema do resumo ausente ou nao suportado")
             return data
@@ -750,6 +922,20 @@ class SerialReader:
             self._diagnostic("[RAW GATEWAY] %s", json.dumps(gateway_log_snapshot(data), separators=(",", ":")))
         if kind in METRIC_SUMMARY_KINDS:
             return await self._process_metric_summary(data)
+        if kind == EVIDENCE_KIND:
+            summary = parse_evidence(data)
+            gateway_id = getattr(self.config, "metrics_gateway_id", "")
+            installation_id = getattr(self.config, "metrics_installation_id", "")
+            if not gateway_id or not installation_id:
+                if kind not in self._warned_metric_producers:
+                    self._warned_metric_producers.add(kind)
+                    logger.warning("PDR comprovado aguardando METRICS_GATEWAY_ID e METRICS_INSTALLATION_ID")
+                return False
+            connection = self._connection if getattr(self.config, "metrics_serial_ack_enabled", False) else None
+            return await self._submit_work(
+                partial(self._persist_metric_evidence, gateway_id, installation_id, summary, connection),
+                priority=_PDR_WORK_PRIORITY, description=f"[{collar_label(summary.collar_id)}] tipo=PDR_COMPROVADO",
+            )
         if kind == PDR_KIND:
             observed_at = received_at or datetime.now(timezone.utc)
             summary = parse_pdr_summary(data)
@@ -766,13 +952,11 @@ class SerialReader:
                                            priority=_PDR_WORK_PRIORITY,
                                            description=f"[{collar_label(summary.collar_id)}] tipo=PDR")
         if kind == "telemetry":
-            await self._save_and_broadcast(
-                self._telemetry_packet(
-                    data,
-                    "[APP] " + json.dumps(data, separators=(",", ":")),
-                    received_at,
-                )
+            packet = self._telemetry_packet(
+                data, "[APP] " + json.dumps(data, separators=(",", ":")), received_at,
             )
+            await self._save_and_broadcast(packet)
+            await self._remember_windows_collar(data["collarId"], packet.timestamp)
             return True
 
         if kind == "command_response":
@@ -791,7 +975,9 @@ class SerialReader:
                             "IDLE", "PREPARING", "COMMITTING", "VERIFYING", "COMPLETED", "ROLLING_BACK", "FAILED",
                         } else None,
                     }
-            if not data.get("ok") or data.get("command") != "FENCE_POINT" or self.terminal_detail:
+            routine = {"FENCE_POINT", "GET_PROFILE", "GET_PROFILE_V2", "GET_METRIC_CLOCK_V1"}
+            if (not data.get("ok") or data.get("command") not in routine or self.terminal_detail
+                    or (not getattr(self.config, "windows_base", False) and data.get("command") != "FENCE_POINT")):
                 log = logger.info if data.get("ok") else logger.warning
                 response = "ACEITO" if data.get("ok") else "RECUSADO"
                 origin = "GATEWAY RESPONDEU" if matched else "RESPOSTA DO GATEWAY RECEBIDA"
@@ -860,7 +1046,10 @@ class SerialReader:
             self.radio_config = dict(data)
 
         if kind in {"collar_state", "collar_status", "offline"} and type(data.get("collarId")) is int:
-            self._record_collar_contact(data, received_at or datetime.now(timezone.utc))
+            observed = received_at or datetime.now(timezone.utc)
+            self._record_collar_contact(data, observed)
+            if data.get("empty") is not True and data.get("state") in {"ONLINE", "online"}:
+                await self._remember_windows_collar(data["collarId"], observed)
         return await self._process_gateway_event(data)
 
     def _record_collar_contact(self, data: dict, received_at: datetime) -> None:
@@ -911,8 +1100,40 @@ class SerialReader:
             except OSError:
                 logger.warning("[BASE] PDR | ACK apos COMMIT nao escrito | Gateway pode reenviar")
         if result is MetricSaveResult.INSERTED and received_at is not None:
-            logger.info("%s", fpga_metric_diagnostic(summary, received_at))
+            logger.info("%s", fpga_metric_diagnostic(
+                summary, received_at, fpga_enabled=getattr(self.config, "fpga_enabled", False)))
         return persisted
+
+    async def _persist_metric_evidence(self, gateway_id, installation_id, summary, connection):
+        result = await asyncio.to_thread(self.database.save_metric_evidence, gateway_id, installation_id, summary)
+        if result not in (MetricSaveResult.INSERTED, MetricSaveResult.DUPLICATE):
+            logger.warning("[BASE] PDR comprovado COL %03d janela=%s SQLite=%s",
+                           summary.collar_id, summary.window_id, result.name)
+            return False
+        if result is MetricSaveResult.INSERTED:
+            logger.info("[BASE] PDR comprovado COL %03d janela=%s perfil=P%d TX=%d RX=%d PDRx100=%s "
+                        "RADIO[n=%d RSSIx100=%s SNRx100=%s] HDOP[n=%d x100=%s] SQLite=COMMIT",
+                        summary.collar_id, summary.window_id, summary.profile_id, summary.transmitted,
+                        summary.received, summary.pdr, summary.radio_count, summary.rssi, summary.snr,
+                        summary.hdop_count, summary.hdop)
+        if connection is not None:
+            try:
+                await self._send_serial_commit_command(
+                    connection, "EVIDENCE_COMMITTED", collarId=summary.collar_id,
+                    gatewaySessionId=summary.gateway_session_id, collarSessionId=summary.collar_session_id,
+                    windowId=summary.window_id,
+                )
+            except OSError:
+                logger.warning("[BASE] PDR comprovado | confirmacao Serial pendente apos COMMIT")
+            else:
+                if self.terminal_detail or result is MetricSaveResult.INSERTED:
+                    logger.info("[BASE] EVIDENCE_COMMITTED | COL %03d sessão=%s janela=%s | ESCRITO NA SERIAL",
+                                summary.collar_id, summary.gateway_session_id, summary.window_id)
+        if result is MetricSaveResult.INSERTED:
+            await self.hub.broadcast({"type": "metric_window", "data": {
+                "collar_id": summary.collar_id, "window_id": summary.window_id, "source": "proven",
+            }})
+        return True
 
     async def _persist_metric_summary(self, summary: MetricSummary, connection=None, *,
                                       received_at: datetime | None = None) -> bool:
@@ -940,7 +1161,8 @@ class SerialReader:
                         f"Motivo: FILA CHEIA | Recusados: {self._refused_metric_acks}", collar_id=summary.collar_id,
                     ))
         if result is MetricSaveResult.INSERTED and received_at is not None:
-            logger.info("%s", fpga_metric_diagnostic(summary, received_at))
+            logger.info("%s", fpga_metric_diagnostic(
+                summary, received_at, fpga_enabled=getattr(self.config, "fpga_enabled", False)))
         return True
 
     async def _write_metric_acks(self, queue: asyncio.Queue[tuple[object, MetricSummary]]) -> None:
@@ -953,6 +1175,8 @@ class SerialReader:
                     f"ERRO | ACK {summary.kind}", "Escrita Serial: FALHOU", f"Motivo: {base_value(exc)}",
                     collar_id=summary.collar_id, critical=True,
                 ))
+            finally:
+                queue.task_done()
 
     async def _finish_metric_acks(self, writer: asyncio.Task | None) -> None:
         if writer is not None:
@@ -975,7 +1199,8 @@ class SerialReader:
         line = b"[CMD] " + json.dumps(message, separators=(",", ":")).encode("ascii") + b"\n"
         async with self._write_lock:
             if (self._metric_acks is None or self._stop.is_set() or connection is not self._connection
-                    or not getattr(connection, "is_open", True)):
+                    or not getattr(connection, "is_open", True)
+                    or (getattr(self.config, "windows_base", False) and not self._serial_resume.is_set())):
                 return
             if self._serial_needs_separator is connection:
                 line = _SERIAL_RESYNC + line
@@ -1076,7 +1301,9 @@ class SerialReader:
                    "command": command, **fields}
         line = b"[CMD] " + json.dumps(message, separators=(",", ":")).encode("ascii") + b"\n"
         async with self._write_lock:
-            if connection is None or connection is not self._connection or not getattr(connection, "is_open", True):
+            if (connection is None or connection is not self._connection or not getattr(connection, "is_open", True)
+                    or (getattr(self.config, "windows_base", False)
+                        and (self._stop.is_set() or not self._serial_resume.is_set()))):
                 raise ConnectionError("gateway disconnected")
             if self._serial_needs_separator is connection:
                 line = _SERIAL_RESYNC + line
@@ -1120,7 +1347,7 @@ class SerialReader:
                 if request_id not in self._pending_commands:
                     return request_id
 
-    async def send_command(self, command: str) -> None:
+    async def send_command(self, command: str, *, _verify: bool = False) -> None:
         if "\n" in command or "\r" in command:
             raise ValueError("comando Serial deve ocupar uma única linha")
         if self.config.mock_serial:
@@ -1128,18 +1355,33 @@ class SerialReader:
             return
         async with self._write_lock:
             connection = self._connection
-            if connection is None or not getattr(connection, "is_open", True):
+            windows = getattr(self.config, "windows_base", False)
+            if not self._serial_resume.is_set() or connection is None or not getattr(connection, "is_open", True):
                 raise ConnectionError("gateway offline")
+            if windows and (self._stop.is_set() or (not _verify and self.state.status != "online")):
+                raise ConnectionError("gateway nao confirmado")
             line = (command + "\n").encode("utf-8")
             # NUL invalida a linha anterior e LF fecha o descarte no Gateway.
             if self._serial_needs_separator is connection:
                 line = _SERIAL_RESYNC + line
             self._serial_needs_separator = connection
-            if await asyncio.to_thread(connection.write, line) != len(line):
+            if windows:
+                write = asyncio.create_task(asyncio.to_thread(connection.write, line))
+                try:
+                    written = await asyncio.shield(write)
+                except asyncio.CancelledError:
+                    self._cancel_windows_io()
+                    with suppress(Exception):
+                        await write
+                    raise
+            else:
+                written = await asyncio.to_thread(connection.write, line)
+            if written != len(line):
                 raise OSError("incomplete Serial command")
             if self._serial_needs_separator is connection:
                 self._serial_needs_separator = None
-            await asyncio.to_thread(connection.flush)
+            if not windows:
+                await asyncio.to_thread(connection.flush)
 
     async def send_gateway_command(
         self,
@@ -1147,6 +1389,7 @@ class SerialReader:
         *,
         request_id: int | None = None,
         timeout_seconds: float = 5.0,
+        _verify: bool = False,
         **fields,
     ) -> dict:
         if request_id is None:
@@ -1170,11 +1413,18 @@ class SerialReader:
         self._pending_commands[request_id] = future
         try:
             payload = json.dumps(message, separators=(",", ":"), ensure_ascii=True)
-            await self.send_command(f"[CMD] {payload}")
+            if _verify:
+                await self.send_command(f"[CMD] {payload}", _verify=True)
+            else:
+                await self.send_command(f"[CMD] {payload}")
             response = await asyncio.wait_for(future, timeout=timeout_seconds)
             return response
         finally:
             self._pending_commands.pop(request_id, None)
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                future.exception()
 
     @staticmethod
     def _numeric_collar_id(collar_id: str) -> int:
@@ -1248,7 +1498,9 @@ class SerialReader:
         return {
             "status": self.state.status,
             "as_of": datetime.now(timezone.utc).isoformat(),
-            "serial_open": self._connection is not None and self.state.status == "online",
+            "serial_open": self._connection is not None and (
+                getattr(self.config, "windows_base", False) or self.state.status == "online"
+            ),
             "last_response_at": self.last_response_at if self.state.status == "online" and not self.config.mock_serial else None,
             "freshness_seconds": getattr(self.config, "collar_offline_seconds", 180),
             "serial_port": self.state.serial_port,

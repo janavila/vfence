@@ -36,15 +36,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+from time import monotonic
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 
+from backend.permissions import session_user
 from backend.security import (
     SESSION_COOKIE,
     create_session_token,
     hash_password,
-    read_session_token,
     verify_password,
 )
 
@@ -88,19 +90,36 @@ async def login_route(data: LoginIn, request: Request, response: Response) -> di
     # Continua havendo um scrypt por tentativa — o da senha digitada — e
     # isso é proposital: são os ~100 ms que tornam a tentativa e erro
     # inviável.
-    esperado = request.app.state.admin_password_hash
-    if esperado is None:
-        esperado = await asyncio.to_thread(hash_password, settings.admin_password)
-        request.app.state.admin_password_hash = esperado
+    attempts = request.app.state.login_attempts
+    client_key = request.client.host if request.client else ""
+    now = monotonic()
+    while attempts and next(iter(attempts.values()))[0] <= now:
+        attempts.popitem(last=False)
+    expires, hits = attempts.get(client_key, (now + 60, 0))
+    if hits >= 12:
+        raise HTTPException(429, "login_rate_limited", headers={"Retry-After": str(max(1, int(expires - now)))})
+    attempts[client_key] = (expires, hits + 1)
+    if len(attempts) > 2048:
+        attempts.popitem(last=False)
 
-    usuario_confere = data.user.strip().lower() == settings.admin_user.strip().lower()
+    username = data.user.strip().casefold()
+    is_producer = bool(settings.producer_user and username == settings.producer_user.casefold())
+    user = settings.producer_user if is_producer else settings.admin_user
+    password = settings.producer_password if is_producer else settings.admin_password
+    hashes = request.app.state.password_hashes
+    esperado = hashes.get(user)
+    if esperado is None:
+        esperado = await asyncio.to_thread(hash_password, password)
+        hashes[user] = esperado
+
+    usuario_confere = username == user.strip().casefold()
     senha_confere = await asyncio.to_thread(verify_password, data.password, esperado)
 
     if not (usuario_confere and senha_confere):
         logger.warning("login refused for user %r", data.user)
         raise HTTPException(status_code=401, detail="invalid_credentials")
 
-    token = create_session_token(settings.admin_user, settings.session_secret, SESSION_LIFETIME_S)
+    token = create_session_token(user, settings.session_secret, SESSION_LIFETIME_S)
     response.set_cookie(
         SESSION_COOKIE,
         token,
@@ -108,10 +127,10 @@ async def login_route(data: LoginIn, request: Request, response: Response) -> di
         httponly=True,
         samesite="lax",
         path="/",
-        secure=request.url.scheme == "https",
+        secure=request.url.scheme == "https" or os.getenv("VERCEL_ENV") == "production",
     )
-    logger.info("login accepted for user %s", settings.admin_user)
-    return {"user": settings.admin_user, "authenticated": True}
+    logger.info("login accepted for user %s", user)
+    return {"user": user, "authenticated": True}
 
 
 @router.post("/logout", response_model=SessionOut, summary="Sair do sistema")
@@ -127,7 +146,5 @@ async def session_route(request: Request) -> dict:
     settings = request.app.state.settings
     if not settings.auth_enabled:
         return {"user": settings.admin_user, "authenticated": True}
-    usuario = read_session_token(
-        request.cookies.get(SESSION_COOKIE, ""), settings.session_secret
-    )
+    usuario = session_user(request)
     return {"user": usuario, "authenticated": usuario is not None}

@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Minhas Cercas — VFence</title>
+  <link rel="icon" href="/static/VFence.png" type="image/png">
+  
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+<!-- area-header -->
+<main class="workspace">
+  <div class="page-heading"><h1>Minhas Cercas</h1><p class="lead">Abra um rascunho ou acompanhe a entrega de uma cerca publicada.</p><p><a href="{{editor_path}}" class="button primary">Desenhar nova cerca</a></p></div>
+  <p class="notice info" id="fences-feedback" role="status">Carregando cercas…</p>
+  <section class="panel"><div class="panel-heading"><h2>Rascunhos salvos</h2></div><div class="panel-body"><ul class="herd-list" id="draft-list"></ul></div></section>
+  <section class="panel"><div class="panel-heading"><h2>Cercas publicadas</h2></div><div class="panel-body"><ul class="herd-list" id="published-list"></ul></div></section>
+</main>
+
+<script type="module" src="/js/my-fences.js"></script>
+</body>
+</html>

@@ -27,6 +27,8 @@ class CollarOut(BaseModel):
     position_age_s: int | None = None
     position_stale: bool = True
     last_contact_at: str | None = None
+    contact_age_s: int | None = None
+    received_at: str | None = None
     gnss_status: str | None = None
     link_status: str | None = None
     confirmed_fence_version: int | None = None

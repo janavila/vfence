@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from math import ceil
 
 import httpx
 
@@ -71,6 +72,13 @@ class CentralSyncService:
         )
         self._stop = asyncio.Event()
         self.status = "disabled" if not config.central_sync_enabled else "offline"
+        self.phase = "connecting" if config.central_sync_enabled else "disabled"
+        self.failure_kind: str | None = None
+        self.authenticated = False
+        self.last_heartbeat: str | None = None
+        self.next_retry_at: str | None = None
+        self._remote_failures = 0
+        self._reported_failure = None
         self.last_error: str | None = None
         self.last_sync: str | None = None
 
@@ -82,6 +90,11 @@ class CentralSyncService:
         return {
             "enabled": self.config.central_sync_enabled,
             "status": self.status,
+            "phase": self.phase,
+            "failure_kind": self.failure_kind,
+            "authenticated": self.authenticated,
+            "last_heartbeat": self.last_heartbeat,
+            "next_retry_at": self.next_retry_at,
             "last_error": self.last_error,
             "last_sync": self.last_sync,
             "base_id": self.config.base_id,
@@ -96,13 +109,18 @@ class CentralSyncService:
         if not self.config.central_sync_enabled:
             logger.info("[BASE] CENTRAL | SINCRONIZACAO DESATIVADA")
             return
-        if not self.config.base_token:
+        if not self.config.base_token.strip():
             self.status = "error"
+            self.phase = "awaiting_credential"
+            self.failure_kind = "authentication"
             self.last_error = "BASE_TOKEN ausente"
             logger.error("%s", base_block(
                 "ERRO | CENTRAL", "Estado: TOKEN DA BASE AUSENTE", critical=True,
             ))
+            await self._broadcast_status()
             return
+        logger.info("[BASE] CENTRAL | CONECTANDO")
+        await self._broadcast_status()
         sqlite_retries = 0
         while not self._stop.is_set():
             try:
@@ -117,9 +135,11 @@ class CentralSyncService:
                         "ERRO | CENTRAL", *central_error_rows(exc, detail=self.terminal_detail), critical=True,
                     ))
                 self.status = status
+                self.phase = status
+                self.failure_kind = "storage"
                 self.last_error = type(exc).__name__
                 delay = min(60, max(0.01, self.config.central_retry_seconds) * (2 ** (sqlite_retries - 1)))
-                await self.hub.broadcast({"type": "central", "data": await asyncio.to_thread(self.as_dict)})
+                await self._broadcast_status()
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=delay)
             except asyncio.TimeoutError:
@@ -131,39 +151,85 @@ class CentralSyncService:
             await self._set_online()
             return self.config.central_sync_interval_seconds
         except CentralAuthenticationError as exc:
-            await self._set_offline(f"authentication: {exc}", exc)
-            return max(self.config.central_retry_seconds, 30)
+            delay = max(self.config.central_retry_seconds, 30)
+            await self._set_offline(exc, "authentication", delay)
+            return delay
         except (CentralClientError, InvalidFenceError, ValueError, KeyError) as exc:
-            await self._set_offline(str(exc), exc)
-            return self.config.central_retry_seconds
+            cause = exc.__cause__ or exc
+            status = getattr(exc, "status_code", None)
+            if isinstance(cause, (httpx.TransportError, ConnectionError, TimeoutError)):
+                kind = "network"
+            elif status is not None and (status in {408, 425, 429} or status >= 500):
+                kind = "server"
+            else:
+                kind = "protocol"
+            self._remote_failures = min(self._remote_failures + 1, 7)
+            interval = self.config.central_retry_seconds
+            delay = min(max(60, interval), interval * (2 ** (self._remote_failures - 1)))
+            await self._set_offline(exc, kind, delay)
+            return delay
+
+    async def _broadcast_status(self) -> None:
+        await self.hub.broadcast({"type": "central", "data": await asyncio.to_thread(self.as_dict)})
+
+    async def _heartbeat_received(self) -> None:
+        self.last_heartbeat = utc_now()
+        if not self.authenticated:
+            self.authenticated = True
+            self.phase = "authenticated"
+            self.failure_kind = self.last_error = self.next_retry_at = None
+            if self._reported_failure is None:
+                logger.info("[BASE] CENTRAL | AUTENTICADA | HEARTBEAT ACEITO")
+            await self._broadcast_status()
 
     async def _set_online(self) -> None:
         changed = self.status != "online"
         self.status = "online"
-        self.last_error = None
+        self.phase = "reconnected" if changed and self.last_sync else "synchronized"
+        self.failure_kind = self.last_error = self.next_retry_at = None
+        self._remote_failures = 0
+        self._reported_failure = None
         self.last_sync = utc_now()
         if changed:
-            logger.info("%s", base_block("CENTRAL | SINCRONIZACAO", "Estado: CICLO CONCLUIDO"))
+            label = ("RECONECTADA | CICLO CONCLUIDO" if self.phase == "reconnected"
+                     else "SINCRONIZADA | CICLO CONCLUIDO")
+            logger.info("%s", base_block("CENTRAL | SINCRONIZACAO", f"Estado: {label}"))
             await asyncio.to_thread(
                 self.database.enqueue_event, "central_online",
                 timestamp=self.last_sync, detail=self.config.central_base_url,
             )
-        await self.hub.broadcast({"type": "central", "data": self.as_dict()})
+        await self._broadcast_status()
 
-    async def _set_offline(self, error: str, exception: Exception) -> None:
-        changed = self.status != "offline" or self.last_error != error
+    async def _set_offline(self, exception: Exception, kind: str, delay: float) -> None:
+        rows = central_error_rows(exception, detail=self.terminal_detail)
+        error = rows[0].removeprefix("Motivo: ")
+        signature = (kind, error)
+        changed = self._reported_failure != signature
         self.status = "offline"
+        self.phase = {"authentication": "awaiting_credential", "network": "network_unavailable",
+                      "server": "server_unavailable", "protocol": "protocol_error"}[kind]
+        self.failure_kind = kind
+        self.authenticated = False
         self.last_error = error
+        self.next_retry_at = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
         if changed:
+            self._reported_failure = signature
+            label = {
+                "authentication": "AGUARDANDO CREDENCIAL VALIDA",
+                "network": "SEM CONEXAO COM A CENTRAL",
+                "server": "TEMPORARIAMENTE INDISPONIVEL",
+                "protocol": "RESPOSTA INCOMPATIVEL",
+            }[kind]
+            pending = await asyncio.to_thread(self.database.outbox_size)
             logger.warning("%s", base_block(
-                "AVISO | CENTRAL", "Estado: CICLO INDISPONIVEL",
-                *central_error_rows(exception, detail=self.terminal_detail), critical=True,
+                "AVISO | CENTRAL", f"Estado: CICLO INDISPONIVEL | {label}", *rows,
+                f"Dados pendentes: {pending} | Nova tentativa em {ceil(delay)} s", critical=True,
             ))
             await asyncio.to_thread(
                 self.database.enqueue_event, "central_offline",
                 timestamp=utc_now(), detail=error[:500],
             )
-        await self.hub.broadcast({"type": "central", "data": self.as_dict()})
+        await self._broadcast_status()
 
     async def sync_once(self) -> None:
         state = await asyncio.to_thread(self.database.fence_state)
@@ -175,6 +241,7 @@ class CentralSyncService:
             serial_status=self.serial_reader.state.status,
             queue_size=queued,
         )
+        await self._heartbeat_received()
         desired = heartbeat["desired_fence_version"]
         await asyncio.to_thread(self.database.set_desired_fence, desired, utc_now())
         if self.terminal_detail and queued:

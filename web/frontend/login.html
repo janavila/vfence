@@ -11,6 +11,7 @@
 <body class="login-body">
 
 <main class="login-card">
+  <a class="area-back" data-back href="/"><span aria-hidden="true">←</span> Voltar</a>
   <div class="login-brand">
     <img src="/static/VFence.png" alt="VFence">
     <div>
@@ -19,8 +20,7 @@
     </div>
   </div>
 
-  <h1>Entrar</h1>
-  <p class="muted-text">Use o usuário e a senha combinados para esta propriedade.</p>
+  <h1 id="login-title">Entrar</h1>
 
   <form id="login-form" novalidate>
     <div class="field">
@@ -40,10 +40,6 @@
     <button class="button primary" type="submit" id="login-button">Entrar</button>
   </form>
 
-  <p class="muted-text small login-footnote">
-    O VFence funciona na rede da propriedade. Não é preciso internet para
-    desenhar e enviar a cerca — só as imagens do mapa dependem dela.
-  </p>
 </main>
 
 <script type="module">
@@ -54,6 +50,13 @@
   const formulario = document.getElementById('login-form');
   const erro = document.getElementById('login-error');
   const botao = document.getElementById('login-button');
+  const next = new URLSearchParams(location.search).get('next');
+  const paths = ['/produtor', '/produtor/avisos', '/produtor/cercas', '/produtor/editor',
+    '/gestao', '/gestao/painel', '/gestao/cercas', '/gestao/visitante', '/gestao/editor',
+    '/gestao/rebanho', '/gestao/historico', '/gestao/eventos'];
+  const destination = next && paths.includes(next.split('?')[0]) ? next : '/gestao';
+  document.getElementById('login-title').textContent = destination.startsWith('/produtor')
+    ? 'Entrar como produtor' : 'Entrar na Gestão';
 
   function mostrarErro(texto) {
     erro.innerHTML = `<div>${texto}</div>`;
@@ -80,7 +83,7 @@
         /* `replace` em vez de `href`: o botão Voltar do navegador não
            deve trazer o produtor de volta para a tela de login depois
            de ele já ter entrado. */
-        window.location.replace('/');
+        window.location.replace(destination);
         return;
       }
       /* A mesma mensagem para usuário errado e senha errada: dizer qual

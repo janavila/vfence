@@ -153,3 +153,25 @@ test('marks old or out-of-range input and reports a failed refresh', async () =>
   assert.match(ui.getElementById('fpga-api-status').textContent, /API indisponível/);
   assert.equal(ui.getElementById('fpga-radio-value').textContent, '-95,30 dBm · 0,00 dB');
 });
+
+test('shows proven metrics from one window and does not treat a delayed commit as fresh', async () => {
+  const ui = page();
+  const data = fixtures();
+  const {windows} = data['/api/collars/1/link-metrics?limit=1'];
+  const radio = windows.radio[0];
+  const collarSession = 'b'.repeat(16);
+  const identity = {...radio, gateway_id: 'GW', installation_id: 'INST', source: 'proven',
+    gateway_session_id: radio.session_id, collar_session_id: collarSession, profile_id: 0, freshness: 'recent'};
+  Object.assign(radio, identity, {timing_proven: 1});
+  Object.assign(windows.hdop[0], identity, {session_id: collarSession, producer_id: 'INST',
+    timing_proven: 1, sample_count: 7, hdop_mean_x100: 124, hdop_mean_valid: true});
+  windows.pdr = [{...identity, tx_proven: true, valid: true, received_count: 8, transmitted_count: 10, pdr_x100: 8000}];
+  await ui.refresh(data);
+  assert.equal(ui.field('hdop_x100').state, 'Válido');
+  assert.equal(ui.getElementById('fpga-sufficiency').textContent, 'Métricas da mesma janela');
+  assert.match(JSON.stringify(ui.getElementById('fpga-pdr').children), /Transmissões comprovadas/);
+  windows.pdr[0].freshness = 'historical';
+  await ui.refresh(data);
+  assert.equal(ui.field('pdr_x100').state, 'Inválido');
+  assert.equal(ui.getElementById('fpga-sufficiency').textContent, 'Dados insuficientes');
+});

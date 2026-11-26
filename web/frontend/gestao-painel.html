@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Painel técnico | VFence</title><link rel="icon" href="/static/VFence.png">
+  <link rel="stylesheet" href="/css/style.css"><link rel="stylesheet" href="/css/visitante.css">
+  <link rel="stylesheet" href="/css/produtor.css"><link rel="stylesheet" href="/css/gestao.css">
+</head>
+<body class="visitor-page producer-area management-area">
+<!-- area-header -->
+<main class="visitor-container visitor-main">
+  <div class="visitor-intro"><div><h1>Painel técnico</h1><p>Acompanhe a comunicação, as coleiras, as entregas e os eventos da propriedade.</p></div><a href="#visibilidade-publica" class="button visitor-secondary">Visibilidade pública</a></div>
+  <dl id="technical-counts" class="visitor-counts" aria-label="Resumo operacional"></dl>
+  <section class="visitor-panel"><div class="visitor-panel-heading"><h2>Comunicação</h2></div><dl id="technical-comms" class="management-facts"></dl></section>
+  <section class="visitor-panel"><div class="visitor-panel-heading"><h2>Cerca publicada e entregas</h2><a class="button visitor-secondary" href="/gestao/cercas">Abrir Cercas</a></div><div id="technical-fence"></div></section>
+  <section class="visitor-panel"><div class="visitor-panel-heading"><h2>Coleiras e últimos contatos</h2></div><ul id="technical-collars" class="visitor-alerts"></ul></section>
+  <section class="visitor-panel"><div class="visitor-panel-heading"><h2>Eventos recentes e avisos ativos</h2><a class="button visitor-secondary" href="/gestao/eventos">Todos os eventos</a></div><ul id="technical-events" class="visitor-alerts"></ul><ul id="technical-alerts" class="visitor-alerts"></ul></section>
+  <section class="visitor-panel" id="visibilidade-publica">
+    <div class="visitor-panel-heading"><div><h2>Visibilidade pública</h2><p>Autorize os dados acessíveis sem login. Os vértices das cercas selecionadas serão públicos.</p></div></div>
+    <!-- public-policy-form -->
+  </section>
+</main>
+<footer class="visitor-footer">VFence — Sistema inteligente de cercamento virtual</footer>
+<script type="module" src="/js/gestao-painel.js"></script><script type="module" src="/js/publication.js"></script>
+</body>
+</html>

@@ -14,6 +14,19 @@ static void check(const PdrWindowResult& result, unsigned rx, unsigned tx, unsig
 }
 
 static void pdrCases() {
+  LegacyPdrSlots slots;
+  assert(!slots.acquire(0) && !slots.acquire(255));
+  assert(!slots.find(1) && !slots.find(254));
+  for (uint8_t id = 1; id <= 16; ++id) {
+    auto* slot = slots.acquire(id);
+    assert(slot && slots.acquire(id) == slot && !slot->tracker.known());
+    assert(slot->tracker.observe({9, 10, 0}, 10, 0));
+  }
+  auto* highId = slots.acquire(254);
+  assert(highId && highId != slots.find(1) && highId->tracker.observe({9, 10, 0}, 10, 0));
+  assert(!slots.acquire(1)->tracker.observe({9, 10, 0}, 20, 0));
+  assert(!slots.find(17));
+
   PositionPdr collars[255];
   const auto rx = [&](unsigned id, uint32_t sequence, uint64_t session = 9, uint32_t now = 10) {
     return collars[id].observe({session, sequence, 0}, now, 0);

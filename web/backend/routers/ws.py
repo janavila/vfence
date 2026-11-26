@@ -31,6 +31,7 @@ import asyncio
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from backend.clock import utc_now_iso
+from backend.permissions import browser_origin_matches, role_for, session_user
 from backend.services import edge_service, fence_service
 
 logger = logging.getLogger("realtime")
@@ -39,6 +40,7 @@ router = APIRouter()
 
 
 @router.websocket("/ws")
+@router.websocket("/ws/producer")
 async def websocket_route(websocket: WebSocket) -> None:
     """Aceita a conexão e mantém o navegador na lista de difusão.
 
@@ -55,7 +57,10 @@ async def websocket_route(websocket: WebSocket) -> None:
     # protocolo do WebSocket não passa por ele. Por isso a conferência
     # de login acontece aqui, na própria rota. Sem isso, qualquer pessoa
     # na rede receberia a telemetria do rebanho sem fazer login.
-    if settings.auth_enabled and app.state.sessao_valida(websocket) is None:
+    restricted = websocket.url.path == "/ws/producer"
+    user = session_user(websocket)
+    if (not user or (not restricted and role_for(settings, user) != "management")
+            or not browser_origin_matches(websocket)):
         # 1008 é "policy violation" no protocolo do WebSocket.
         await websocket.close(code=1008, reason="not_authenticated")
         logger.info("websocket refused: no session")
@@ -68,20 +73,26 @@ async def websocket_route(websocket: WebSocket) -> None:
         await websocket.close(code=1013, reason="database_unavailable")
         return
 
-    active, bases = await asyncio.to_thread(lambda: (fence_service.active_version(db), _all_bases(db)))
-    hello = {"type": "hello", "data": {
-        "server_time": utc_now_iso(), "active_fence_version": active,
-        "bases": [
-            {"base_id": base["base_id"], "online": edge_service.base_is_online(base, settings),
-             "last_heartbeat": base["last_heartbeat"]} for base in bases
-        ],
-    }}
-    if not await hub.connect(websocket, hello):
+    if restricted:
+        hello = {"type": "invalidate"}
+    else:
+        active, bases = await asyncio.to_thread(lambda: (fence_service.active_version(db), _all_bases(db)))
+        hello = {"type": "hello", "data": {
+            "server_time": utc_now_iso(), "active_fence_version": active,
+            "bases": [
+                {"base_id": base["base_id"], "online": edge_service.base_is_online(base, settings),
+                 "last_heartbeat": base["last_heartbeat"]} for base in bases
+            ],
+        }}
+    if not await hub.connect(websocket, hello, invalidation_only=restricted):
         return
     try:
-        while True:
-            # Só serve para perceber a desconexão.
-            await websocket.receive_text()
+        while session_user(websocket):
+            try:
+                await asyncio.wait_for(websocket.receive_text(), 5)
+            except TimeoutError:
+                pass
+        await websocket.close(code=1008, reason="session_expired")
     except (WebSocketDisconnect, RuntimeError):
         pass
     finally:

@@ -20,14 +20,8 @@
 export const CAMADAS = {
   ruas: {
     nome: 'Mapa de ruas',
-    url: 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
-    atribuicao: '© OpenStreetMap contributors',
-    zoomMaximo: 19,
-  },
-  satelite: {
-    nome: 'Satélite',
-    url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-    atribuicao: 'Esri',
+    url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+    atribuicao: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>',
     zoomMaximo: 19,
   },
 };
@@ -38,7 +32,7 @@ export const CAMADAS = {
  * A Base é só o ponto de partida: `mostrarLocalizacao` leva o mapa até
  * onde o produtor está.
  */
-export function criarMapa(elementoId, config, zoom = 17) {
+export function criarMapa(elementoId, config, zoom = 17, onTileState) {
   const elemento = document.getElementById(elementoId);
   if (!elemento) return null;
 
@@ -59,18 +53,11 @@ export function criarMapa(elementoId, config, zoom = 17) {
     maxZoom: CAMADAS.ruas.zoomMaximo,
     attribution: CAMADAS.ruas.atribuicao,
   });
-  const satelite = L.tileLayer(CAMADAS.satelite.url, {
-    maxZoom: CAMADAS.satelite.zoomMaximo,
-    attribution: CAMADAS.satelite.atribuicao,
-  });
-
-  // Satélite primeiro: é o que o produtor reconhece ao marcar divisa.
-  satelite.addTo(mapa);
-  L.control.layers(
-    { [CAMADAS.satelite.nome]: satelite, [CAMADAS.ruas.nome]: ruas },
-    {},
-    { position: 'topright' },
-  ).addTo(mapa);
+  if (onTileState) {
+    ruas.on('tileerror', () => onTileState(false));
+    ruas.on('tileload', () => onTileState(true));
+  }
+  ruas.addTo(mapa);
 
   return mapa;
 }
@@ -89,7 +76,7 @@ export function marcarBase(mapa, config) {
     fillOpacity: 1,
     interactive: true,
   }).addTo(mapa);
-  marcador.bindTooltip(`Base ${config.base_id}`, { direction: 'top' });
+  marcador.bindTooltip(config.base_id ? `Base ${config.base_id}` : 'Base da propriedade', { direction: 'top' });
   return marcador;
 }
 

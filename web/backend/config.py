@@ -164,6 +164,9 @@ class Settings:
     admin_user: str
     admin_password: str
     session_secret: str
+    producer_user: str = ""
+    producer_password: str = ""
+    property_timezone: str = "America/Sao_Paulo"
 
     # ---- caminhos derivados -------------------------------------------
     # Não vêm do .env: são calculados a partir de DATA_DIR, para que
@@ -247,6 +250,9 @@ def load_settings(env_file: Path | None = DEFAULT_ENV_FILE) -> Settings:
         admin_user=_text("ADMIN_USER", "produtor"),
         admin_password=_secret("ADMIN_PASSWORD", "troque-esta-senha"),
         session_secret=_secret("SESSION_SECRET", "troque-esta-chave"),
+        producer_user=_text("VFENCE_PRODUCER_USER", ""),
+        producer_password=_secret("VFENCE_PRODUCER_PASSWORD", ""),
+        property_timezone=_text("VFENCE_PROPERTY_TIMEZONE", "America/Sao_Paulo"),
     )
     _check(settings)
     return settings
@@ -266,6 +272,13 @@ def _database_url() -> str | None:
 
 
 def _check(settings: Settings) -> None:
+    if bool(settings.producer_user) != bool(settings.producer_password):
+        raise ConfigError("VFENCE_PRODUCER_USER e VFENCE_PRODUCER_PASSWORD devem ser configurados juntos")
+    if settings.producer_user and (
+        settings.producer_user.casefold() == settings.admin_user.casefold()
+        or settings.producer_password == settings.admin_password
+    ):
+        raise ConfigError("A credencial de Produtor deve ser distinta da Gestão")
     """Recusa configurações impossíveis já na subida do servidor.
 
     A ideia é falhar alto e cedo: um BASE_LAT digitado como 31.3 em vez

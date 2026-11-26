@@ -47,6 +47,15 @@ class Settings:
     profile_control_enabled: bool = _as_bool(os.getenv("PROFILE_CONTROL_ENABLED"), False)
     profile_control_token: str = os.getenv("PROFILE_CONTROL_TOKEN", "")
     terminal_detail: bool = _as_bool(os.getenv("VFENCE_TERMINAL_DETAIL"), False)
+    windows_base: bool = _as_bool(os.getenv("VFENCE_WINDOWS_BASE"), False)
+    fpga_enabled: bool = _as_bool(os.getenv("VFENCE_FPGA_ENABLED"), False)
+    fpga_auto_profile_enabled: bool = _as_bool(os.getenv("VFENCE_FPGA_AUTO_PROFILE_ENABLED"), False)
+    jtag_dll_dir: str = os.getenv("VFENCE_JTAG_DLL_DIR", r"C:\altera\13.1\quartus\bin64")
+    jtag_cable: str = os.getenv("VFENCE_JTAG_CABLE", "USB-Blaster [USB-0]")
+    jtag_device: int = int(os.getenv("VFENCE_JTAG_DEVICE", "1"))
+    jtag_instance: int = int(os.getenv("VFENCE_JTAG_INSTANCE", "0"))
+    hdop_clock_map: str = os.getenv("VFENCE_HDOP_CLOCK_MAP", "{}")
+    gateway_clock_map: str = os.getenv("VFENCE_GATEWAY_CLOCK_MAP", "{}")
 
 
 settings = Settings()

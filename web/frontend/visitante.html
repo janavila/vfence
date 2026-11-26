@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rebanho público | VFence</title>
+  <link rel="icon" href="/static/VFence.png" type="image/png">
+  <link rel="stylesheet" href="/vendor/leaflet/leaflet.css">
+  <link rel="stylesheet" href="/css/style.css">
+  <link rel="stylesheet" href="/css/visitante.css">
+  <script defer src="/vendor/leaflet/leaflet.js"></script>
+  <script type="module" src="/js/visitante.js"></script>
+</head>
+<body class="visitor-page">
+  <header class="visitor-header">
+    <div class="visitor-container visitor-header-inner">
+      <div class="visitor-brand"><img src="/static/VFence.png" alt="VFence"><span>Visitante</span></div>
+      <a class="button visitor-back" data-back href="/">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m10 6-6 6 6 6M4 12h16"/></svg>
+        Voltar ao início
+      </a>
+    </div>
+  </header>
+  <main class="visitor-container visitor-main">
+    <section class="visitor-intro" aria-labelledby="visitor-title">
+      <div>
+        <h1 id="visitor-title">Rebanho público</h1>
+        <p>Acompanhe a localização dos animais e sua situação em relação à cerca virtual.</p>
+      </div>
+      <p id="visitor-update" class="visitor-update" role="status">Consultando o rebanho…</p>
+    </section>
+    <section aria-label="Resumo do rebanho">
+      <dl class="visitor-counts" id="visitor-counts"></dl>
+      <p class="visitor-count-note" id="visitor-count-note" hidden></p>
+    </section>
+    <section class="visitor-panel" id="visitor-map-panel" aria-labelledby="visitor-map-title">
+      <div class="visitor-panel-heading">
+        <div><h2 id="visitor-map-title">Mapa do rebanho</h2><p id="visitor-map-status">Consultando informações públicas…</p></div>
+        <button class="button visitor-secondary" id="visitor-fit" type="button" disabled>Reenquadrar mapa</button>
+      </div>
+      <div id="shared-herd-map" class="visitor-map" role="region" aria-label="Mapa de posições atuais"></div>
+      <ul class="visitor-legend" aria-label="Legenda do mapa">
+        <li><span class="visitor-dot inside"></span>Dentro da cerca</li>
+        <li><span class="visitor-dot near"></span>Próximo da cerca</li>
+        <li><span class="visitor-dot outside"></span>Fora da cerca</li>
+        <li><span class="visitor-dot unknown"></span>Situação indisponível</li>
+        <li><span class="visitor-fence-key"></span>Cerca virtual</li>
+      </ul>
+    </section>
+    <section class="visitor-panel" aria-labelledby="visitor-animals-title">
+      <div class="visitor-panel-heading"><h2 id="visitor-animals-title">Animais monitorados</h2></div>
+      <ul class="visitor-animals" id="visitor-animals"><li class="visitor-empty">Consultando animais…</li></ul>
+    </section>
+    <section class="visitor-panel" aria-labelledby="visitor-alerts-title">
+      <div class="visitor-panel-heading"><h2 id="visitor-alerts-title">Avisos ativos</h2></div>
+      <ul class="visitor-alerts" id="visitor-alerts"><li class="visitor-empty">Consultando avisos…</li></ul>
+    </section>
+  </main>
+  <footer class="visitor-footer">VFence — Sistema inteligente de cercamento virtual</footer>
+</body>
+</html>

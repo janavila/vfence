@@ -12,6 +12,7 @@
 #include "event_serial_delivery.h"
 #include "gateway_serial_output.h"
 #include "metric_serial_export.h"
+#include "metric_evidence_store.h"
 #include "pdr_serial.h"
 #include "profile_plan.h"
 #include "serial_command_input.h"
@@ -67,28 +68,21 @@ struct RadioWindowStats {
   int32_t snrSumX100;
   uint16_t recentSequences[MAX_RECENT_RADIO_SEQUENCES];
   uint16_t windowSampleCount;
-  int16_t rssiMeanX100;
-  int16_t snrMeanX100;
-  uint16_t radioSampleCount;
   uint8_t recentSequenceCount;
   uint8_t nextRecentSequence;
-  bool rssiMeanValid;
-  bool snrMeanValid;
 };
 
 struct CollarState {
-  bool seen;
-  bool online;
   uint32_t lastSeenMs;
   int lastRssi;
   float lastSnr;
-  uint16_t lastTelemetrySequence;
-  bool haveTelemetrySequence;
-  bool terminalHasRadioMetrics;
+  RadioWindowStats radio;
   uint16_t recentReliable[MAX_RECENT_RELIABLE];
   uint8_t recentReliableCount;
   uint8_t recentReliableNext;
-  RadioWindowStats radio;
+  bool seen;
+  bool online;
+  bool terminalHasRadioMetrics;
 };
 
 // IDs validos de coleira: 0x01..0xFE. O indice 0 existe, mas nao e usado.
@@ -125,6 +119,8 @@ struct RadioWindowSummary {
 
 static uint64_t radioSessionId = 0;
 static uint64_t radioNextWindowId = 1;
+static uint64_t evidenceEpochFirst = 1;
+static GatewayMetricEvidence metricEvidence;
 static RadioSummaryFrame radioSummaryFrames[RADIO_SUMMARY_CAPACITY];
 static uint8_t radioSummaryTail = 0;
 static uint8_t radioSummaryFrameCount = 0;
@@ -135,14 +131,7 @@ static uint32_t radioTerminalLastMs = 0;
 static uint32_t radioTerminalSkipped = 0;
 static_assert(RADIO_WINDOW_MS == PDR_WINDOW_MS, "PDR and RADIO use the same clock boundaries");
 
-struct PdrSlot {
-  PositionPdr tracker;
-  PdrReport latest;
-  bool pending;
-  bool hasReport;
-};
-
-static PdrSlot pdrSlots[255]{};
+static LegacyPdrSlots pdrSlots;
 static bool pdrTxReady = false;
 static unsigned pdrLastId = 0;
 static unsigned pdrPendingCount = 0;
@@ -866,17 +855,17 @@ static void publishRadioWindow(uint32_t startedAtMs, bool useSamples, bool repor
   if (radioSummaryFrameCount < RADIO_SUMMARY_CAPACITY) ++radioSummaryFrameCount;
 
   for (uint16_t id = 1; id <= 0xFE; ++id) {
-    auto& pdr = pdrSlots[id];
-    if (pdr.tracker.known()) {
-      const auto result = pdr.tracker.closeWindow();
+    auto* pdr = pdrSlots.find(static_cast<uint8_t>(id));
+    if (pdr && pdr->tracker.known()) {
+      const auto result = pdr->tracker.closeWindow();
       const auto published = useSamples ? result : PdrWindowResult{};
-      if (!pdr.hasReport || published.reason != PdrReason::NO_SAMPLES ||
-          pdr.latest.result.reason != PdrReason::NO_SAMPLES) {
-        if (pdr.pending) ++pdrOverwritten;
+      if (!pdr->hasReport || published.reason != PdrReason::NO_SAMPLES ||
+          pdr->latest.result.reason != PdrReason::NO_SAMPLES) {
+        if (pdr->pending) ++pdrOverwritten;
         else ++pdrPendingCount;
-        pdr.latest = {published, frame.windowId, startedAtMs};
-        pdr.hasReport = pdr.pending = true;
-        if (PDR_SERIAL_COMMIT_ENABLED && !pdrSerialDelivery.retain(static_cast<uint8_t>(id), pdr.latest) &&
+        pdr->latest = {published, frame.windowId, startedAtMs};
+        pdr->hasReport = pdr->pending = true;
+        if (PDR_SERIAL_COMMIT_ENABLED && !pdrSerialDelivery.retain(static_cast<uint8_t>(id), pdr->latest) &&
             (pdrSerialDelivery.refused == 1 || pdrSerialDelivery.refused % 100 == 0)) {
           gatewayTerminal.tryPrint(framedSerial, "[ERRO] [GATEWAY] PDR v2 retencao cheia recusados=%lu\n",
                                    static_cast<unsigned long>(pdrSerialDelivery.refused));
@@ -890,19 +879,14 @@ static void publishRadioWindow(uint32_t startedAtMs, bool useSamples, bool repor
     if (!collar.seen) continue;
     RadioWindowStats& radio = collar.radio;
 
-    radio.radioSampleCount = useSamples ? radio.windowSampleCount : 0;
-    radio.rssiMeanValid = radio.snrMeanValid = radio.radioSampleCount != 0;
-    radio.rssiMeanX100 = 0;
-    radio.snrMeanX100 = 0;
-    if (radio.radioSampleCount != 0) {
-      radio.rssiMeanX100 = radioMeanX100(radio.rssiSumX100, radio.radioSampleCount);
-      radio.snrMeanX100 = radioMeanX100(radio.snrSumX100, radio.radioSampleCount);
+    entry = {0, 0, useSamples ? radio.windowSampleCount : uint16_t(0), true, false};
+    if (entry.radioSampleCount != 0) {
+      entry.rssiMeanX100 = radioMeanX100(radio.rssiSumX100, entry.radioSampleCount);
+      entry.snrMeanX100 = radioMeanX100(radio.snrSumX100, entry.radioSampleCount);
     }
     radio.rssiSumX100 = 0;
     radio.snrSumX100 = 0;
     radio.windowSampleCount = 0;
-    entry = {radio.rssiMeanX100, radio.snrMeanX100, radio.radioSampleCount, true, false};
-
   }
 }
 
@@ -972,12 +956,12 @@ static void servicePdrOutput(uint32_t now) {
   pdrLastPollMs = now;
   for (unsigned i = 1; i <= 254; ++i) {
     const unsigned id = (pdrLastId + i - 1) % 254 + 1;
-    auto& slot = pdrSlots[id];
-    if (!slot.pending) continue;
+    auto* slot = pdrSlots.find(static_cast<uint8_t>(id));
+    if (!slot || !slot->pending) continue;
     if (PDR_SERIAL_EXPORT_ENABLED && !pdrTxReady) return;
     if (pdrTxReady && !PDR_SERIAL_COMMIT_ENABLED) {
       char line[512];
-      const size_t length = formatPdrReport(slot.latest, radioSessionId, id, line);
+      const size_t length = formatPdrReport(slot->latest, radioSessionId, id, line);
       if (!length) return;
       const auto sent = framedSerial.tryWrite(reinterpret_cast<const uint8_t*>(line), length);
       if (sent == SerialWriteResult::REFUSED) return;
@@ -985,7 +969,7 @@ static void servicePdrOutput(uint32_t now) {
       if (sent == SerialWriteResult::PARTIAL) ++pdrShortWrites;
     }
 
-    const auto& result = slot.latest.result;
+    const auto& result = slot->latest.result;
     char estimate[48] = "PDR=N/A";
     if (result.reason == PdrReason::OK)
       snprintf(estimate, sizeof(estimate), "tx~%u perda~%u PDR~%.2f%%",
@@ -1001,7 +985,7 @@ static void servicePdrOutput(uint32_t now) {
     if (!pdrTxReady && framedSerial.availableForWrite() < length) return;
     gatewayTerminal.write(framedSerial, reinterpret_cast<const uint8_t*>(human), length);
     pdrLastId = id;
-    slot.pending = false;
+    slot->pending = false;
     --pdrPendingCount;
     if (GATEWAY_TERMINAL_DETAIL && (pdrOverwritten || pdrShortWrites)) {
       char diag[112];
@@ -1388,12 +1372,6 @@ static void processHdopSummary(const PacketView& packet, uint32_t receivedAtMs) 
 
 static void emitPositionStatus(const PacketView& packet, const TelemetryPayload& d, int rssi,
                                float snr, bool hasRadioMetrics) {
-  CollarState& c = collars[packet.header.collarId];
-  // A sequence e global por coleira e tambem e consumida por EVENT/CONTROL.
-  // Portanto, saltos entre duas TELEMETRY nao significam necessariamente perda.
-  c.lastTelemetrySequence = packet.header.sequence;
-  c.haveTelemetrySequence = true;
-
   gatewayOutput.print("[APP] {\"schema\":\""); gatewayOutput.print(SERIAL_SCHEMA);
   gatewayOutput.print("\",\"kind\":\"telemetry\",\"collarId\":");
   gatewayOutput.print(packet.header.collarId);
@@ -1744,6 +1722,90 @@ void processControl(const PacketView& packet) {
 // PROCESSAMENTO CENTRAL DE RX
 // ============================================================
 
+static bool metricWindowFor(uint64_t session, uint64_t id, uint8_t profile, MetricWindow& window) {
+  if (session != radioSessionId || profile != radioTransition.active || id < evidenceEpochFirst ||
+      id > radioNextWindowId + 1 || (id <= radioNextWindowId && radioNextWindowId - id >= EVIDENCE_HISTORY))
+    return false;
+  const uint32_t offset = static_cast<uint32_t>(id - radioNextWindowId) * EVIDENCE_WINDOW_MS;
+  window = {session, id, radioWindowStartMs + offset, profile};
+  return true;
+}
+
+static bool handleEvidenceControl(const PacketView& packet, uint32_t now) {
+  const auto* p = packet.payload;
+  const auto id = packet.header.collarId;
+  if (evidenceControl(packet, METRIC_CLOCK)) {
+    if (packet.payloadLength != 15 || p[2] != 1 || !gatewayTerminalIdle() || radioTransition.busy() ||
+        eventSerialDelivery.hasPending()) return true;
+    const uint64_t boot = evidenceRead64(p + 7);
+    if (!boot) return true;
+    auto* member = metricEvidence.admit(id, now);
+    if (!member) return true;
+    const MetricWindow current{radioSessionId, radioNextWindowId, radioWindowStartMs, radioTransition.active};
+    if (member->boot && member->boot != boot) {
+      auto* slot = metricEvidence.slot(id, current, member->boot, true);
+      if (slot) slot->conflict = true;
+      // Publish invalidation with the existing PDR reason and no assumed new
+      // session for the interrupted interval.
+      PdrReport changed{{}, current.id, current.start};
+      changed.result.reason = PdrReason::SESSION_CHANGED;
+      char line[512];
+      const auto size = formatPdrReport(changed, current.gateway, id, line);
+      if (!size || !framedSerial.canQueue(1)) return true;
+      framedSerial.queue(reinterpret_cast<const uint8_t*>(line), size, true);
+    }
+    member->boot = boot;
+    uint8_t response[MAX_PACKET_SIZE];
+    const auto size = encodeMetricClock(response, sizeof(response), id, allocateSequence(), readU32BE(p + 3),
+                                        boot, &current, millis());
+    if (size) transportSend(response, size);
+    return true;
+  }
+  if (evidenceControl(packet, METRIC_PROOF)) {
+    MetricProof proof;
+    MetricWindow expected;
+    if (decodeMetricProof(packet, proof) &&
+        metricWindowFor(proof.window.gateway, proof.window.id, proof.window.profile, expected) &&
+        sameMetricWindow(expected, proof.window) && proof.window.id <= radioNextWindowId) {
+      auto* slot = metricEvidence.slot(id, expected, proof.boot, true);
+      if (slot && !slot->retain(proof))
+        gatewayTerminal.print(framedSerial, "[AVISO] PDR comprovado: contagem rejeitada COL %u\n", unsigned(id));
+    }
+    return true;
+  }
+  return false;
+}
+
+static void serviceMetricEvidence(uint32_t now) {
+  if (!PROVEN_METRICS_ENABLED || !gatewayTerminalIdle() || radioTransition.busy() || eventSerialDelivery.hasPending())
+    return;
+  static unsigned cursor = 0;
+  constexpr unsigned slots = GatewayMetricEvidence::MAX_COLLARS * EVIDENCE_HISTORY;
+  for (unsigned i = 0; i < slots; ++i) {
+    const unsigned position = cursor++ % slots;
+    auto& member = metricEvidence.members[position / EVIDENCE_HISTORY];
+    auto& slot = member.windows[position % EVIDENCE_HISTORY];
+    if (!member.id || !slot.closed || slot.conflict || slot.window.id < evidenceEpochFirst ||
+        slot.window.id >= radioNextWindowId || radioNextWindowId - slot.window.id >= EVIDENCE_HISTORY) continue;
+    if (slot.ackPending) {
+      uint8_t packet[MAX_PACKET_SIZE];
+      const auto size = encodeMetricProof(packet, sizeof(packet), member.id, allocateSequence(), slot.proof(), true);
+      if (size && transportSend(packet, size)) slot.ackPending = false;
+      return;
+    }
+    if (slot.committed || (slot.sent && now - slot.lastSerial < 1000) ||
+        !framedSerial.canQueue(FramedSerial<GatewaySerialPort>::RESERVED_FRAMES + 1)) continue;
+    char line[512];
+    const auto size = formatEvidence(slot, member.id, line);
+    if (size) {
+      framedSerial.queue(reinterpret_cast<const uint8_t*>(line), size, false);
+      slot.sent = true;
+      slot.lastSerial = now;
+    }
+    return;
+  }
+}
+
 void processIncomingPacket(const uint8_t* data, size_t len,
                            int rssi = 0, float snr = 0.0f,
                            bool hasRadioMetrics = false, uint32_t receivedAtMs = 0) {
@@ -1756,6 +1818,30 @@ void processIncomingPacket(const uint8_t* data, size_t len,
   const uint8_t collarId = packet.header.collarId;
   if (!validCollarId(collarId)) {
     gatewayTerminal.print(framedSerial, "[RX] collarId invalido para uplink: 0x%X\n", unsigned(collarId));
+    return;
+  }
+  if (hasRadioMetrics && PROVEN_METRICS_ENABLED && evidenceControl(packet, METRIC_UPLINK)) {
+    PacketView inner;
+    MetricAttempt attempt;
+    if (!unwrapMetricAttempt(packet, inner, attempt)) return;
+    MetricWindow window;
+    if (metricWindowFor(attempt.gateway, attempt.window, attempt.profile, window)) {
+      auto* slot = metricEvidence.slot(collarId, window, attempt.boot, true);
+      if (slot && !slot->conflict) {
+        if (slot->rx.seen(attempt.ordinal)) return;
+        if (!slot->closed) {
+          const bool valid = rssi >= -255 && rssi <= 0 && isfinite(snr) && snr >= -327.68f && snr <= 327.67f;
+          slot->rx.observe(attempt.ordinal, valid, valid ? static_cast<int16_t>(rssi * 100) : 0,
+                           valid ? static_cast<int16_t>(lroundf(snr * 100)) : 0);
+        }
+      }
+    }
+    // All legacy messages, including event duplicates with a new physical
+    // ordinal, still pass through the original handlers and ACK policy.
+    packet = inner;
+  }
+  if (PROVEN_METRICS_ENABLED && hasRadioMetrics && handleEvidenceControl(packet, receivedAtMs)) {
+    markCollarSeen(collarId, rssi, snr, true);
     return;
   }
 
@@ -1788,10 +1874,18 @@ void processIncomingPacket(const uint8_t* data, size_t len,
     // ONLINE means a valid contact for this subtype, even without a GNSS fix
     // or when this ordinal does not contribute to the PDR window.
     markCollarSeen(collarId, rssi, snr, hasRadioMetrics);
-    if (hasRadioMetrics &&
-        pdrSlots[collarId].tracker.observe(tag, receivedAtMs, radioTransition.active) &&
-        tag.profileId == radioTransition.active) {
-      accumulateRadioSample(collars[collarId].radio, packet.header.sequence, rssi, snr);
+    if (hasRadioMetrics) {
+      if (auto* pdr = pdrSlots.acquire(collarId)) {
+        if (pdr->tracker.observe(tag, receivedAtMs, radioTransition.active) &&
+            tag.profileId == radioTransition.active)
+          accumulateRadioSample(collars[collarId].radio, packet.header.sequence, rssi, snr);
+      } else {
+        static bool warned = false;
+        if (!warned) {
+          warned = true;
+          gatewayTerminal.print(framedSerial, "[ERRO] [GATEWAY] memoria insuficiente para PDR legado\n");
+        }
+      }
     }
     emitPositionStatus(legacy, position, rssi, snr, hasRadioMetrics);
     return;
@@ -1840,13 +1934,14 @@ void pollLoRaReceive() {
   const int packetSize = LoRa.parsePacket();
   if (packetSize <= 0) return;
 
-  uint8_t data[MAX_PACKET_SIZE];
+  uint8_t data[EVIDENCE_PACKET_MAX];
   size_t count = 0;
-  bool oversized = packetSize > static_cast<int>(MAX_PACKET_SIZE);
+  const size_t maxSize = PROVEN_METRICS_ENABLED ? sizeof(data) : MAX_PACKET_SIZE;
+  bool oversized = packetSize > static_cast<int>(maxSize);
 
   while (LoRa.available()) {
     const int b = LoRa.read();
-    if (count < MAX_PACKET_SIZE && b >= 0) {
+    if (count < maxSize && b >= 0) {
       data[count++] = static_cast<uint8_t>(b);
     }
   }
@@ -1873,7 +1968,7 @@ void pollLoRaReceive() {
   }
 
   if (GATEWAY_TERMINAL_DETAIL) {
-    char hex[MAX_PACKET_SIZE * 3];
+    char hex[EVIDENCE_PACKET_MAX * 3];
     terminalHex(data, count, hex);
     gatewayTerminal.print(framedSerial, "[RX LoRa] [GATEWAY] bytes=%u RSSI=%ddBm SNR=%.2fdB\n%s\n",
                           unsigned(count), rssi, static_cast<double>(snr), hex);
@@ -2190,6 +2285,7 @@ static void serviceGlobalProfile() {
         if (profile != radioTransition.active) {
           publishRadioWindow(radioWindowStartMs, false, false);
           radioWindowStartMs = millis();
+          evidenceEpochFirst = radioNextWindowId;
         }
         return true;
       });
@@ -2411,6 +2507,19 @@ void processJsonCommand(const String& line) {
     pdrSerialDelivery.confirm(radioSessionId, session, static_cast<uint8_t>(collar), window);
     return;
   }
+  if (command == "EVIDENCE_COMMITTED") {
+    uint32_t collar;
+    uint64_t session, window, boot;
+    if (!PROVEN_METRICS_ENABLED || !json.unsignedField("collarId", collar, 254) || !collar ||
+        !json.stringField("gatewaySessionId", field, length) || length != 16 || !readMetricId(field, session) ||
+        !json.stringField("collarSessionId", field, length) || length != 16 || !readMetricId(field, boot) ||
+        !json.stringField("windowId", field, length) || length != 16 || !readMetricId(field, window)) return;
+    MetricWindow expected;
+    if (!metricWindowFor(session, window, radioTransition.active, expected)) return;
+    auto* slot = metricEvidence.slot(static_cast<uint8_t>(collar), expected, boot, false);
+    if (slot && slot->closed && slot->sent) slot->ackPending = slot->committed = true;
+    return;
+  }
   if (processProfileTransition(json, command, requestId) || processProfileCommand(json, command, requestId)) return;
   if (PROFILE_SWITCH_ENABLED && radioTransition.busy() &&
       (command == "SET_PARAMETERS" || command == "FENCE_NEW" || command == "FENCE_POINT" ||
@@ -2422,6 +2531,20 @@ void processJsonCommand(const String& line) {
   if (command == "GET_STATUS") {
     emitCommandResponse(requestId, command.c_str(), true);
     emitGatewayAndCollarStatus();
+    return;
+  }
+  if (command == "GET_METRIC_CLOCK_V1") {
+    // Timestamp at the start of response generation. The Base brackets this
+    // instant with its own monotonic request and receive timestamps.
+    const uint32_t tick = millis();
+    emitAppHeader("command_response", true);
+    gatewayOutput.printf(",\"requestId\":%lu,\"command\":\"GET_METRIC_CLOCK_V1\",\"ok\":true,"
+        "\"clockVersion\":1,\"gatewaySessionId\":\"%016llx\",\"tickMs\":%lu,"
+        "\"windowStartMs\":%lu,\"windowId\":\"%016llx\",\"durationMs\":60000}\n",
+        static_cast<unsigned long>(requestId),
+        static_cast<unsigned long long>(radioSessionId),
+        static_cast<unsigned long>(tick), static_cast<unsigned long>(radioWindowStartMs),
+        static_cast<unsigned long long>(radioNextWindowId));
     return;
   }
   if (command == "GET_RADIO") {
@@ -2734,5 +2857,6 @@ void loop() {
       return true;
     });
   if (PROFILE_SWITCH_ENABLED) serviceGlobalProfile();
+  serviceMetricEvidence(millis());
   serviceTerminalSummary(millis());
 }

@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Histórico | VFence</title><link rel="icon" href="/static/VFence.png">
+  <link rel="stylesheet" href="/vendor/leaflet/leaflet.css"><link rel="stylesheet" href="/css/style.css">
+  <link rel="stylesheet" href="/css/visitante.css"><link rel="stylesheet" href="/css/produtor.css"><link rel="stylesheet" href="/css/gestao.css">
+  <script defer src="/vendor/leaflet/leaflet.js"></script>
+</head>
+<body class="visitor-page producer-area management-area">
+<!-- area-header -->
+<main class="visitor-container visitor-main">
+  <div class="visitor-intro"><div><h1>Histórico</h1><p>Consulte as posições registradas e as versões publicadas da cerca.</p></div></div>
+  <nav class="button-row management-tabs" aria-label="Seções do histórico">
+    <a href="#deslocamento" class="button visitor-secondary">Deslocamento dos animais</a>
+    <a href="#historico-cercas" class="button visitor-secondary">Histórico de cercas</a>
+  </nav>
+  <section class="visitor-panel" id="deslocamento">
+    <div class="visitor-panel-heading"><div><h2>Deslocamento dos animais</h2><p id="movement-timezone"></p></div></div>
+    <form id="movement-form" class="management-filters">
+      <label>Animal ou coleira <select id="movement-collar" required><option value="">Selecione</option></select></label>
+      <label>Data <input id="movement-date" type="date" required></label>
+      <label>Período <select id="movement-period"><option value="day">Dia inteiro</option><option value="am">Manhã</option><option value="pm">Tarde</option><option value="custom">Horário personalizado</option></select></label>
+      <label data-custom-time hidden>De <input id="movement-start" type="time" value="08:00"></label>
+      <label data-custom-time hidden>Até <input id="movement-end" type="time" value="12:00"></label>
+      <button class="button primary" type="submit" disabled>Consultar percurso</button>
+    </form>
+    <p id="movement-status" role="status">Selecione uma coleira e uma data.</p>
+  </section>
+  <dl id="movement-counts" class="visitor-counts management-history-counts" aria-label="Resumo do percurso"></dl>
+  <section class="visitor-panel">
+    <div class="visitor-panel-heading"><h2>Mapa do percurso registrado</h2><button class="button visitor-secondary" id="movement-fit" disabled>Reenquadrar mapa</button></div>
+    <div class="management-filters movement-controls">
+      <label class="checkbox-row"><input type="checkbox" id="movement-points"> Pontos intermediários</label>
+      <label class="checkbox-row"><input type="checkbox" id="movement-fences" checked> Mostrar cerca</label>
+      <label>Versão no mapa <select id="movement-version"><option value="">Todas as reportadas</option></select></label>
+    </div>
+    <div id="movement-map" class="visitor-map" role="region" aria-label="Mapa do deslocamento"></div>
+    <ul class="visitor-legend"><li><span class="movement-key"></span> Percurso registrado</li><li><span class="visitor-fence-key"></span> Cerca histórica</li><li>Início e fim identificados no mapa</li></ul>
+    <p id="movement-map-status"></p>
+    <details class="producer-rules"><summary>Como o percurso e a distância são calculados</summary><p>A linha liga posições registradas em ordem de geração. É interrompida quando há GPS inválido, perda de comunicação registrada, mais de 120 segundos entre posições ou um salto acima de 5 m/s com tolerância adicional de 15 m. A distância estimada soma, por Haversine, apenas os trechos contínuos. A amostragem, as lacunas e a imprecisão do GNSS afetam a estimativa.</p></details>
+  </section>
+  <section class="visitor-panel"><div class="visitor-panel-heading"><h2>Registros do percurso</h2><div class="button-row"><button id="movement-previous" class="button visitor-secondary" hidden>Anterior</button><button id="movement-more" class="button visitor-secondary" hidden>Próxima</button></div></div>
+    <p id="movement-page" role="status"></p>
+    <div class="table-scroll" tabindex="0"><table class="data-table"><thead><tr><th>Horário da posição</th><th>Situação</th><th>Localização</th><th>Cerca reportada</th><th>Mapa</th></tr></thead><tbody id="movement-records"></tbody></table></div>
+  </section>
+  <section id="historico-cercas" class="visitor-panel"><div class="visitor-panel-heading"><h2>Histórico de cercas</h2></div><p id="fences-feedback" role="status">Carregando cercas…</p><ul id="published-list" class="visitor-alerts producer-saved"></ul></section>
+</main>
+<footer class="visitor-footer">VFence — Sistema inteligente de cercamento virtual</footer>
+<script type="module" src="/js/gestao-historico.js"></script><script type="module" src="/js/my-fences.js"></script>
+</body>
+</html>

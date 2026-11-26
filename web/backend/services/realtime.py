@@ -48,6 +48,7 @@ class Client:
     queue: asyncio.Queue
     task: asyncio.Task | None = None
     close_code: int | None = None
+    invalidation_only: bool = False
 
 
 class RealtimeHub:
@@ -62,7 +63,7 @@ class RealtimeHub:
         """Quantos navegadores estão ouvindo. Usado no diagnóstico."""
         return len(self._connections)
 
-    async def connect(self, websocket: WebSocket, hello: dict) -> bool:
+    async def connect(self, websocket: WebSocket, hello: dict, *, invalidation_only: bool = False) -> bool:
         try:
             await asyncio.wait_for(websocket.accept(), _IO_TIMEOUT)
         except (RuntimeError, OSError, TimeoutError):
@@ -70,7 +71,7 @@ class RealtimeHub:
         if self._closed or self.count >= _MAX_CLIENTS:
             await self._close_socket(websocket, 1013)
             return False
-        client = Client(asyncio.Queue(maxsize=_QUEUE_SIZE))
+        client = Client(asyncio.Queue(maxsize=_QUEUE_SIZE), invalidation_only=invalidation_only)
         client.queue.put_nowait(hello)
         self._connections[websocket] = client
         client.task = asyncio.create_task(self._write(websocket, client))
@@ -94,7 +95,11 @@ class RealtimeHub:
             if client.close_code is not None:
                 continue
             try:
-                client.queue.put_nowait(message)
+                if client.invalidation_only:
+                    if client.queue.empty():
+                        client.queue.put_nowait({"type": "invalidate"})
+                else:
+                    client.queue.put_nowait(message)
             except asyncio.QueueFull:
                 client.close_code = 1013
                 logger.warning("websocket backlog full; client reconnect required")

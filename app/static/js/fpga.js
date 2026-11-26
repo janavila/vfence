@@ -26,6 +26,7 @@ const isRecent = (stamp, maxAge = MAX_AGE_MS) => {
 };
 const profileName = value => between(value, 0, 3) ? `P${value}` : EMPTY;
 const display = (value, unit = '') => Number.isFinite(value) ? `${number.format(value / 100)}${unit}` : EMPTY;
+const freshWindow = row => row?.source === 'proven' ? row.freshness === 'recent' : isRecent(row?.persisted_at);
 
 let collars = [];
 let positionCollars = [];
@@ -153,8 +154,8 @@ function windowDetails(row, clock, sessionId = row?.session_id) {
     ['Sessão', sessionId], ['Janela', row?.window_id],
     ['Duração', Number.isFinite(row?.duration_ms) ? `${row.duration_ms / 1000} s` : EMPTY],
     [`Início · relógio ${clock}`, between(row?.started_at_ms, 0, 0xffffffff) ? `${row.started_at_ms} ms` : EMPTY],
-    ['Gravação no Raspberry', date(row?.persisted_at)],
-    ['Idade do registro', !row?.persisted_at ? 'Indisponível' : isRecent(row.persisted_at) ? 'Recente' : 'Antigo'],
+    ['Gravação na Base', date(row?.persisted_at)],
+    ['Atualidade', !row?.persisted_at || row.freshness === 'unknown' ? 'Indisponível' : freshWindow(row) ? 'Recente' : 'Antigo'],
   ];
 }
 
@@ -165,7 +166,8 @@ function flagLabel(flag) {
 }
 
 function metricRows() {
-  return {hdop: linkMetrics?.windows?.hdop?.[0], radio: linkMetrics?.windows?.radio?.[0], pdr};
+  return {hdop: linkMetrics?.windows?.hdop?.[0], radio: linkMetrics?.windows?.radio?.[0],
+    pdr: linkMetrics?.windows?.pdr?.[0] ?? pdr};
 }
 
 function renderMetrics() {
@@ -176,7 +178,7 @@ function renderMetrics() {
     ? (hdop.hdop_mean_valid === true ? display(hdop.hdop_mean_x100) : 'N/A') : empty;
   showDetails('fpga-hdop', hdop ? [
     ['Amostras', hdop.sample_count], ['Validade', flagLabel(hdop.hdop_mean_valid)],
-    ['Produtor', hdop.producer_id], ...windowDetails(hdop, 'da coleira'),
+    ['Produtor', hdop.producer_id], ...windowDetails(hdop, hdop.timing_proven ? 'do Gateway' : 'da coleira'),
     ['Recepção · relógio do Gateway', between(hdop.gateway_received_at_ms, 0, 0xffffffff)
       ? `${hdop.gateway_received_at_ms} ms` : EMPTY],
     ['Sessão do Gateway na recepção', hdop.gateway_session_id],
@@ -192,7 +194,10 @@ function renderMetrics() {
   byId('fpga-pdr-value').textContent = delivery
     ? (delivery.valid === true ? display(delivery.pdr_x100, '%') : 'N/A') : empty;
   showDetails('fpga-pdr', delivery ? [
-    ['Recebidos', delivery.received_count], ['Enviados estimados', delivery.estimated_tx_count],
+    ['Origem', delivery.tx_proven ? 'PDR comprovado' : 'PDR estimado · legado'],
+    ['Recebidos', delivery.received_count],
+    [delivery.tx_proven ? 'Transmissões comprovadas' : 'Enviados estimados',
+      delivery.tx_proven ? delivery.transmitted_count : delivery.estimated_tx_count],
     ['Perfil', profileName(delivery.profile_id)], ['Validade', flagLabel(delivery.valid)],
     ['Motivo', delivery.valid === true ? EMPTY : pdrReasons[delivery.reason] ?? 'Motivo indisponível'],
     ['Gateway', delivery.gateway_id], ['Sessão da coleira', delivery.collar_session_id],
@@ -206,7 +211,7 @@ function metricField(row, key, validKey, min, max, count, minCount = 1, maxCount
   if (row[validKey] === false || !between(count, minCount, maxCount) ||
       (value != null && !between(value, min, max))) return [value, 'invalid'];
   if (value == null || row[validKey] !== true) return [value, 'missing'];
-  if (!isRecent(row.persisted_at) || row.duration_ms !== 60000 ||
+  if (!freshWindow(row) || row.duration_ms !== 60000 ||
       !hexId(row.window_id) || !between(row.started_at_ms, 0, 0xffffffff)) return [value, 'invalid'];
   return [value, 'valid'];
 }
@@ -220,19 +225,26 @@ function previewFields() {
   const hdopField = metricField(hdop, 'hdop_mean_x100', 'hdop_mean_valid', 0, 65534, hdop?.sample_count, 1, 60);
   const rssiField = metricField(radio, 'rssi_mean_x100', 'rssi_mean_valid', -25500, 0, radio?.sample_count, 1, 255);
   const snrField = metricField(radio, 'snr_mean_x100', 'snr_mean_valid', -32768, 32767, radio?.sample_count, 1, 255);
-  const pdrField = metricField(delivery, 'pdr_x100', 'valid', 1, 10000, delivery?.received_count, 2, 64);
+  const pdrField = metricField(delivery, 'pdr_x100', 'valid', 0, 10000, delivery?.received_count, 2,
+    delivery?.tx_proven ? 512 : 64);
   const radioMatchesPdr = radio && delivery && radio.producer_id === delivery.gateway_id &&
     hexId(radio.session_id) && radio.session_id === delivery.gateway_session_id &&
     radio.window_id === delivery.window_id && radio.started_at_ms === delivery.started_at_ms &&
-    radio.duration_ms === delivery.duration_ms;
+    radio.duration_ms === delivery.duration_ms &&
+    (!delivery.tx_proven || (radio.timing_proven && radio.profile_id === delivery.profile_id &&
+      radio.collar_session_id === delivery.collar_session_id));
   const correlate = (field, matches) => field[1] === 'valid' && !matches ? [field[0], 'uncorrelated'] : field;
-  const alignedHdop = correlate(hdopField, false);
+  const alignedHdop = correlate(hdopField, delivery?.tx_proven && hdop?.timing_proven &&
+    hdop.gateway_id === delivery.gateway_id && hdop.installation_id === delivery.installation_id &&
+    hdop.session_id === delivery.collar_session_id && hdop.gateway_session_id === delivery.gateway_session_id &&
+    hdop.window_id === delivery.window_id && hdop.started_at_ms === delivery.started_at_ms &&
+    hdop.duration_ms === delivery.duration_ms && hdop.profile_id === delivery.profile_id);
   const alignedRssi = correlate(rssiField, radioMatchesPdr);
   const alignedSnr = correlate(snrField, radioMatchesPdr);
   const alignedPdr = correlate(pdrField, radioMatchesPdr && hexId(delivery?.collar_session_id) &&
     profile[1] === 'valid' && delivery.profile_id === profile[0]);
   const samples = [radio?.sample_count, !radio ? 'missing' :
-    !between(radio.sample_count, 1, 255) || !isRecent(radio.persisted_at) || radio.duration_ms !== 60000 ? 'invalid' :
+    !between(radio.sample_count, 1, 255) || !freshWindow(radio) || radio.duration_ms !== 60000 ? 'invalid' :
     radioMatchesPdr ? 'valid' : 'uncorrelated'];
   const flag = field => [field[1] === 'valid' ? '1' : field[1] === 'invalid' ? '0' : null, field[1]];
   return [
@@ -244,7 +256,7 @@ function previewFields() {
       between(alignedRssi[0], -25500, 0) ? Math.round(Math.abs(alignedRssi[0]) / 100) : null, alignedRssi[1],
     ]],
     ['snr_x100', 'SNR médio do Gateway', alignedSnr],
-    ['pdr_x100', 'PDR estimado pelo Gateway', alignedPdr],
+    ['pdr_x100', delivery?.tx_proven ? 'PDR comprovado por tentativas físicas' : 'PDR estimado pelo Gateway', alignedPdr],
     ['sample_count', 'Amostras da janela RADIO', samples],
     ['metrics_valid[3]', 'HDOP', flag(alignedHdop)],
     ['metrics_valid[2]', 'PDR', flag(alignedPdr)],
@@ -257,13 +269,16 @@ function renderPreview() {
   const contextAvailable = !overviewFailed && metricsState === 'ready' && !gateway?.mock;
   const fields = previewFields();
   const status = byId('fpga-sufficiency');
-  status.textContent = 'Dados insuficientes';
-  status.dataset.state = 'Sem correlação';
+  const aligned = contextAvailable && metricRows().pdr?.tx_proven &&
+    fields.filter(([key]) => ['hdop_x100', 'rssi_mag', 'snr_x100', 'pdr_x100', 'sample_count'].includes(key))
+      .every(([, , [, state]]) => state === 'valid');
+  status.textContent = aligned ? 'Métricas da mesma janela' : 'Dados insuficientes';
+  status.dataset.state = aligned ? 'Válido' : 'Sem correlação';
   byId('fpga-input-detail').textContent = overviewFailed || metricsState === 'error'
     ? 'Consulta incompleta. Os valores anteriores, quando disponíveis, são apenas históricos.'
     : gateway?.mock ? 'A Base está em modo simulado. A prévia não está habilitada para votação.'
     : !selector.value ? 'Selecione uma coleira com telemetria na Base.'
-    : 'A Base ainda não identifica o minuto de votação nem correlaciona o relógio do HDOP com a janela do Gateway.';
+    : 'O serviço FPGA só envia SAMPLE para janelas sincronizadas elegíveis. O índice de votação aparece no comando transmitido.';
   byId('fpga-input').replaceChildren(...fields.map(([name, source, [value, state]]) => {
     if (!contextAvailable && state === 'valid' && name !== 'collar_id') {
       state = 'uncorrelated';
@@ -279,6 +294,37 @@ function renderPreview() {
   }));
 }
 
+function renderFpgaStatus() {
+  const status = gateway?.fpga;
+  if (!status) return;
+  const set = (id, value) => {
+    const field = byId(`fpga-live-${id}`);
+    if (field) field.textContent = value;
+  };
+  const states = {waiting: 'Aguardando Gateway e perfil', waiting_clock: 'Aguardando janela sincronizada', collecting: 'Janela em processamento',
+    confirmed: 'Janela confirmada', discarded: 'Janela descartada', interrupted: 'Janela interrompida',
+    result: 'Resultado recebido', idle: 'Sem janela'};
+  const links = {online: 'JTAG conectado', offline: 'JTAG indisponível', disabled: 'JTAG desativado'};
+  const reasons = ['Manter', 'Subir', 'Descer', 'Alerta crítico', 'Dados insuficientes', 'Empate'];
+  const result = status.result;
+  const packet = item => item ? `${date(item.at)} · ${item.line}` : EMPTY;
+  set('link', `${links[status.connection] ?? EMPTY} · ${states[status.window] ?? EMPTY}`);
+  set('tx', packet(status.last_tx));
+  set('rx', packet(status.last_rx));
+  set('error', status.error ?? EMPTY);
+  set('history', status.history?.slice(0, 6).map(item => `${item.direction} ${packet(item)}`).join(' · ')
+    || 'Nenhum registro operacional.');
+  set('profile', result ? profileName(result.profile) : EMPTY);
+  set('reason', result ? reasons[result.reason] ?? EMPTY : EMPTY);
+  set('critical', result ? (result.critical ? 'Sim' : 'Não') : EMPTY);
+  set('at', date(result?.at));
+  set('ack', result ? `${result.ack ? 'ACK confirmado' : 'ACK pendente'}${result.window_id !== status.window_id ? ' · Janela anterior' : ''}` : EMPTY);
+  const applied = status.gateway;
+  const proved = applied?.participants?.filter(member => member.proved).length ?? 0;
+  set('applied', applied ? `Gateway: ${profileName(applied.activeProfileId)} · ${applied.state} · ${proved}/${applied.participants?.length ?? 0} provas na fase · Recomendação apenas`
+    : 'Sem confirmação do Gateway');
+}
+
 function render() {
   const status = byId('fpga-api-status');
   const failed = overviewFailed || metricsState === 'error';
@@ -291,6 +337,7 @@ function render() {
   renderUnit();
   renderMetrics();
   renderPreview();
+  renderFpgaStatus();
 }
 
 async function getJson(path) {

@@ -74,13 +74,14 @@ export function conectarTempoReal(tratadores = {}) {
     else if (tipo === 'telemetry') tratadores.onTelemetry?.(dados);
     else if (tipo === 'event') tratadores.onEvent?.(dados);
     else if (tipo === 'base') tratadores.onBase?.(dados);
+    else if (tipo === 'invalidate') tratadores.onInvalidate?.();
   }
 
   function conectar() {
     if (encerrado) return;
     const protocolo = window.location.protocol === 'https:' ? 'wss' : 'ws';
     try {
-      socket = new WebSocket(`${protocolo}://${window.location.host}/ws`);
+      socket = new WebSocket(protocolo + '://' + window.location.host + (tratadores.path || '/ws'));
     } catch {
       agendarReconexao();
       return;
@@ -88,9 +89,9 @@ export function conectarTempoReal(tratadores = {}) {
 
     socket.onopen = () => {
       espera = ESPERA_INICIAL_MS;  // deu certo: zera a espera
-      desligarPlanoB();
       setOfflineBanner(false);
       avisarSituacao(true);
+      tratadores.onPollingTick?.();
     };
 
     socket.onmessage = ({ data }) => tratarMensagem(data);
@@ -118,6 +119,8 @@ export function conectarTempoReal(tratadores = {}) {
     espera = Math.min(espera * 2, ESPERA_MAXIMA_MS);
   }
 
+  // Durable REST reconciliation also runs while a socket is connected.
+  ligarPlanoB();
   conectar();
 
   // Ao voltar para a aba, tenta reconectar na hora em vez de esperar:

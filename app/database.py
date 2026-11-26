@@ -201,6 +201,24 @@ class Database:
                     PRIMARY KEY (gateway_id, gateway_session_id, window_id, collar_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_pdr_windows_collar ON pdr_windows(collar_id, persisted_at DESC);
+                CREATE TABLE IF NOT EXISTS proven_metric_windows (
+                    gateway_id TEXT NOT NULL, installation_id TEXT NOT NULL,
+                    gateway_session_id TEXT NOT NULL, window_id TEXT NOT NULL,
+                    collar_id INTEGER NOT NULL CHECK (collar_id BETWEEN 1 AND 254),
+                    evidence TEXT NOT NULL, persisted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (gateway_id, gateway_session_id, window_id, collar_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_proven_metric_collar ON proven_metric_windows(collar_id, window_id);
+                CREATE TABLE IF NOT EXISTS windows_detected_collars (
+                    collar_id INTEGER PRIMARY KEY CHECK (collar_id BETWEEN 1 AND 254),
+                    first_detected_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS windows_fpga_results (
+                    id INTEGER PRIMARY KEY,
+                    result_json TEXT NOT NULL,
+                    received_at TEXT NOT NULL,
+                    acknowledged INTEGER NOT NULL DEFAULT 0
+                );
                 CREATE TABLE IF NOT EXISTS profile_operations (
                     gateway_session TEXT NOT NULL, operation_id INTEGER NOT NULL,
                     profile_id INTEGER NOT NULL, participants TEXT NOT NULL, status TEXT NOT NULL,
@@ -212,6 +230,38 @@ class Database:
             if "confirmed_crc32" not in columns:
                 db.execute("ALTER TABLE fence_deliveries ADD COLUMN confirmed_crc32 TEXT")
             db.execute("PRAGMA optimize")
+
+    def detect_windows_collar(self, collar_id: int, timestamp: str) -> None:
+        with self._lock, self.connect() as db:
+            db.execute("INSERT OR IGNORE INTO windows_detected_collars VALUES (?, ?)", (collar_id, timestamp))
+
+    def windows_detected_collars(self) -> list[int]:
+        with self._lock, self.connect() as db:
+            return [row[0] for row in db.execute("SELECT collar_id FROM windows_detected_collars ORDER BY collar_id")]
+
+    def save_windows_fpga_result(self, result: dict, *, recovering: bool = False) -> int:
+        with self._lock, self.connect() as db:
+            if recovering:
+                pending = db.execute("""
+                    SELECT id, result_json FROM windows_fpga_results
+                    WHERE acknowledged = 0 ORDER BY id DESC LIMIT 1
+                """).fetchone()
+                if pending and json.loads(pending["result_json"])["wire"] == result["wire"]:
+                    return pending["id"]
+            return db.execute("""
+                INSERT INTO windows_fpga_results(result_json, received_at) VALUES (?, ?)
+            """, (json.dumps(result), result["at"])).lastrowid
+
+    def acknowledge_windows_fpga_result(self, result_id: int) -> None:
+        with self._lock, self.connect() as db:
+            db.execute("UPDATE windows_fpga_results SET acknowledged = 1 WHERE id = ?", (result_id,))
+
+    def latest_windows_fpga_result(self):
+        with self._lock, self.connect() as db:
+            row = db.execute("""
+                SELECT result_json, acknowledged FROM windows_fpga_results ORDER BY id DESC LIMIT 1
+            """).fetchone()
+        return {**json.loads(row["result_json"]), "ack": bool(row["acknowledged"])} if row else None
 
     def save_pdr_summary(self, gateway_id: str, summary: PdrSummary) -> MetricSaveResult:
         identity = (gateway_id, summary.gateway_session_id, summary.window_id, summary.collar_id)
@@ -243,6 +293,67 @@ class Database:
             logger.debug("PDR summary write failed", exc_info=True)
             return MetricSaveResult.FAILED
 
+    def save_metric_evidence(self, gateway_id, installation_id, summary):
+        from dataclasses import asdict
+
+        identity = (gateway_id, summary.gateway_session_id, summary.window_id, summary.collar_id)
+        payload = json.dumps(asdict(summary), separators=(",", ":"), sort_keys=True)
+        try:
+            with self._lock, self.connect() as db:
+                inserted = db.execute("""
+                    INSERT INTO proven_metric_windows (
+                        gateway_id, gateway_session_id, window_id, collar_id, installation_id, evidence
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (gateway_id, gateway_session_id, window_id, collar_id) DO NOTHING
+                    """, (*identity, installation_id, payload))
+                if inserted.rowcount:
+                    return MetricSaveResult.INSERTED
+                previous = db.execute("""
+                    SELECT installation_id,evidence FROM proven_metric_windows
+                    WHERE gateway_id = ? AND gateway_session_id = ? AND window_id = ? AND collar_id = ?
+                    """, identity).fetchone()
+                return (MetricSaveResult.DUPLICATE if previous and tuple(previous) == (installation_id, payload)
+                        else MetricSaveResult.CONFLICT)
+        except sqlite3.Error:
+            logger.debug("metric evidence write failed", exc_info=True)
+            return MetricSaveResult.FAILED
+
+    def proven_windows(self, collar_id, limit, *, gateway_id=None, gateway_session=None):
+        from app.metric_evidence import MetricEvidence
+
+        with self._lock, self.connect() as db:
+            rows = db.execute("""
+                WITH sessions AS (
+                    SELECT gateway_id, gateway_session_id, MIN(rowid) AS first_seen
+                    FROM proven_metric_windows GROUP BY gateway_id, gateway_session_id
+                )
+                SELECT e.* FROM proven_metric_windows AS e JOIN sessions USING (gateway_id, gateway_session_id)
+                WHERE collar_id = :collar AND (:gateway IS NULL OR gateway_id = :gateway)
+                    AND (:session IS NULL OR gateway_session_id = :session)
+                ORDER BY first_seen DESC, window_id DESC LIMIT :limit
+                """, {"collar": collar_id, "limit": limit, "gateway": gateway_id,
+                      "session": gateway_session}).fetchall()
+        return [MetricEvidence(**json.loads(row["evidence"])).project(
+            row["gateway_id"], row["installation_id"], row["persisted_at"]
+        ) for row in rows]
+
+    def fpga_window_metrics(self, collar_id, limit, *, gateway_id=None):
+        operational = self.link_metrics(collar_id, limit)["windows"]
+        records = self.proven_windows(collar_id, limit, gateway_id=gateway_id)
+        # Keep legacy invalidations such as session_changed for the decision
+        # guard, without letting estimates override measured windows.
+        return {kind: [record[kind] for record in records] + operational[kind] for kind in operational}
+
+    def public_link_metrics(self, collar_id, limit, *, gateway_id=None, gateway_session=None):
+        snapshot = self.link_metrics(collar_id, limit)
+        proof = self.proven_windows(collar_id, limit, gateway_id=gateway_id, gateway_session=gateway_session)
+        if not proof and gateway_session:
+            proof = self.proven_windows(collar_id, limit, gateway_id=gateway_id)
+        if proof:
+            snapshot["legacy_windows"] = snapshot["windows"]
+            snapshot["windows"] = {kind: [bundle[kind] for bundle in proof] for kind in snapshot["windows"]}
+        return snapshot
+
     def list_pdr(self, collar_id: int, limit: int) -> list[dict]:
         with self._lock, self.connect() as db:
             # The session IDs are random. A late row from a known old session
@@ -269,11 +380,20 @@ class Database:
                 UNION ALL
                 SELECT collar_id, 'pdr', MAX(persisted_at)
                 FROM pdr_windows GROUP BY collar_id
+                UNION ALL
+                SELECT proven.collar_id, kinds.kind, MAX(proven.persisted_at)
+                FROM proven_metric_windows AS proven
+                CROSS JOIN (SELECT 'pdr' AS kind UNION ALL SELECT 'radio' UNION ALL SELECT 'hdop') AS kinds
+                GROUP BY proven.collar_id, kinds.kind
                 ORDER BY collar_id
             """).fetchall()
         collars = {}
         for row in rows:
-            collars.setdefault(row["collar_id"], {})[row["kind"]] = row["latest"]
+            latest = collars.setdefault(row["collar_id"], {})
+            stamp = datetime.fromisoformat(row["latest"])
+            stamp = (stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+            if row["kind"] not in latest or stamp > datetime.fromisoformat(latest[row["kind"]]):
+                latest[row["kind"]] = stamp.isoformat()
         return [{"collar_id": collar, "latest_persisted": latest} for collar, latest in collars.items()]
 
     def link_metrics(self, collar_id: int, limit: int) -> dict:

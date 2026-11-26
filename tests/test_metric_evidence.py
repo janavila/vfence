@@ -1,0 +1,195 @@
+import asyncio
+import json
+import os
+import shutil
+import subprocess
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import httpx
+
+from app.database import Database
+from app.fpga_service import FpgaService, NetworkWindow
+from app.fpga_window import FpgaWindow
+from app.jtag_atlantic import sample_command
+from app.metric_evidence import parse_evidence
+from app.serial_reader import SerialReader
+from test_metric_summaries import FakeByteConnection, RecordingHub
+
+
+@pytest.fixture
+def firmware_frame(tmp_path):
+    captured = os.getenv("VFENCE_WSL_EVIDENCE")
+    if captured is not None:
+        return captured.strip().encode("ascii") + b"\n"
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if not compiler:
+        pytest.skip("requires C++ compiler or frame emitted by the WSL firmware test")
+    root = Path(__file__).resolve().parents[1]
+    gateway = root / "gateway" / "VFenceGateway"
+    binary = tmp_path / "metric_evidence"
+    subprocess.run([compiler, "-std=c++11", "-Wall", "-Wextra", "-Werror", "-I", str(gateway),
+                    str(root / "tests/cpp/test_metric_evidence.cpp"), str(gateway / "vfence_protocol.cpp"),
+                    "-o", str(binary)], check=True)
+    return subprocess.check_output([binary])
+
+
+async def test_firmware_evidence_survives_reopen_and_feeds_aligned_fpga_sample(firmware_frame, tmp_path, monkeypatch):
+    url = f"sqlite:///{tmp_path / 'evidence.db'}"
+    database = Database(url)
+    database.initialize()
+    config = SimpleNamespace(mock_serial=False, metrics_gateway_id="gw", metrics_installation_id="site",
+                             metrics_serial_ack_enabled=True, central_sync_enabled=False, serial_port="test")
+    reader = SerialReader(config, database, RecordingHub())
+    reader._connection = object()
+    sent = []
+
+    async def committed(connection, command, **fields):
+        assert connection is reader._connection
+        # The frame's projection must already be visible on a separate connection.
+        saved = Database(url).fpga_window_metrics(2, 10)
+        assert saved["pdr"][0]["pdr_x100"] == 8000 and saved["pdr"][0]["tx_proven"] == 1
+        sent.append((command, fields))
+
+    monkeypatch.setattr(reader, "_send_serial_commit_command", committed)
+    assert await reader.process_line(firmware_frame)
+    assert await reader.process_line(firmware_frame)  # lost commit response
+    assert len(sent) == 2 and sent[0] == sent[1]
+    assert sent[0][0] == "EVIDENCE_COMMITTED"
+    assert not await reader.process_line(firmware_frame.replace(b'"pdrX100":8000', b'"pdrX100":10000'))
+    assert not await reader.process_line(firmware_frame.replace(b'"hdopX100":110', b'"hdopX100":111'))
+    assert len(sent) == 2
+    service = FpgaService(config, Database(url), reader)
+    records = await asyncio.to_thread(service.records, [2])
+    record = records[2]["pdr"][0]
+    batch = FpgaWindow("gw", record["gateway_session_id"], 160000, 1,
+                       {2: record["collar_session_id"]}, time.monotonic() + 30)
+    service.samples(batch, records, {}, lambda row: row["window_id"] == record["window_id"])
+    assert len(batch.ready_samples()) == 1
+    assert sample_command(batch.ready_samples()[0]) == "SAMPLE 2 0 8000 600 94 110 8 15"
+
+
+async def test_operational_window_sends_firmware_frame_without_manual_clock_map(firmware_frame, monkeypatch, tmp_path):
+    import app.fpga_service as worker
+    from app import main
+
+    url = f"sqlite:///{tmp_path / 'integrated.db'}"
+    database = Database(url)
+    database.initialize()
+    config = SimpleNamespace(mock_serial=False, metrics_gateway_id="gw", metrics_installation_id="site",
+                             central_sync_enabled=False, serial_port="test", windows_base=True,
+                             metrics_serial_ack_enabled=True)
+    reader = SerialReader(config, database, RecordingHub())
+    reader.state.status = "online"
+    reader.effective_profile = {"profile_id": 1, "observed_at": worker._utc_now()}
+
+    class Wire(FakeByteConnection):
+        write_timeout = 2
+
+        def write(self, wire):
+            report = Database(url).proven_windows(2, 1)[0]
+            assert report["pdr"]["transmitted_count"] == 10 and report["pdr"]["received_count"] == 8
+            return super().write(wire)
+
+    reader._connection = Wire()
+    service = FpgaService(config, database, reader)
+    start = time.monotonic()
+    now = start
+    session = "0000000000001234"
+    network = NetworkWindow(session, 9, 160000, start, 0.05)
+    report = dict(gatewaySessionId=session, operationId=0, activeProfileId=1, state="COMPLETED")
+    commands = []
+
+    async def gateway():
+        nonlocal now
+        if now == start:
+            now += 62
+            assert await reader.process_line(firmware_frame)
+        return report
+
+    async def same_clock(_session):
+        return network
+
+    async def command(line, expected, **kwargs):
+        commands.append(line)
+        if line == "ACK":
+            with Database(url).connect() as db:
+                decision = db.execute("SELECT result_json FROM windows_fpga_results").fetchone()
+            assert json.loads(decision[0])["wire"] == "VFENCE|P1|4|0"
+        return {"BEGIN 1": "OK|BEGIN", "SAMPLE 2 0 8000 600 94 110 8 15": "OK|SAMPLE", "PING": "PONG",
+                "CLOSE": "VFENCE|P1|4|0", "ACK": "OK|ACK"}[line]
+
+    async def pause(_seconds):
+        nonlocal now
+        now += 260
+
+    monkeypatch.setattr(worker, "time", SimpleNamespace(monotonic=lambda: now))
+    monkeypatch.setattr(service, "gateway", gateway)
+    monkeypatch.setattr(service, "network_window", same_clock)
+    monkeypatch.setattr(service, "command", command)
+    monkeypatch.setattr(service, "pause", pause)
+    await service.evaluate([2], {}, report, network=network, require_proven=True)
+    assert commands == ["BEGIN 1", "SAMPLE 2 0 8000 600 94 110 8 15", "PING", "CLOSE", "ACK"]
+    serial_ack, = reader._connection.writes
+    serial_ack = json.loads(serial_ack.split(b"[CMD] ", 1)[1])
+    assert serial_ack["command"] == "EVIDENCE_COMMITTED" and serial_ack["collarId"] == 2
+    assert serial_ack["gatewaySessionId"] == session and serial_ack["windowId"] == "0000000000000009"
+    with Database(url).connect() as db:
+        assert db.execute("SELECT acknowledged FROM windows_fpga_results").fetchone()[0] == 1
+    for key, val in {"database": database, "reader": reader, "fpga_service": service, "settings": config}.items():
+        monkeypatch.setattr(main, key, val)
+    service._last_network_clock = (network, now, reader.serial_generation)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test") as client:
+        pdr = (await client.get("/api/collars/2/pdr")).json()[0]
+        windows = (await client.get("/api/collars/2/link-metrics")).json()["windows"]
+        assert pdr["tx_proven"] is True and pdr["pdr_x100"] == 8000
+        assert windows["radio"][0]["rssi_mean_x100"] == -9400 and windows["radio"][0]["snr_mean_x100"] == 600
+        assert windows["hdop"][0]["hdop_mean_x100"] == 110 and windows["hdop"][0]["sample_count"] == 2
+        assert len({rows[0]["window_id"] for rows in windows.values()}) == 1
+        assert all(rows[0]["freshness"] == "historical" for rows in windows.values())
+        assert (await client.get("/api/fpga/collars")).json()[0]["collar_id"] == 2
+        status = (await client.get("/api/fpga/status")).json()
+        assert status["result"]["ack"] is True
+        assert status["last_persisted_result"]["ack"] is True
+        assert status["last_persisted_result"]["wire"] == "VFENCE|P1|4|0"
+
+
+@pytest.mark.parametrize(("tx", "rx", "ratio"), [
+    (10, 10, 10000), (10, 8, 8000), (10, 5, 5000), (10, 0, 0), (1, 1, 10000), (0, 0, None),
+])
+def test_validated_pdr_denominator_is_distinct_from_voting_minimum(firmware_frame, tx, rx, ratio):
+    data = json.loads(firmware_frame[6:])
+    data.update(txFirst=0xfffffffc, txLast=(0xfffffffc + tx) & 0xffffffff, receivedCount=rx,
+                pdrX100=ratio, radioCount=0, rssiX100=None, snrX100=None)
+    summary = parse_evidence(data)
+    pdr = summary.project("gw", "site", "2026-01-01T00:00:00Z")["pdr"]
+    assert (pdr["transmitted_count"], pdr["pdr_x100"], pdr["valid"]) == (tx, ratio, tx != 0)
+    from app.fpga_service import _record
+    from app.pdr_protocol import PdrSummary
+    batch = FpgaWindow("gw", summary.gateway_session_id, summary.started_at_ms, summary.profile_id,
+                       {summary.collar_id: summary.collar_session_id}, time.monotonic() + 10)
+    assert batch.add(gateway_id="gw", pdr=_record(PdrSummary, pdr))
+    assert batch.ready_samples()[0].pdr_x100 == (ratio if rx >= 2 else None)
+
+
+@pytest.mark.parametrize("overrides", [
+    {"txLast": None}, {"receivedCount": 11}, {"pdrX100": 9999}, {"radioCount": 9},
+    {"radioCount": 0}, {"hdopCount": 0}, {"profileId": True},
+])
+def test_bad_evidence_cannot_produce_proven_tx(firmware_frame, overrides):
+    data = json.loads(firmware_frame[6:])
+    with pytest.raises(ValueError):
+        parse_evidence({**data, **overrides})
+
+
+async def test_sqlite_failure_prevents_evidence_ack(firmware_frame, tmp_path):
+    db = Database(f"sqlite:///{tmp_path / 'no-schema.db'}")
+    config = SimpleNamespace(mock_serial=False, metrics_gateway_id="gw", metrics_installation_id="site",
+                             central_sync_enabled=False, serial_port="test", metrics_serial_ack_enabled=True)
+    hub = RecordingHub()
+    reader = SerialReader(config, db, hub)
+    reader._connection = FakeByteConnection()
+    assert not await reader.process_line(firmware_frame)
+    assert reader._connection.writes == [] and hub.messages == []

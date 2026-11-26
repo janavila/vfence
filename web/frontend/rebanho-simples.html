@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rebanho — VFence</title>
+  <link rel="icon" href="/static/VFence.png" type="image/png">
+  <link rel="stylesheet" href="/vendor/leaflet/leaflet.css">
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+<!-- area-header -->
+<main class="workspace">
+  <div class="page-heading"><h1 id="herd-title">Rebanho</h1><p class="lead" id="herd-status" role="status">Consultando o rebanho…</p><!-- herd-actions --></div>
+  <section class="card-grid herd-counts" aria-label="Resumo do rebanho" id="herd-counts"></section>
+  <section class="panel" id="herd-map-panel">
+    <div class="panel-heading"><div><h2>Mapa do rebanho</h2><p id="herd-fence-state"></p></div></div>
+    <div class="map-surface" id="shared-herd-map" aria-label="Mapa de posições atuais"></div>
+  </section>
+  <div class="herd-columns">
+    <section class="panel" id="herd-animals-panel"><div class="panel-heading"><h2>Animais</h2></div><div class="panel-body"><ul class="herd-list" id="herd-animals"></ul><div id="herd-animal-detail"></div></div></section>
+    <section class="panel" id="herd-notices"><div class="panel-heading"><h2>Avisos ativos</h2></div><div class="panel-body"><ul class="herd-list" id="herd-alerts"></ul></div></section>
+  </div>
+  <section class="panel" id="herd-history-panel"><div class="panel-heading"><h2>Histórico de acontecimentos</h2></div><div class="panel-body"><ul class="herd-list" id="herd-history"></ul></div></section>
+</main>
+<script src="/vendor/leaflet/leaflet.js"></script>
+<script type="module" src="/js/herd.js"></script>
+</body>
+</html>

@@ -11,6 +11,7 @@
 static const uint8_t COLLAR_ID = 0x01;
 // Habilitar somente depois de atualizar o Gateway para o subtipo contado.
 static const bool COUNTED_POSITION_ENABLED = false;
+static const bool PROVEN_METRICS_ENABLED = true;
 static const bool PROFILE_SWITCH_ENABLED = false;
 
 // GPS NEO-6M: TX do GPS -> GPIO23 da Heltec.

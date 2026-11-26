@@ -70,9 +70,17 @@ function renderCentral(central){
   const online=central?.enabled&&central.status==='online';
   const labels={online:'Online',offline:'Offline',error:'Erro de configuração',
     storage_full:'Armazenamento cheio',storage_unavailable:'Armazenamento indisponível'};
-  status.textContent=!central?'—':!central.enabled?'Desativada':labels[central.status]||'Desconhecido';
+  const phases={connecting:'Conectando',authenticated:'Autenticada',synchronized:'Sincronizada',
+    reconnected:'Reconectada',awaiting_credential:'Aguardando credencial válida',
+    network_unavailable:'Sem conexão com a Central',server_unavailable:'Temporariamente indisponível',
+    protocol_error:'Resposta incompatível'};
+  const state=phases[central?.phase]||labels[central?.status]||'Desconhecido';
+  const pending=Number.isInteger(central?.outbox_size)?`${central.outbox_size} pendentes`:'';
+  status.textContent=!central?'—':!central.enabled?'Desativada':pending?`${state} · ${pending}`:state;
   status.className=online?'online':central?.enabled?'offline':'';
-  status.title=central?.last_sync?`Última sincronização: ${timestamp(central.last_sync)}`:'';
+  status.title=[central?.last_sync?`Última sincronização: ${timestamp(central.last_sync)}`:'',
+    central?.next_retry_at?`Próxima tentativa: ${timestamp(central.next_retry_at)}`:'',
+    central?.last_error||''].filter(Boolean).join(' · ');
 }
 
 function renderFence(data){
@@ -152,6 +160,8 @@ function renderUnitDetails(collar){
   const windowRows=(data,clock)=>[
     ['Janela',`${data.duration_ms/1000} s · início ${data.started_at_ms} ms (${clock})`],
     ['Gravada na Base',`${timestamp(data.persisted_at)} · há ${age(data.persisted_at)}`],
+    ...(data.source==='proven'?[['Atualidade',data.freshness==='recent'?'Recente':
+      data.freshness==='historical'?'Histórica':'Sem referência temporal atual']]:[]),
   ];
   const validity=value=>value===true?'Válida':value===false?'Inválida':'—';
   const pdrReasons={no_samples:'Sem amostras',one_sample:'Apenas uma amostra',session_changed:'Sessão mudou',
@@ -175,18 +185,19 @@ function renderUnitDetails(collar){
     ${detailGroup('HDOP médio',hdop?[
       ['HDOP',metricValue(hdop.hdop_mean_x100,hdop.hdop_mean_valid,'')],
       ['Validade',validity(hdop.hdop_mean_valid)],['Amostras',hdop.sample_count],
-      ...windowRows(hdop,'coleira'),
+      ...windowRows(hdop,hdop.timing_proven?'Gateway':'coleira'),
     ]:[['Estado',metricStatus]])}
     ${detailGroup('Rádio · médias',radio?[
       ['RSSI',`${metricValue(radio.rssi_mean_x100,radio.rssi_mean_valid,'dBm')} · ${validity(radio.rssi_mean_valid)}`],
       ['SNR',`${metricValue(radio.snr_mean_x100,radio.snr_mean_valid,'dB')} · ${validity(radio.snr_mean_valid)}`],
       ['Amostras',radio.sample_count],...windowRows(radio,'Gateway'),
     ]:[['Estado',metricStatus]])}
-    ${detailGroup('PDR estimado',pdr?[
+    ${detailGroup(pdr?.tx_proven?'PDR comprovado':'PDR estimado',pdr?[
       ['Entrega',metricValue(pdr.pdr_x100,pdr.valid,'%')],
       ['Validade',pdr.valid?'Válido no intervalo observado':pdrReasons[pdr.reason]||'Inválido'],
-      ['Recebidos / esperados',`${number(pdr.received_count,0)} / ${number(pdr.estimated_tx_count,0)}`],
-      ['Perdas estimadas',pdr.estimated_lost_count],
+      [pdr.tx_proven?'Recebidos / transmissões comprovadas':'Recebidos / esperados',
+        `${number(pdr.received_count,0)} / ${number(pdr.tx_proven?pdr.transmitted_count:pdr.estimated_tx_count,0)}`],
+      [pdr.tx_proven?'Perdas':'Perdas estimadas',pdr.tx_proven?pdr.lost_count:pdr.estimated_lost_count],
       ['Perfil',pdr.profile_id==null?'—':`P${pdr.profile_id}`],
       ...windowRows(pdr,'Gateway'),
     ]:[['Estado',metricStatus]])}
@@ -438,6 +449,7 @@ function connect(){
       if(['event','collar_state','offline'].includes(kind))scheduleEventHistory();
       if(['collar_state','collar_status','offline'].includes(kind)||['GPS_LOST','GPS_RECOVERED'].includes(subtype))scheduleCollars();
     }
+    if(message?.type==='metric_window'&&message.data?.collar_id===Number(selectedCollar?.replace(/^COL\s*/i,'')))scheduleMetrics();
     if(message?.type==='telemetry'&&typeof message.collar?.collar_id==='string'){
       if(message.gateway)acceptUpdate('gateway',message.gateway);
       const index=collars.findIndex(collar=>collar.collar_id===message.collar.collar_id);

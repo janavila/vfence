@@ -13,7 +13,8 @@ import {
   enderecoDoGeojson, enderecoDoLog, explicarErro, lerCercaAtiva, lerColeiras,
   lerConfiguracao, lerEntregas, lerEventos, lerHistorico, lerTrajeto, reativarCerca, salvarNomeAnimal,
 } from './api.js';
-import { criarMapa, enquadrar, marcarBase, mostrarLocalizacao, paraLeaflet } from './map.js';
+import { marcarBase } from './map.js';
+import { herdMap } from './herd-map.js';
 import { conectarTempoReal } from './realtime.js';
 import { escapeHtml, formatClock } from './ui.js';
 
@@ -146,7 +147,7 @@ async function tratarReativacao(evento) {
 
 /* ---- Rebanho ---- */
 
-const rebanho = { mapa: null, marcadores: new Map(), cerca: null };
+const rebanho = { mapa: null, controller: null, config: null, signature: null };
 
 function estadoDaPosicao(coleira) {
   if (!coleira.last_position_at) return 'Sem horário de posição válida';
@@ -155,16 +156,18 @@ function estadoDaPosicao(coleira) {
 }
 
 async function desenharRebanho() {
-  await desenharUltimosAcontecimentos();
   let coleiras = [];
   try {
-    coleiras = await lerColeiras();
+    [coleiras] = await Promise.all([lerColeiras(), desenharUltimosAcontecimentos()]);
   } catch (erro) {
     elemento('herd-body').innerHTML = vazio(7, explicarErro(erro));
     return;
   }
 
-  elemento('herd-body').innerHTML = coleiras.length
+  const signature = JSON.stringify(coleiras.map(({ position_age_s, contact_age_s, ...row }) => row));
+  if (signature !== rebanho.signature) {
+    rebanho.signature = signature;
+    elemento('herd-body').innerHTML = coleiras.length
     ? coleiras.map((c) => `
         <tr>
           <td class="mono"><strong>${escapeHtml(c.collar_id)}</strong></td>
@@ -182,13 +185,17 @@ async function desenharRebanho() {
             <div>${c.link_status === 'offline' ? 'Offline' : c.link_status === 'online' ? 'Último contato recebido' : 'Sem contato'}</div>
             <div>${c.gnss_status === 'invalid' ? 'GNSS indisponível' : c.gnss_status === 'valid' ? 'GNSS válido no último informe' : 'GNSS sem informação'}</div></td>
         </tr>`).join('')
-    : vazio(7, 'Nenhuma coleira enviou dados ainda');
+      : vazio(7, 'Nenhuma coleira enviou dados ainda');
+  }
 
-  desenharColeirasNoMapa(coleiras);
+  await desenharColeirasNoMapa(coleiras);
   const seletor = elemento('trail-collar');
   if (seletor) {
     const atual = seletor.value;
-    seletor.replaceChildren(...coleiras.map((c) => new Option(c.animal_label || c.collar_id, c.collar_id)));
+    if (JSON.stringify(Array.from(seletor.options, o => [o.value, o.text])) !==
+        JSON.stringify(coleiras.map(c => [c.collar_id, c.animal_label || c.collar_id]))) {
+      seletor.replaceChildren(...coleiras.map((c) => new Option(c.animal_label || c.collar_id, c.collar_id)));
+    }
     if (coleiras.some((c) => c.collar_id === atual)) seletor.value = atual;
   }
 }
@@ -228,32 +235,24 @@ async function editarAnimal(evento) {
   } catch (erro) { elemento('trail-feedback').textContent = explicarErro(erro); }
 }
 
-function desenharColeirasNoMapa(coleiras) {
-  if (!rebanho.mapa || !window.L) return;
-  const comPosicao = coleiras.filter((c) => Number.isFinite(c.last_lat) && Number.isFinite(c.last_lon));
-
-  comPosicao.forEach((coleira) => {
-    const cor = coleira.position_stale ? 'var(--neutral)' :
-      (ZONAS[coleira.last_zone] ?? { cor: 'var(--neutral)' }).cor;
-    const posicao = [coleira.last_lat, coleira.last_lon];
-    let marcador = rebanho.marcadores.get(coleira.collar_id);
-    if (marcador) {
-      marcador.setLatLng(posicao);
-      marcador.setStyle({ color: cor, fillColor: cor });
-    } else {
-      marcador = L.circleMarker(posicao, {
-        radius: 9, color: cor, fillColor: cor, weight: 3, fillOpacity: 0.7,
-      }).addTo(rebanho.mapa);
-      rebanho.marcadores.set(coleira.collar_id, marcador);
-    }
-    const rotulo = document.createElement('span');
-    rotulo.textContent = `${coleira.animal_label || coleira.collar_id}. ${estadoDaPosicao(coleira)}`;
-    marcador.bindTooltip(rotulo, { direction: 'top' });
-  });
-
-  if (comPosicao.length && !rebanho.enquadrou) {
-    enquadrar(rebanho.mapa, comPosicao.map((c) => ({ lat: c.last_lat, lon: c.last_lon })), 17);
-    rebanho.enquadrou = true;
+async function desenharColeirasNoMapa(coleiras) {
+  if (!rebanho.controller) return;
+  let cercas = rebanho.cercas || [];
+  try {
+    cercas = [await lerCercaAtiva()];
+  } catch (error) {
+    if (error.status === 404) cercas = [];
+  }
+  rebanho.cercas = cercas;
+  const zones = { SEGURO: 'inside', ATENCAO: 'near', CRITICO: 'near', FORA: 'outside' };
+  rebanho.controller.update(coleiras.map(c => ({
+    key: c.collar_id, name: c.animal_label || c.collar_id, status: zones[c.last_zone],
+    position: { lat: c.last_lat, lon: c.last_lon, current: !c.position_stale &&
+      c.link_status === 'online' && c.gnss_status === 'valid' && Number.isFinite(c.last_lat) && Number.isFinite(c.last_lon) },
+  })), cercas);
+  if (!rebanho.mapa && rebanho.controller.instance()) {
+    rebanho.mapa = rebanho.controller.instance();
+    marcarBase(rebanho.mapa, rebanho.config);
   }
 }
 
@@ -320,23 +319,11 @@ const TELAS = {
     async ligar() {
       elemento('herd-trail')?.addEventListener('submit', mostrarTrajeto);
       elemento('herd-body')?.addEventListener('click', editarAnimal);
-      const config = await lerConfiguracao();
-      rebanho.mapa = criarMapa('herd-map', config, 16);
-      if (rebanho.mapa) {
-        marcarBase(rebanho.mapa, config);
-        // Centraliza no produtor só se ainda não enquadrou as coleiras:
-        // nesta tela, o que importa ver primeiro são os animais.
-        mostrarLocalizacao(rebanho.mapa, () => !rebanho.enquadrou);
-        // A cerca que está valendo, para o produtor ver onde o animal está
-        // em relação a ela.
-        try {
-          const cerca = await lerCercaAtiva();
-          L.polygon(paraLeaflet(cerca.points), {
-            color: '#245c4f', weight: 2, fillColor: '#245c4f',
-            fillOpacity: 0.08, interactive: false,
-          }).addTo(rebanho.mapa);
-        } catch { /* sem cerca ainda */ }
-      }
+      rebanho.config = await lerConfiguracao();
+      rebanho.controller = herdMap('herd-map', key => {
+        elemento('trail-collar').value = key;
+        rebanho.controller.focus(key);
+      }, rebanho.config);
     },
   },
   eventos: {
@@ -367,12 +354,15 @@ export async function iniciarPainel(nome) {
   // Tempo real, com o plano B por consulta periódica cuidando do resto
   // (seção 6.2). Redesenhar a tela inteira é barato: são tabelas pequenas.
   let agendado = false;
+  let ocupado = false;
   function atualizar() {
-    if (agendado) return;
+    if (agendado || ocupado) return;
     agendado = true;
     window.setTimeout(async () => {
       agendado = false;
-      await tela.desenhar();
+      ocupado = true;
+      try { await tela.desenhar(); }
+      finally { ocupado = false; }
     }, 150);
   }
   conectarTempoReal({ onTelemetry: atualizar, onEvent: atualizar, onDelivery: atualizar,

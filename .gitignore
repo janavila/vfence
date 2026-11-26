@@ -1,4 +1,7 @@
 .env
+.env.windows
+.env.windows.tmp
+.vfence-unattributed/
 .venv/
 __pycache__/
 .pytest_cache/

@@ -1,0 +1,14 @@
+    <section id="dados-coleiras" class="visitor-panel" aria-labelledby="dados-coleiras-title">
+      <div class="visitor-panel-heading"><h2 id="dados-coleiras-title">Dados das coleiras</h2></div>
+      <div class="management-filters">
+        <label>Coleira <select id="management-collar"><option value="">Selecione</option></select></label>
+        <a id="management-collar-history" class="button visitor-secondary" hidden>Ver histórico de deslocamento</a>
+      </div>
+      <dl id="management-collar-details" class="management-facts"></dl>
+      <form id="management-collar-name" class="management-filters" hidden>
+        <label>Nome amigável <input id="management-collar-label" maxlength="80" autocomplete="off"></label>
+        <button class="button primary" type="submit">Salvar nome</button>
+      </form>
+      <p id="management-collar-status" role="status"></p>
+    </section>
+    <script type="module" src="/js/gestao-coleiras.js"></script>

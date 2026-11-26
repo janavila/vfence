@@ -170,6 +170,27 @@ CREATE TABLE IF NOT EXISTS fence_log_lines (
 -- está com a cerca errada.
 -- Consequência para a fase F3: ao criar uma cerca nova é obrigatório
 -- desativar a anterior ANTES de inserir a nova, dentro da mesma transação.
+CREATE TABLE IF NOT EXISTS fence_publications (
+  publication_key TEXT PRIMARY KEY,
+  version INTEGER NOT NULL REFERENCES fences(version),
+  fingerprint TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS collar_watermarks (
+  collar_id TEXT PRIMARY KEY REFERENCES collars(collar_id),
+  link_at TEXT,
+  gnss_at TEXT,
+  zone_at TEXT,
+  received_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS central_preferences (
+  scope TEXT NOT NULL,
+  name TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  PRIMARY KEY (scope, name)
+);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_fences_single_active
   ON fences(status) WHERE status = 'active';
 
@@ -182,6 +203,11 @@ CREATE INDEX IF NOT EXISTS idx_fences_version_desc
 -- empata quando dois pacotes têm o mesmo segundo.
 CREATE INDEX IF NOT EXISTS idx_telemetry_collar
   ON telemetry(collar_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_telemetry_collar_time
+  ON telemetry(collar_id, substr(ts,1,19), id);
+CREATE INDEX IF NOT EXISTS idx_events_collar_time
+  ON events(collar_id, substr(ts,1,19), id);
 
 -- Montagem do arquivo de log de uma cerca, na ordem em que aconteceu.
 CREATE INDEX IF NOT EXISTS idx_fence_log_lines_version

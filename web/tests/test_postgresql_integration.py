@@ -32,6 +32,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 TABLES = (
+    "fence_publications",
+    "collar_watermarks",
+    "central_preferences",
     "fence_points",
     "deliveries",
     "edge_items",
@@ -87,6 +90,26 @@ def test_postgresql_inicializa_schema_idempotente(pg_db: Database):
     pg_db.initialize()
 
     assert set(TABLES) <= set(pg_db.table_names())
+
+
+def test_postgresql_publicacao_atomica_idempotente_e_rascunho(pg_client, cerca_limpa, monkeypatch):
+    import uuid
+    from backend.services import delivery
+
+    draft = str(uuid.uuid4())
+    assert pg_client.put("/api/producer/drafts/" + draft, json=cerca_limpa).status_code == 200
+    assert pg_client.get("/api/fences/active").status_code == 404
+    key = {"Idempotency-Key": str(uuid.uuid4())}
+    first = pg_client.post("/api/fences", json=cerca_limpa, headers=key)
+    assert first.status_code == 201
+    assert pg_client.post("/api/fences", json=cerca_limpa, headers=key).json()["version"] == first.json()["version"]
+    with monkeypatch.context() as patch:
+        def interrupt(*args, **kwargs):
+            raise RuntimeError("write interrupted")
+        patch.setattr(delivery, "create_pending", interrupt)
+        with pytest.raises(RuntimeError):
+            pg_client.post("/api/fences", json={**cerca_limpa, "name": "Failed version"})
+    assert pg_client.get("/api/fences/active").json()["version"] == first.json()["version"]
 
 
 def test_postgresql_fluxo_cerca_heartbeat_download_e_batch(

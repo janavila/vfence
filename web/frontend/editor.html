@@ -14,27 +14,7 @@
 </head>
 <body>
 
-<header class="app-header">
-  <div class="brand">
-    <a href="/"><img src="/static/VFence.png" alt="VFence"></a>
-    <strong>VFence — Cercamento Virtual</strong>
-  </div>
-  <div class="header-inner">
-    <div class="mode-switch" role="group" aria-label="Modo de uso">
-      <a href="/editor" aria-current="true" title="Desenhar a cerca e acompanhar o rebanho">Produtor</a>
-      <a href="/painel" title="Situação da propriedade, histórico de cercas e eventos">Gestão</a>
-    </div>
-    <nav class="primary-nav" aria-label="Navegação principal">
-      <a href="/editor" aria-current="page">Editor de cerca</a>
-      <a href="/rebanho">Rebanho</a>
-    </nav>
-    <span class="base-indicator" id="base-indicator" data-state="unknown" aria-live="polite">
-      <i aria-hidden="true"></i>
-      <span id="base-indicator-text">Verificando…</span>
-    </span>
-    <button class="logout-button" type="button" id="logout-button">Sair</button>
-  </div>
-</header>
+<!-- area-header -->
 
 <main class="workspace">
 
@@ -79,7 +59,7 @@
       <div class="panel-heading">
         <div>
           <h2>Mapa da propriedade</h2>
-          <p>Base <span id="base-label" class="mono">—</span> ·
+          <p class="management-only">Base <span id="base-label" class="mono">—</span> ·
              <span id="base-state">verificando</span> ·
              <span id="realtime-state" data-live="false">conectando</span></p>
         </div>
@@ -165,6 +145,7 @@
           </div>
 
           <div class="button-row">
+            <button class="button" type="button" id="map-center-point">Adicionar ponto no centro do mapa</button>
             <button class="button" type="button" id="undo-point" disabled>Desfazer último</button>
             <button class="button" type="button" id="clear-points" disabled>Limpar tudo</button>
             <button class="button" type="button" id="invert-order" disabled>Inverter ordem</button>
@@ -199,12 +180,12 @@
         </div>
         <div class="panel-body stack-sm">
           <div class="field">
-            <label for="margin-attention">Aviso ao animal a (metros da cerca)</label>
+            <label for="margin-attention">Distância de aviso (metros)</label>
             <input type="number" id="margin-attention" min="0.5" max="100" step="0.5" value="5">
             <small id="attention-explain">A coleira começa a avisar o animal a 5 m da cerca.</small>
           </div>
           <div class="field">
-            <label for="margin-critical">Aviso forte a (metros da cerca)</label>
+            <label for="margin-critical">Distância de aviso urgente (metros)</label>
             <input type="number" id="margin-critical" min="0.1" max="100" step="0.5" value="2">
             <small>Mais perto da cerca, o aviso fica mais forte. Precisa ser menor que o de cima.</small>
           </div>
@@ -243,11 +224,12 @@
       <!-- Passo 4 -->
       <article class="panel">
         <div class="panel-heading">
-          <div><h2><span class="step-number">4</span> Enviar</h2></div>
+          <div><h2><span class="step-number">4</span> Salvar ou publicar</h2></div>
         </div>
-        <div class="panel-body">
+        <div class="panel-body button-row">
+          <button class="button" type="button" id="save-draft">Salvar rascunho</button>
           <button class="button primary" type="button" id="send-fence" disabled>
-            Enviar a cerca para as coleiras
+            Publicar e distribuir
           </button>
         </div>
       </article>
@@ -261,11 +243,11 @@
   <section class="panel sent-panel" id="sent-panel" hidden style="margin-top: var(--gap);">
     <div class="panel-heading">
       <div>
-        <h2>Cerca <span id="sent-version">—</span> enviada</h2>
-        <p>Conferência <span class="mono" id="sent-crc">—</span> ·
+        <h2>Cerca <span id="sent-version">—</span> publicada</h2>
+        <p><span class="management-only">Conferência <span class="mono" id="sent-crc">—</span> ·</span>
            criada em <span id="sent-created">—</span></p>
       </div>
-      <a class="button" id="log-link" href="#" download>Baixar o relatório</a>
+      <a class="button management-only" id="log-link" href="#" download>Baixar o relatório</a>
     </div>
     <div class="table-scroll">
       <table class="data-table">

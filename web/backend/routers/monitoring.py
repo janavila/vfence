@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
+from backend.clock import read_instant
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
@@ -53,8 +54,9 @@ def _collars(db, active_version: int | None) -> list[dict]:
     with db.connect() as conn:
         rows = [dict(row) for row in conn.execute(
             "SELECT collars.*,(SELECT MAX(fence_version) FROM deliveries "
-            "WHERE deliveries.collar_id=collars.collar_id AND status='confirmed') AS confirmed_fence_version "
-            "FROM collars ORDER BY collar_id",
+            "WHERE deliveries.collar_id=collars.collar_id AND status='confirmed') AS confirmed_fence_version, "
+            "collar_watermarks.received_at, collar_watermarks.zone_at "
+            "FROM collars LEFT JOIN collar_watermarks USING(collar_id) ORDER BY collar_id",
         )]
     now = datetime.now(timezone.utc)
     for row in rows:
@@ -68,6 +70,10 @@ def _collars(db, active_version: int | None) -> list[dict]:
                 pass
         row["position_age_s"] = age
         row["position_stale"] = age is None or age > 120 or row["gnss_status"] == "invalid"
+        contact = read_instant(row["last_contact_at"])
+        row["contact_age_s"] = max(0, int((now - contact).total_seconds())) if contact else None
+        if row["link_status"] == "online" and (row["contact_age_s"] is None or row["contact_age_s"] > 180):
+            row["link_status"] = "offline"
         row["outdated"] = active_version is not None and row["fence_version_reported"] != active_version
     return rows
 
@@ -174,6 +180,7 @@ async def events_route(
     start: datetime | None = None,
     end: datetime | None = None,
     before_id: int | None = Query(None, ge=1),
+    kind: list[str] | None = Query(None, max_length=32),
 ) -> list[dict]:
     """Mais recente primeiro, com filtro opcional por coleira.
 
@@ -183,6 +190,9 @@ async def events_route(
     """
     db = request.app.state.db
     where, parameters = _history_filter(collar_id, start, end, before_id)
+    if kind:
+        where += (" AND " if where else " WHERE ") + "kind IN (" + ",".join("?" for _ in kind) + ")"
+        parameters.extend(kind)
 
     def consultar() -> list[dict]:
         with db.connect() as conn:
@@ -192,6 +202,15 @@ async def events_route(
             return [dict(linha) for linha in linhas]
 
     return await asyncio.to_thread(consultar)
+
+
+@router.get("/events/kinds", response_model=list[str])
+async def event_kinds(request: Request):
+    def read():
+        with request.app.state.db.connect() as conn:
+            return [row["kind"] for row in conn.execute("SELECT DISTINCT kind FROM events ORDER BY kind")]
+
+    return await asyncio.to_thread(read)
 
 
 # ---------------------------------------------------------------------------

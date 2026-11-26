@@ -87,6 +87,7 @@ export function setOfflineBanner(offline) {
 function markCurrentPage() {
   const here = window.location.pathname.replace(/\/+$/, '') || '/';
   document.querySelectorAll('.primary-nav a').forEach((link) => {
+    if (link.closest('[data-area]')) return;
     const target = new URL(link.getAttribute('href'), window.location.origin)
       .pathname.replace(/\/+$/, '') || '/';
     if (target === here) link.setAttribute('aria-current', 'page');
@@ -181,7 +182,7 @@ async function monitorService() {
 /* ---- Início ---- */
 
 markCurrentPage();
-monitorService();
+if (document.getElementById('base-indicator') && !location.pathname.startsWith('/produtor')) monitorService();
 
 /* ---- Sair do sistema (fase F8) ---- */
 
@@ -199,8 +200,26 @@ function ligarBotaoSair() {
     try {
       await fetch('/api/auth/logout', { method: 'POST' });
     } catch { /* sem rede: mandamos ao login de todo jeito */ }
-    window.location.replace('/login');
+    window.location.replace('/');
   });
 }
 
 ligarBotaoSair();
+
+const back = document.querySelector('[data-back]');
+if (back && document.referrer) {
+  const previous = new URL(document.referrer);
+  const area = back.closest('[data-area]')?.dataset.area;
+  const legacy = ['/painel', '/rebanho', '/editor', '/historico', '/eventos'];
+  const prefix = area === 'producer' ? '/produtor' : '/gestao';
+  const sameArea = (area === 'producer' || area === 'management') &&
+    (previous.pathname === prefix || previous.pathname.startsWith(prefix + '/') ||
+      (area === 'management' && legacy.includes(previous.pathname)));
+  if (previous.origin === location.origin && sameArea && previous.href !== location.href) {
+    back.addEventListener('click', (event) => {
+      if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || history.length < 2) return;
+      event.preventDefault();
+      history.back();
+    });
+  }
+}

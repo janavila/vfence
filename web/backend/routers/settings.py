@@ -49,6 +49,7 @@ class SettingsOut(BaseModel):
     known_collars: list[str]
     min_points: int
     max_points: int
+    property_timezone: str
 
 
 @router.get("/settings", response_model=SettingsOut, summary="Configuração para a tela")
@@ -70,4 +71,5 @@ async def settings_route(request: Request) -> dict:
         "known_collars": list(settings.known_collars),
         "min_points": 3,
         "max_points": 32,
+        "property_timezone": settings.property_timezone,
     }

@@ -1,0 +1,81 @@
+m255
+K3
+13
+cModel Technology
+Z0 dC:\Users\leobo\OneDrive\Desktop\vfence\FPGA
+vtb_vfence_carga
+!i10b 1
+!s100 1Doh`2j;9H@9zA<oFc`673
+I[5Y_oB?dOSY830Td6TXTR2
+VeEI8UZnVSRfE0SnEIi]6Y1
+Z1 dC:\Users\leobo\OneDrive\Desktop\vfence\FPGA
+w1795272820
+8tb_vfence_carga.v
+Ftb_vfence_carga.v
+L0 5
+Z2 OV;L;10.1d;51
+r1
+!s85 0
+31
+Z3 !s108 1795272881.596000
+Z4 !s107 tb_vfence_carga.v|vfence_top.v|vfence_operativa.v|vfence_controle.v|
+Z5 !s90 -reportprogress|300|vfence_controle.v|vfence_operativa.v|vfence_top.v|tb_vfence_carga.v|
+!s101 -O0
+o-O0
+vvfence_controle
+!i10b 1
+!s100 _U0KmFn>NZ0;ObL033XMU2
+IheIVO=J5ZZ@gbI?AC9j4P0
+V0O8H2hf]@zXdXdf0YIA?i1
+R1
+w1795271908
+8vfence_controle.v
+Fvfence_controle.v
+L0 4
+R2
+r1
+!s85 0
+31
+R3
+R4
+R5
+!s101 -O0
+o-O0
+vvfence_operativa
+!i10b 1
+!s100 @_Q?KNQ:^d;``HXdLPk[U0
+Ioh>1FN7[_ITzzI^U]o5Vo2
+Vm]=1]LX`ag=m@5O9cNV9T3
+R1
+w1795271999
+8vfence_operativa.v
+Fvfence_operativa.v
+L0 6
+R2
+r1
+!s85 0
+31
+R3
+R4
+R5
+!s101 -O0
+o-O0
+vvfence_top
+!i10b 1
+!s100 =BHWgonAC1:iJ?UnNDS081
+I8o6HazVDjfBWOP4F]>Emj1
+V6zNk8^9ln]jPN4JZg]TGO2
+R1
+w1795272019
+8vfence_top.v
+Fvfence_top.v
+L0 4
+R2
+r1
+!s85 0
+31
+R3
+R4
+R5
+!s101 -O0
+o-O0

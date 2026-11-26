@@ -52,7 +52,7 @@ import math
 import re
 from datetime import datetime, timedelta, timezone
 
-from backend.clock import ISO_FORMAT, utc_now_iso
+from backend.clock import ISO_FORMAT, event_stamp, read_instant, utc_now, utc_now_iso
 from backend.config import Settings
 from backend.db import Database
 from backend.services import delivery, fence_service
@@ -95,6 +95,8 @@ def _validate_item(item: dict) -> tuple[str, str]:
         value = data.get(key)
         if value is not None and (not isinstance(value, str) or len(value) > limit):
             raise BatchRejected("invalid_" + key, seq)
+    if data.get("ts") is not None and read_instant(data["ts"]) is None:
+        raise BatchRejected("invalid_ts", seq)
     if kind == "event" and not _valid_identifier(data.get("kind")):
         raise BatchRejected("invalid_event_kind", seq)
     if kind == "telemetry":
@@ -351,6 +353,53 @@ def _ensure_collar(conn, collar_id: str, base_id: str, edge_seq: int) -> None:
         raise BatchRejected("collar_base_conflict", edge_seq, conflict=True)
 
 
+def _update_collar_state(db, conn, collar_id, stamp, *, link=None, gnss=None, zone=None, position=None):
+    # PostgreSQL must serialize projection updates across Function instances.
+    suffix = " FOR UPDATE" if db.is_postgresql else ""
+    row = conn.execute("SELECT * FROM collars WHERE collar_id=?" + suffix, (collar_id,)).fetchone()
+    water = conn.execute("SELECT * FROM collar_watermarks WHERE collar_id=?", (collar_id,)).fetchone()
+    clocks = dict(water) if water else {
+        "link_at": row["last_contact_at"], "gnss_at": row["last_seen"], "zone_at": row["last_seen"],
+    }
+    incoming = read_instant(stamp)
+
+    def newer(previous):
+        other = read_instant(previous)
+        return other is None or incoming >= other
+
+    updates = {}
+    if link is not None and newer(clocks["link_at"]):
+        updates["link_status"] = link
+        clocks["link_at"] = stamp
+        if link == "online":
+            updates["last_contact_at"] = stamp
+    if gnss is not None and newer(clocks["gnss_at"]):
+        updates["gnss_status"] = gnss
+        clocks["gnss_at"] = stamp
+    if zone is not None and newer(clocks["zone_at"]):
+        updates["last_zone"] = zone or None
+        clocks["zone_at"] = stamp
+    if position is not None:
+        if newer(row["last_seen"]):
+            updates["last_seen"] = stamp
+            for column, key in (("battery_pct", "battery_pct"), ("rssi", "rssi"), ("snr", "snr"),
+                                ("fence_version_reported", "fence_version")):
+                if position.get(key) is not None:
+                    updates[column] = position[key]
+        if (position.get("lat") is not None and position.get("lon") is not None
+                and gnss == "valid" and newer(row["last_position_at"])):
+            updates.update(last_lat=position["lat"], last_lon=position["lon"], last_position_at=stamp)
+    if updates:
+        conn.execute("UPDATE collars SET " + ",".join(f"{key}=?" for key in updates) + " WHERE collar_id=?",
+                     (*updates.values(), collar_id))
+        conn.execute(
+            """INSERT INTO collar_watermarks (collar_id,link_at,gnss_at,zone_at,received_at) VALUES (?,?,?,?,?)
+               ON CONFLICT(collar_id) DO UPDATE SET link_at=excluded.link_at,gnss_at=excluded.gnss_at,
+               zone_at=excluded.zone_at,received_at=excluded.received_at""",
+            (collar_id, clocks["link_at"], clocks["gnss_at"], clocks["zone_at"], event_stamp(utc_now())),
+        )
+
+
 def _store_telemetry(db: Database, base_id: str, edge_seq: int, data: dict) -> dict | None:
     """Grava uma posição e atualiza o último estado da coleira."""
     collar_id = data.get("collar_id")
@@ -367,7 +416,7 @@ def _store_telemetry(db: Database, base_id: str, edge_seq: int, data: dict) -> d
         )
         zone = None
 
-    ts = data.get("ts") or utc_now_iso()
+    ts = event_stamp(read_instant(data.get("ts")) or utc_now())
     position_valid = data.get("lat") is not None and data.get("lon") is not None and zone != "GNSS_INVALIDO"
     with db.connect() as conn:
         _ensure_collar(conn, collar_id, base_id, edge_seq)
@@ -384,34 +433,8 @@ def _store_telemetry(db: Database, base_id: str, edge_seq: int, data: dict) -> d
                 data.get("fence_version"), data.get("rssi"), data.get("snr"),
             ),
         )
-        # Último estado conhecido. COALESCE preserva o valor anterior
-        # quando o campo não vem no pacote — um pacote sem bateria não
-        # apaga a última bateria conhecida.
-        conn.execute(
-            """
-            UPDATE collars SET
-                base_id = ?,
-                fence_version_reported = COALESCE(?, fence_version_reported),
-                last_zone = COALESCE(?, last_zone),
-                last_lat = COALESCE(?, last_lat),
-                last_lon = COALESCE(?, last_lon),
-                battery_pct = COALESCE(?, battery_pct),
-                rssi = COALESCE(?, rssi),
-                snr = COALESCE(?, snr),
-                last_seen = ?,
-                last_position_at = COALESCE(?,last_position_at),
-                last_contact_at = ?, gnss_status = ?, link_status = 'online'
-            WHERE collar_id = ?
-            """,
-            (
-                base_id, data.get("fence_version"), zone,
-                data.get("lat") if position_valid else None, data.get("lon") if position_valid else None,
-                data.get("battery_pct"), data.get("rssi"), data.get("snr"),
-                ts, ts if position_valid else None, ts,
-                "valid" if position_valid else "invalid" if zone == "GNSS_INVALIDO" else "unknown",
-                collar_id,
-            ),
-        )
+        gnss = "valid" if position_valid else "invalid" if zone == "GNSS_INVALIDO" else "unknown"
+        _update_collar_state(db, conn, collar_id, ts, link="online", gnss=gnss, zone=zone, position=data)
         if invalid_zone:
             conn.execute(
                 """
@@ -448,21 +471,19 @@ def _store_event(db: Database, base_id: str, edge_seq: int, data: dict) -> dict 
     zone = (data.get("zone") or "").upper() or None
     if zone is not None and zone not in VALID_ZONES:
         zone = None
-    ts = data.get("ts") or utc_now_iso()
+    ts = event_stamp(read_instant(data.get("ts")) or utc_now())
     collar_id = data.get("collar_id")
 
     with db.connect() as conn:
         if collar_id:
             _ensure_collar(conn, collar_id, base_id, edge_seq)
             if kind in {"outside", "back_inside", "low_battery", "critical_battery", "device_started",
-                        "gps_lost", "gps_recovered", "collar_online", "collar_offline", "offline"}:
+                        "gps_lost", "gps_recovered", "collar_online", "collar_offline", "offline", "zone_change"}:
                 offline = kind in {"collar_offline", "offline"}
                 gnss = {"gps_lost": "invalid", "gps_recovered": "valid"}.get(kind)
-                conn.execute(
-                    "UPDATE collars SET last_contact_at=COALESCE(?,last_contact_at),"
-                    "link_status=?,gnss_status=COALESCE(?,gnss_status) WHERE collar_id=?",
-                    (None if offline else ts, "offline" if offline else "online", gnss, collar_id),
-                )
+                zone_update = "FORA" if kind == "outside" else (zone or "") if kind == "back_inside" else zone
+                _update_collar_state(db, conn, collar_id, ts, link="offline" if offline else "online",
+                                     gnss=gnss, zone=zone_update)
         cursor = conn.execute(
             """
             INSERT INTO events (base_id, edge_seq, collar_id, kind, zone, detail, ts)

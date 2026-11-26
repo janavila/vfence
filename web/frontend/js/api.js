@@ -49,24 +49,29 @@ export class ErroDeConexao extends Error {
  * @param {string} caminho  ex.: '/api/fences'
  * @param {{metodo?: string, corpo?: object, texto?: boolean}} opcoes
  */
-async function chamar(caminho, { metodo = 'GET', corpo = null, texto = false } = {}) {
+export const produtor = location.pathname === '/produtor' || location.pathname.startsWith('/produtor/');
+const fencePath = produtor ? '/api/producer/fences' : '/api/fences';
+
+async function chamar(caminho, { metodo = 'GET', corpo = null, texto = false, key = null, signal } = {}) {
   let resposta;
   try {
     resposta = await fetch(caminho, {
       method: metodo,
-      headers: corpo ? { 'Content-Type': 'application/json' } : undefined,
+      headers: { ...(corpo ? { 'Content-Type': 'application/json' } : {}),
+        ...(key ? { 'Idempotency-Key': key } : {}) },
       body: corpo ? JSON.stringify(corpo) : undefined,
       cache: 'no-store',
-      signal: AbortSignal.timeout(TEMPO_LIMITE_MS),
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(TEMPO_LIMITE_MS)]) : AbortSignal.timeout(TEMPO_LIMITE_MS),
     });
   } catch (causa) {
-    setOfflineBanner(true);
+    if (!signal?.aborted) setOfflineBanner(true);
     throw new ErroDeConexao(causa);
   }
 
   setOfflineBanner(false);
 
   if (resposta.status === 204) return null;
+  if (resposta.status === 401 && produtor) location.replace('/login?next=%2Fprodutor');
 
   if (!resposta.ok) {
     let decodificado = null;
@@ -83,21 +88,26 @@ async function chamar(caminho, { metodo = 'GET', corpo = null, texto = false } =
 
 /* ---- Configuração e situação ---- */
 
-export const lerConfiguracao = () => chamar('/api/settings');
+export const consultar = chamar;
+export const lerConfiguracao = () => chamar(produtor ? '/api/producer/settings' : '/api/settings');
 
 /* ---- Cercas ---- */
 
 export const validarNoServidor = (cerca) =>
-  chamar('/api/fences/validate', { metodo: 'POST', corpo: cerca });
+  chamar(fencePath + '/validate', { metodo: 'POST', corpo: cerca });
 
-export const criarCerca = (cerca) =>
-  chamar('/api/fences', { metodo: 'POST', corpo: cerca });
+export const criarCerca = (cerca, key) =>
+  chamar(fencePath, { metodo: 'POST', corpo: cerca, key });
 
-export const lerCercaAtiva = () => chamar('/api/fences/active');
-export const lerHistorico = () => chamar('/api/fences');
-export const reativarCerca = (versao) =>
-  chamar(`/api/fences/${versao}/reactivate`, { metodo: 'POST' });
-export const lerEntregas = (versao) => chamar(`/api/fences/${versao}/deliveries`);
+export const lerCercaAtiva = () => chamar(fencePath + '/active');
+export const lerHistorico = () => chamar(fencePath);
+export const lerCerca = versao => chamar(fencePath + '/' + versao);
+export const reativarCerca = (versao, key) =>
+  chamar(fencePath + '/' + versao + '/reactivate', { metodo: 'POST', key });
+export const lerEntregas = versao => chamar(fencePath + '/' + versao + '/deliveries');
+export const lerRascunhos = () => chamar('/api/producer/drafts');
+export const lerRascunho = id => chamar('/api/producer/drafts/' + id);
+export const salvarRascunho = (id, corpo) => chamar('/api/producer/drafts/' + id, { metodo: 'PUT', corpo });
 
 /** Endereços de download. Não passam por `fetch`: o navegador baixa direto. */
 export const enderecoDoLog = (versao) => `/api/fences/${versao}/log`;

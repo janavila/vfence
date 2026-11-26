@@ -32,6 +32,8 @@ _GATEWAY_LOG_ENUMS = {
         "GET_STATUS", "GET_RADIO", "GET_PROFILE", "LIST_PROFILES", "GET_PROFILE_TRANSITION",
         "REQUEST_PROFILE", "CANCEL_PROFILE", "PING", "SET_PARAMETERS", "FENCE_NEW", "FENCE_POINT",
         "FENCE_SEND", "FENCE_CANCEL", "ENABLE_EVENT_COMMIT", "ENABLE_PDR_COMMIT", "UNKNOWN",
+        "GET_PROFILE_V2", "START_PROFILE_V2", "CANCEL_PROFILE_V2", "GET_METRIC_CLOCK_V1",
+        "METRIC_COMMITTED", "EVIDENCE_COMMITTED", "EVENT_COMMITTED", "PDR_COMMITTED",
     },
     "reason": {"ok", "no_samples", "one_sample", "session_changed", "profile_changed", "discontinuity"},
     "detail": {
@@ -255,7 +257,8 @@ def _fpga_field(value: int | None, valid: bool, minimum: int, maximum: int) -> s
     return "DISPONIVEL" if minimum <= value <= maximum else "INVALIDO"
 
 
-def fpga_metric_diagnostic(summary: MetricSummary | PdrSummary, received_at: datetime) -> str:
+def fpga_metric_diagnostic(summary: MetricSummary | PdrSummary, received_at: datetime,
+                           *, fpga_enabled: bool = False) -> str:
     fields = dict.fromkeys(
         ("hdop_x100", "rssi_mag", "snr_x100", "pdr_x100", "sample_count"), "AUSENTE",
     )
@@ -310,5 +313,6 @@ def fpga_metric_diagnostic(summary: MetricSummary | PdrSummary, received_at: dat
         f" {availability}\n"
         f" metrics_valid | {flags}\n"
         " Resultado da previa: DADOS INSUFICIENTES | Janelas sem correlacao operacional\n"
-        " NAO ENVIADO — INTEGRACAO PENDENTE"
+        + (" NAO ENVIADO — AGUARDANDO CORRELACAO DA JANELA" if fpga_enabled
+           else " NAO ENVIADO — INTEGRACAO PENDENTE")
     )

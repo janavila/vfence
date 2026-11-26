@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
+import hashlib
 
 from backend.clock import utc_now_iso
 from backend.config import Settings
@@ -174,6 +175,7 @@ def create_fence(
     points: list[GeoPoint],
     result: ValidationResult,
     reactivated_from: int | None = None,
+    publication_key: str | None = None,
 ) -> dict:
     """Grava uma versão nova e a torna a ativa.
 
@@ -193,11 +195,26 @@ def create_fence(
     warnings = [v.as_dict() for v in result.warnings]
 
     with db.connect() as conn:
+        if not db.is_postgresql:
+            conn.execute("BEGIN IMMEDIATE")
         # No PostgreSQL, esta chamada adquire pg_advisory_xact_lock antes
         # de consultar MAX(version). Duas instâncias serverless não conseguem
         # reservar a mesma versão. No SQLite, a trava local do Database
         # serializa a transação.
         version = db.next_fence_version(conn)
+        fingerprint = hashlib.sha256(json.dumps(
+            [name.strip(), attention_cm, critical_cm, points_e6, reactivated_from],
+            separators=(",", ":"),
+        ).encode()).hexdigest()
+        if publication_key:
+            previous = conn.execute(
+                "SELECT version, fingerprint FROM fence_publications WHERE publication_key=?",
+                (publication_key,),
+            ).fetchone()
+            if previous:
+                if previous["fingerprint"] != fingerprint:
+                    raise PublicationConflict()
+                return get_by_version(db, previous["version"])
         blob = canonical_bytes(version, attention_cm, critical_cm, points_e6)
         crc32 = crc32_hex(blob)
 
@@ -226,39 +243,35 @@ def create_fence(
                 for seq, point in enumerate(points_e6, start=1)
             ],
         )
+        collar_ids = [row["collar_id"] for row in db.list_collars()]
+        delivery.create_pending(db, version, collar_ids)
+        if publication_key:
+            conn.execute(
+                "INSERT INTO fence_publications (publication_key, version, fingerprint) VALUES (?,?,?)",
+                (publication_key, version, fingerprint),
+            )
 
-    logger.info(
-        "fence=%s created (%d points, %.3f ha, %.1f m, crc=%s)",
-        version, len(points_e6), result.area_ha, result.perimeter_m, crc32,
-    )
-    logger.info("fence=%s orientation checked: %s", version, result.orientation)
-
-    # --- log da cerca -------------------------------------------------
-    fence_log.append(
-        db,
-        version,
-        f"fence created name={name.strip()!r} points={len(points_e6)} "
-        f"dA={margin_attention_m}m dC={margin_critical_m}m crc={crc32}"
-        + (f" reactivated_from={reactivated_from}" if reactivated_from else ""),
-    )
-    fence_log.record_validation(db, version, result.as_dict())
-    for warning in warnings:
-        logger.warning(
-            "fence=%s %s %s (accepted by user)", version, warning["rule"], warning["message"]
-        )
         fence_log.append(
-            db, version, f"warning accepted by user: {warning['rule']} {warning['message']}"
+            db, version,
+            f"fence created name={name.strip()!r} points={len(points_e6)} "
+            f"dA={margin_attention_m}m dC={margin_critical_m}m crc={crc32}"
+            + (f" reactivated_from={reactivated_from}" if reactivated_from else ""),
         )
-    fence_log.append(db, version, "fence activated (previous fence deactivated)")
+        fence_log.record_validation(db, version, result.as_dict())
+        for warning in warnings:
+            fence_log.append(db, version, f"warning accepted by user: {warning['rule']} {warning['message']}")
+        fence_log.append(db, version, "fence activated (previous fence deactivated)")
+        published = get_by_version(db, version)
 
-    # --- entregas pendentes, uma por coleira conhecida ----------------
-    collar_ids = [row["collar_id"] for row in db.list_collars()]
-    delivery.create_pending(db, version, collar_ids)
-
-    return get_by_version(db, version)
+    logger.info("fence=%s published (points=%d crc=%s)", version, len(points_e6), crc32)
+    return published
 
 
-def reactivate(db: Database, settings: Settings, version: int) -> dict:
+class PublicationConflict(ValueError):
+    pass
+
+
+def reactivate(db: Database, settings: Settings, version: int, publication_key: str | None = None) -> dict:
     """Cria uma versão NOVA com os pontos de uma versão antiga.
 
     Revalida de propósito: a Base pode ter mudado de posição no `.env`
@@ -291,4 +304,5 @@ def reactivate(db: Database, settings: Settings, version: int) -> dict:
         points=points,
         result=result,
         reactivated_from=version,
+        publication_key=publication_key,
     )

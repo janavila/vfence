@@ -54,20 +54,24 @@ import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from collections import OrderedDict
+from urllib.parse import urlencode
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend import __version__
-from backend.config import DEFAULT_ENV_FILE, PROJECT_DIR, Settings, load_settings
+from backend.config import ConfigError, DEFAULT_ENV_FILE, PROJECT_DIR, Settings, load_settings
 from backend.db import Database, DatabaseConfigurationError, describe_connection_error
 from backend.errors import ApiError
 from backend.logging_setup import setup_logging
-from backend.security import SESSION_COOKIE, read_session_token
+from backend.navigation import header
+from backend.permissions import browser_origin_matches, producer_path, role_for, session_user
 from backend.services.realtime import RealtimeHub
 from backend.routers import (
     auth,
+    areas,
     edge,
     fences,
     health,
@@ -106,6 +110,11 @@ def create_app(
     """
     if settings is None:
         settings = load_settings(env_file=env_file)
+    if os.getenv("VERCEL_ENV") == "production" and (
+        not settings.auth_enabled or settings.admin_password == "troque-esta-senha"
+        or settings.session_secret == "troque-esta-chave" or settings.base_token == "troque-este-token"
+    ):
+        raise ConfigError("Produção exige autenticação e credenciais provisionadas")
 
     database = Database(settings.database_target)
     hub = RealtimeHub()
@@ -222,7 +231,8 @@ def create_app(
     app.state.db = database
     app.state.hub = hub
     # Calculado na primeira tentativa de login e reaproveitado (ver auth.py).
-    app.state.admin_password_hash = None
+    app.state.password_hashes = {}
+    app.state.login_attempts = OrderedDict()
     # Situação do banco (ver `tentar_preparar_banco`). Começa "não pronto":
     # se a plataforma não rodar o `lifespan`, a primeira chamada à API
     # prepara o banco do mesmo jeito.
@@ -246,19 +256,15 @@ def create_app(
     # arquivos      a tela de login precisa carregar o CSS, o JavaScript,
     #               o logotipo e o Leaflet antes de alguém entrar.
     CAMINHOS_ABERTOS = ("/api/edge/", "/api/auth/", "/css/", "/js/", "/vendor/", "/static/")
-    CAMINHOS_ABERTOS_EXATOS = {"/api/health", "/login", "/favicon.ico", "/docs", "/openapi.json", "/redoc"}
+    CAMINHOS_ABERTOS_EXATOS = {"/", "/visitante", "/api/public/rebanho", "/api/health",
+                              "/login", "/favicon.ico", "/docs", "/openapi.json", "/redoc"}
 
     def _caminho_aberto(path: str) -> bool:
         return path in CAMINHOS_ABERTOS_EXATOS or path.startswith(CAMINHOS_ABERTOS)
 
     def sessao_valida(request: Request) -> str | None:
         """Devolve o usuário logado, ou None. Usada aqui e no /ws."""
-        if not settings.auth_enabled:
-            return settings.admin_user
-        user = read_session_token(
-            request.cookies.get(SESSION_COOKIE, ""), settings.session_secret
-        )
-        return user if user == settings.admin_user else None
+        return session_user(request)
 
     app.state.sessao_valida = sessao_valida
 
@@ -308,15 +314,30 @@ def create_app(
           para o JavaScript saber que precisa mandar ao login em vez de
           tentar desenhar uma página de HTML como se fosse JSON.
         """
-        if not settings.auth_enabled or _caminho_aberto(request.url.path):
+        path = request.url.path
+        if _caminho_aberto(path):
             return await call_next(request)
 
-        if sessao_valida(request) is not None:
-            return await call_next(request)
+        request.state.user = sessao_valida(request)
+        role = role_for(settings, request.state.user)
+        if role == "management" or (role == "producer" and producer_path(path)):
+            if request.method not in {"GET", "HEAD", "OPTIONS"} and not browser_origin_matches(request):
+                return JSONResponse(status_code=403, content={"detail": "origin_not_allowed"})
+            response = await call_next(request)
+            response.headers["Cache-Control"] = "no-store"
+            return response
+        if role == "producer":
+            if path.startswith("/api/"):
+                return JSONResponse(status_code=403, content={"detail": "forbidden"})
+            return RedirectResponse(url="/produtor", status_code=303)
 
-        if request.url.path.startswith("/api/"):
+        if path.startswith("/api/"):
             return JSONResponse(status_code=401, content={"detail": "not_authenticated"})
-        return RedirectResponse(url="/login", status_code=303)
+        next_area = path if producer_path(path) or path == "/gestao" or path.startswith("/gestao/") else None
+        if next_area and request.url.query:
+            next_area += "?" + request.url.query
+        login_url = "/login?" + urlencode({"next": next_area}) if next_area else "/login"
+        return RedirectResponse(url=login_url, status_code=303)
 
     # ---- erros no formato da especificação -----------------------------
     @app.exception_handler(ApiError)
@@ -333,6 +354,7 @@ def create_app(
     # ---- API ----------------------------------------------------------
     app.include_router(health.router)
     app.include_router(auth.router)
+    app.include_router(areas.router)
     app.include_router(fences.router)
     app.include_router(edge.router)
     app.include_router(settings_router.router)
@@ -353,23 +375,49 @@ def create_app(
     # eventos). O modo é só de navegação, não de permissão: o login
     # continua sendo um usuário único.
     @app.get("/", include_in_schema=False)
-    async def home() -> RedirectResponse:
-        """O produtor entra direto no editor de cerca.
+    async def home() -> FileResponse:
+        return FileResponse(FRONTEND_DIR / "inicio.html")
 
-        Redirecionamento, e não o mesmo HTML servido em dois endereços:
-        assim cada tela tem um endereço só, e o menu marca o item certo.
-        """
-        return RedirectResponse(url="/editor", status_code=303)
+    @app.get("/visitante", include_in_schema=False)
+    async def visitante() -> FileResponse:
+        return FileResponse(FRONTEND_DIR / "visitante.html")
+
+    @app.get("/produtor", include_in_schema=False)
+    async def produtor() -> HTMLResponse:
+        return await area_page("visitante.html", "producer", "herd", "/")
+
+    @app.get("/produtor/avisos", include_in_schema=False)
+    async def produtor_avisos():
+        return RedirectResponse("/produtor#visitor-alerts-title", status_code=303)
+
+    @app.get("/produtor/cercas", include_in_schema=False)
+    @app.get("/produtor/editor", include_in_schema=False)
+    async def editor_produtor():
+        return await area_page("editor.html", "producer", "fences", "/produtor/cercas")
+
+    @app.get("/gestao/cercas", include_in_schema=False)
+    async def minhas_cercas():
+        return await area_page("editor.html", "management", "fences", "/gestao")
+
+    @app.get("/gestao/visitante", include_in_schema=False)
+    async def gestao_visitante():
+        return RedirectResponse("/gestao/painel#visibilidade-publica", status_code=303)
+
+    @app.get("/gestao", include_in_schema=False)
+    async def gestao() -> HTMLResponse:
+        return await area_page("visitante.html", "management", "herd", "/")
 
     @app.get("/painel", include_in_schema=False)
-    async def painel() -> FileResponse:
+    @app.get("/gestao/painel", include_in_schema=False)
+    async def painel() -> HTMLResponse:
         """Situação da propriedade, do modo Gestão (seção 11.4)."""
-        return FileResponse(FRONTEND_DIR / "painel.html")
+        return await area_page("gestao-painel.html", "management", "overview", "/gestao")
 
     @app.get("/editor", include_in_schema=False)
-    async def editor() -> FileResponse:
+    @app.get("/gestao/editor", include_in_schema=False)
+    async def editor() -> HTMLResponse:
         """Editor de cerca — a tela principal do projeto (seção 11.3)."""
-        return FileResponse(FRONTEND_DIR / "editor.html")
+        return await area_page("editor.html", "management", "fences", "/gestao/cercas")
 
     @app.get("/login", include_in_schema=False)
     async def login_page() -> FileResponse:
@@ -377,19 +425,22 @@ def create_app(
         return FileResponse(FRONTEND_DIR / "login.html")
 
     @app.get("/historico", include_in_schema=False)
-    async def historico() -> FileResponse:
+    @app.get("/gestao/historico", include_in_schema=False)
+    async def historico() -> HTMLResponse:
         """Histórico de cercas, com reativação (seção 11.4)."""
-        return FileResponse(FRONTEND_DIR / "historico.html")
+        return await area_page("gestao-historico.html", "management", "history", "/gestao")
 
     @app.get("/rebanho", include_in_schema=False)
-    async def rebanho() -> FileResponse:
+    @app.get("/gestao/rebanho", include_in_schema=False)
+    async def rebanho() -> HTMLResponse:
         """Mapa e lista das coleiras (seção 11.4)."""
-        return FileResponse(FRONTEND_DIR / "rebanho.html")
+        return RedirectResponse("/gestao#dados-coleiras", status_code=303)
 
     @app.get("/eventos", include_in_schema=False)
-    async def eventos() -> FileResponse:
+    @app.get("/gestao/eventos", include_in_schema=False)
+    async def eventos() -> HTMLResponse:
         """Linha do tempo dos acontecimentos (seção 11.4)."""
-        return FileResponse(FRONTEND_DIR / "eventos.html")
+        return await area_page("gestao-eventos.html", "management", "events", "/gestao")
 
     @app.get("/favicon.ico", include_in_schema=False)
     async def favicon() -> FileResponse:
@@ -397,6 +448,69 @@ def create_app(
         return FileResponse(LOGO_FILE, media_type="image/png")
 
     return app
+
+
+async def area_page(file: str, area: str, page: str, back: str, *, indicator: bool = False) -> HTMLResponse:
+    content = await asyncio.to_thread((FRONTEND_DIR / file).read_text, encoding="utf-8")
+    if area == "producer" or (area == "management" and page in {"herd", "fences"}):
+        return await operational_page(content, page, area)
+    content = content.replace("<!-- area-header -->", header(area, page, back, indicator=indicator), 1)
+    if page == "overview":
+        publication = await asyncio.to_thread((FRONTEND_DIR / "publicacao.html").read_text, encoding="utf-8")
+        form = publication[publication.index("<form"):publication.index("</form>") + len("</form>")]
+        content = content.replace("<!-- public-policy-form -->", form, 1)
+    return HTMLResponse(content)
+
+
+async def operational_page(content: str, page: str, area: str) -> HTMLResponse:
+    content = content.replace("</head>", '  <link rel="stylesheet" href="/css/produtor.css">\n</head>', 1)
+    area_header = header(area, page, "/produtor")
+    if page == "herd":
+        start = content.index("<header")
+        end = content.index("</header>", start) + len("</header>")
+        content = content[:start] + area_header + content[end:]
+        content = content.replace('class="visitor-page"', 'class="visitor-page producer-area"', 1)
+        content = content.replace("Rebanho público", "Meu Rebanho")
+        content = content.replace("Consultando informações públicas…", "Consultando os dados da propriedade…", 1)
+        content = content.replace("Acompanhe a localização dos animais e sua situação em relação à cerca virtual.",
+                                  "Acompanhe a localização e a situação dos seus animais.")
+        content = content.replace('<p id="visitor-update"', '<div class="producer-intro-actions"><a class="button primary" '
+                                  'href="/produtor/cercas">Gerenciar cercas</a><p id="visitor-update"', 1)
+        content = content.replace("Consultando o rebanho…</p>", "Consultando o rebanho…</p></div>", 1)
+        sections = await asyncio.to_thread((FRONTEND_DIR / "producer-herd-panels.html").read_text, encoding="utf-8")
+        current, history = sections.split("<!-- producer-history -->", 1)
+        anchor = '    <section class="visitor-panel" aria-labelledby="visitor-animals-title">'
+        content = content.replace(anchor, current + anchor, 1).replace("</main>", history + "</main>", 1)
+    else:
+        extra = await asyncio.to_thread((FRONTEND_DIR / "producer-editor-panels.html").read_text, encoding="utf-8")
+        toolbar, history = extra.split("<!-- producer-fence-history -->", 1)
+        content = content.replace("<!-- area-header -->", area_header, 1)
+        content = content.replace("<body>", '<body class="visitor-page producer-area producer-editor">', 1)
+        content = content.replace('<link rel="stylesheet" href="/css/style.css">',
+                                  '<link rel="stylesheet" href="/css/style.css">\n'
+                                  '  <link rel="stylesheet" href="/css/visitante.css">', 1)
+        content = content.replace("<title>Editor de cerca", "<title>Minhas Cercas", 1)
+        content = content.replace('<main class="workspace">', '<main class="workspace visitor-container">', 1)
+        content = content.replace('<div class="page-heading">', toolbar + '<details class="producer-rules visitor-panel">'
+                                  '<summary>Regras de validação</summary><div class="page-heading">', 1)
+        content = content.replace('<div class="notice info" id="editor-announce"', '</details>\n'
+                                  '<div class="notice info" id="editor-announce"', 1)
+        content = content.replace('<section class="stack">', '<section class="stack producer-editor-layout">', 1)
+        content = content.replace('<div class="table-scroll">\n      <table class="data-table">',
+                                  '<div id="producer-delivery-summary" class="panel-body"></div>'
+                                  '<div class="table-scroll">\n      <table class="data-table">', 1)
+        content = content.replace('</main>', history + '</main>\n'
+                                  '<footer class="visitor-footer">VFence — Sistema inteligente de cercamento virtual</footer>', 1)
+    if area == "management":
+        content = content.replace("</head>", '<link rel="stylesheet" href="/css/gestao.css">\n</head>', 1)
+        content = content.replace('class="visitor-page producer-area', 'class="visitor-page producer-area management-area', 1)
+        content = content.replace('href="/produtor/cercas"', 'href="/gestao/cercas"')
+        if page == "herd":
+            technical = await asyncio.to_thread((FRONTEND_DIR / "gestao-coleiras.html").read_text, encoding="utf-8")
+            content = content.replace("Meu Rebanho", "Rebanho").replace("</main>", technical + "</main>", 1)
+        else:
+            content = content.replace("Minhas Cercas", "Cercas")
+    return HTMLResponse(content)
 
 
 def create_runtime_app():

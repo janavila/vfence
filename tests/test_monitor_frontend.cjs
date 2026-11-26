@@ -103,3 +103,21 @@ test('expanded telemetry shows independent windows, units and missing data',asyn
   assert.match(ui.node('#collars').innerHTML,/Nenhuma janela registrada/);
   assert.doesNotMatch(ui.node('#collars').innerHTML,/75\.00%/);
 });
+
+test('central status reflects observed phases and pending count',async()=>{
+  const ui=dashboard();
+  ui.snapshot(online,[collar('COL01',0)]);
+  await settle();
+  for(const [phase,status,label] of [
+    ['connecting','offline','Conectando'],
+    ['authenticated','offline','Autenticada'],
+    ['awaiting_credential','offline','Aguardando credencial válida'],
+    ['network_unavailable','offline','Sem conexão com a Central'],
+    ['server_unavailable','offline','Temporariamente indisponível'],
+    ['reconnected','online','Reconectada'],
+    ['synchronized','online','Sincronizada'],
+  ]){
+    ui.push({type:'central',data:{enabled:true,phase,status,outbox_size:3}});
+    assert.equal(ui.node('#central-status').textContent,`${label} · 3 pendentes`);
+  }
+});

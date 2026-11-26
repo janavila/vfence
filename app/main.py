@@ -6,6 +6,7 @@ import math
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Path as RoutePath, Query, WebSocket
 from fastapi.responses import FileResponse
@@ -13,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.database import Database
+from app.fpga_service import FpgaService
 from app.profile_api import router as profile_router
 from app.realtime import RealtimeHub
 from app.serial_reader import SerialReader
@@ -34,6 +36,7 @@ database = Database(settings.database_url)
 hub = RealtimeHub()
 reader = SerialReader(settings, database, hub)
 sync_service = CentralSyncService(settings, database, reader, hub)
+fpga_service = FpgaService(settings, database, reader)
 
 
 @asynccontextmanager
@@ -41,30 +44,56 @@ async def lifespan(_: FastAPI):
     database.initialize()
     hub.start()
     serial_state = "SIMULADA" if settings.mock_serial else "CONFIGURADA | AGUARDANDO ABERTURA"
-    logger.info(
-        "\n%s\n VFENCE | RASPBERRY PI | BASE LOCAL\n%s\n"
-        " Serial: %s | Baud: %d | Estado: %s\n"
-        " SQLite: INICIALIZADO | Central: SINCRONIZACAO %s\n"
-        " ACK de medias: %s | Terminal: %s\n%s",
-        RULE, RULE, base_value("mock" if settings.mock_serial else settings.serial_port),
-        settings.serial_baud, serial_state, "CONFIGURADA" if settings.central_sync_enabled else "DESATIVADA",
-        "HABILITADO" if settings.metrics_serial_ack_enabled and not settings.mock_serial else "DESATIVADO",
-        "DETALHADO" if settings.terminal_detail else "NORMAL", RULE,
-    )
+    if getattr(settings, "windows_base", False):
+        detected = await asyncio.to_thread(database.windows_detected_collars)
+        local = f"http://127.0.0.1:{settings.port}"
+        logger.info("%s", base_block(
+            "WINDOWS | BASE LOCAL",
+            f"Gateway: {settings.serial_port or 'COM em descoberta'} | AGUARDANDO GET_STATUS | Baud: {settings.serial_baud}",
+            "Detectadas anteriormente: " + (", ".join(f"COL{item:02d}" for item in detected) or "nenhuma"),
+            "Cadastradas/Autorizadas: " + (", ".join(settings.known_collar_ids) or "nenhuma")
+            + " | Participantes: definidos por operação",
+            "SQLite: OPERACIONAL",
+            f"Identidade Gateway: {'CONFIGURADA' if settings.metrics_gateway_id else 'PENDENTE'}",
+            f"Identidade instalação: {'CONFIGURADA' if settings.metrics_installation_id else 'PENDENTE'}",
+            f"ACK de métricas: {'HABILITADO APÓS COMMIT' if settings.metrics_serial_ack_enabled else 'DESATIVADO'}",
+            "Sincronização temporal e PDR comprovado: AGUARDANDO JANELA",
+            f"FPGA: {'AGUARDANDO PONG' if settings.fpga_enabled else 'DESATIVADA'}",
+            f"Central: {'AGUARDANDO SINCRONIZAÇÃO' if settings.central_sync_enabled else 'DESATIVADA'}",
+            f"Troca automática: {'HABILITADA' if settings.fpga_auto_profile_enabled else 'DESATIVADA'}",
+            f"Dashboard: {local}/ | Cercas: {local}/fences | FPGA: {local}/fpga",
+        ))
+    else:
+        logger.info(
+            "\n%s\n VFENCE | RASPBERRY PI | BASE LOCAL\n%s\n"
+            " Serial: %s | Baud: %d | Estado: %s\n"
+            " SQLite: INICIALIZADO | Central: SINCRONIZACAO %s\n"
+            " ACK de medias: %s | Terminal: %s\n%s",
+            RULE, RULE, base_value("mock" if settings.mock_serial else settings.serial_port),
+            settings.serial_baud, serial_state, "CONFIGURADA" if settings.central_sync_enabled else "DESATIVADA",
+            "HABILITADO" if settings.metrics_serial_ack_enabled and not settings.mock_serial else "DESATIVADO",
+            "DETALHADO" if settings.terminal_detail else "NORMAL", RULE,
+        )
     task = asyncio.create_task(reader.run(), name="vfence-serial-reader")
     sync_task = asyncio.create_task(sync_service.run(), name="vfence-central-sync")
+    fpga_service.stop.clear()
+    fpga_task = asyncio.create_task(fpga_service.run(), name="vfence-fpga")
     try:
         yield
     finally:
         logger.info("[BASE] ENCERRAMENTO | servico finalizando")
         await reader.stop()
         await sync_service.stop()
+        fpga_service.stop.set()
         task.cancel()
         sync_task.cancel()
         try:
             await hub.close()
         finally:
-            serial_result, central_result = await asyncio.gather(task, sync_task, return_exceptions=True)
+            serial_result, central_result, fpga_result = await asyncio.gather(
+                task, sync_task, fpga_task, return_exceptions=True)
+            if isinstance(fpga_result, Exception):
+                logger.error("[FPGA] Falha no encerramento: %s", type(fpga_result).__name__)
             if isinstance(serial_result, Exception):
                 logger.error("%s", base_block(
                     "ERRO | SERVICO EM SEGUNDO PLANO", f"Causa: {type(serial_result).__name__}", critical=True,
@@ -108,7 +137,10 @@ async def health():
 
 @app.get("/api/gateway")
 async def gateway():
-    return reader.as_dict()
+    state = reader.as_dict()
+    if getattr(settings, "windows_base", False):
+        state["fpga"] = fpga_service.snapshot()
+    return state
 
 
 @app.get("/api/gateway/profile")
@@ -128,8 +160,13 @@ async def gateway_profile():
 
 
 @app.get("/api/collars/{collar_id}/pdr")
-async def collar_pdr(collar_id: int = RoutePath(ge=1, le=254), limit: int = Query(60, ge=1, le=120)):
-    return await asyncio.to_thread(database.list_pdr, collar_id, limit)
+async def collar_pdr(collar_id: int = RoutePath(ge=1, le=254), limit: int = Query(60, ge=1, le=120),
+                     source: Literal["latest", "legacy"] = "latest"):
+    if source == "legacy":
+        rows = await asyncio.to_thread(database.list_pdr, collar_id, limit)
+        return [{**row, "source": "legacy", "tx_proven": False} for row in rows]
+    snapshot = await collar_link_metrics(collar_id, limit)
+    return (snapshot["windows"]["pdr"] + snapshot.get("legacy_windows", {}).get("pdr", []))[:limit]
 
 
 @app.get("/api/fpga/collars")
@@ -137,16 +174,28 @@ async def fpga_metric_collars():
     return await asyncio.to_thread(database.metric_collars)
 
 
+@app.get("/api/fpga/status")
+async def fpga_status():
+    status = fpga_service.snapshot()
+    if getattr(settings, "windows_base", False):
+        status["last_persisted_result"] = await asyncio.to_thread(database.latest_windows_fpga_result)
+    return status
+
+
 @app.get("/api/collars/{collar_id}/link-metrics")
 async def collar_link_metrics(collar_id: int = RoutePath(ge=1, le=254), limit: int = Query(1, ge=1, le=120)):
-    snapshot = await asyncio.to_thread(database.link_metrics, collar_id, limit)
+    clock = fpga_service.display_clock()
+    snapshot = await asyncio.to_thread(database.public_link_metrics, collar_id, limit,
+                                       gateway_id=settings.metrics_gateway_id or None,
+                                       gateway_session=clock.session if clock else None)
     now = datetime.now(timezone.utc)
 
-    def age_ms(stamp: str) -> int:
+    def timestamp(stamp: str) -> datetime:
         recorded = datetime.fromisoformat(stamp)
-        if recorded.tzinfo is None:
-            recorded = recorded.replace(tzinfo=timezone.utc)
-        return max(0, int((now - recorded).total_seconds() * 1000))
+        return recorded if recorded.tzinfo else recorded.replace(tzinfo=timezone.utc)
+
+    def age_ms(stamp: str) -> int:
+        return max(0, int((now - timestamp(stamp)).total_seconds() * 1000))
 
     instant = snapshot["instant"]
     if instant is not None:
@@ -159,21 +208,30 @@ async def collar_link_metrics(collar_id: int = RoutePath(ge=1, le=254), limit: i
                 valid = False
             instant[key] = value if valid else None
             instant[f"{key}_valid"] = valid
-    for kind, rows in snapshot["windows"].items():
-        for row in rows:
-            row["age_ms"] = age_ms(row["persisted_at"])
-            for field in ("hdop_mean_valid", "rssi_mean_valid", "snr_mean_valid"):
-                if row.get(field) is not None:
-                    row[field] = bool(row[field])
-            if kind != "pdr":
-                row["invalid_reason"] = "no_samples" if row["sample_count"] == 0 else None
+    for windows in (snapshot["windows"], snapshot.get("legacy_windows", {})):
+        for kind, rows in windows.items():
+            for row in rows:
+                row["persisted_at"] = timestamp(row["persisted_at"]).isoformat()
+                row["age_ms"] = age_ms(row["persisted_at"])
+                proven = bool(row.get("tx_proven") or row.get("timing_proven"))
+                row["source"] = "proven" if proven else "legacy"
+                if proven:
+                    row["freshness"], row["window_age_ms"] = fpga_service.display_freshness(row, clock)
+                for field in ("hdop_mean_valid", "rssi_mean_valid", "snr_mean_valid"):
+                    if row.get(field) is not None:
+                        row[field] = bool(row[field])
+                if kind == "pdr":
+                    row["tx_proven"] = proven
+                else:
+                    row["invalid_reason"] = "no_samples" if row["sample_count"] == 0 else None
     profile = reader.effective_profile if reader.state.status == "online" else None
     if profile:
         profile = {**profile, "age_ms": age_ms(profile["observed_at"])}
     return {
         "schema": "vfence.base.link_metrics.v1", "collar_id": collar_id, "as_of": now.isoformat(),
         "gateway": {"status": reader.state.status, "effective_profile": profile},
-        "pdr_basis": "observed_ordinal_interval", **snapshot,
+        "pdr_basis": ("physical_attempts" if snapshot["windows"]["pdr"]
+                      and snapshot["windows"]["pdr"][0]["tx_proven"] else "observed_ordinal_interval"), **snapshot,
     }
 
 

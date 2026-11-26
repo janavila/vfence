@@ -32,7 +32,7 @@
 
 import {
   criarCerca, explicarErro, lerCercaAtiva, lerConfiguracao, lerEntregas,
-  validarNoServidor, enderecoDoLog,
+  validarNoServidor, enderecoDoLog, lerCerca, lerRascunho, salvarRascunho, produtor, consultar,
 } from './api.js';
 import {
   MAX_POINTS, MIN_POINTS, faixaParaDentro, numero, validarCerca,
@@ -47,6 +47,10 @@ import { escapeHtml, formatClock } from './ui.js';
    Curto o bastante para parecer imediato, longo o bastante para não
    disparar uma requisição por clique durante o desenho. */
 const ESPERA_ANTES_DE_CONFIRMAR_MS = 500;
+const editorOperacional = produtor || document.body.classList.contains('management-area');
+document.body.classList.toggle('producer-area', editorOperacional);
+const query = new URLSearchParams(location.search);
+const producerTools = editorOperacional ? import('./producer-herd.js') : null;
 
 /* ---- Estado da tela ---- */
 
@@ -61,6 +65,12 @@ const estado = {
   enviando: false,
   versaoEnviada: null,
   temporizador: null,
+  revision: 0,
+  draftId: null,
+  sourceVersion: null,
+  fetchingDeliveries: false,
+  savedDrawing: null,
+  tileAvailable: true,
 };
 
 /* Camadas do Leaflet que recriamos a cada mudança. */
@@ -89,6 +99,7 @@ function acrescentarPonto(lat, lon) {
 }
 
 function desfazerUltimo() {
+  if (editorOperacional && estado.versaoEnviada) return;
   estado.pontos.pop();
   mudou();
 }
@@ -261,6 +272,7 @@ function lerMargem(id) {
 
 /** Recalcula tudo no navegador e agenda a confirmação no servidor. */
 function mudou() {
+  estado.revision += 1;
   estado.resultadoLocal = estado.pontos.length
     ? validarCerca(estado.pontos, lerMargem('margin-attention'), lerMargem('margin-critical'), estado.config)
     : null;
@@ -277,13 +289,14 @@ function mudou() {
 
 /** Confirma a validação no servidor, que é quem decide. */
 async function confirmarNoServidor() {
-  const marcaDaChamada = estado.pontos.length;
+  const marcaDaChamada = estado.revision;
   try {
     const resposta = await validarNoServidor(montarCorpo());
-    if (estado.pontos.length !== marcaDaChamada) return;  // o produtor já mexeu
+    if (estado.revision !== marcaDaChamada) return;
     estado.resultadoServidor = resposta;
     renderizar();
   } catch (erro) {
+    if (estado.revision !== marcaDaChamada) return;
     // Sem rede, continuamos com a validação do navegador: o produtor
     // segue desenhando e o envio é que vai precisar de conexão.
     const campo = elemento('server-check');
@@ -308,6 +321,11 @@ function montarCorpo() {
 function renderizar() {
   const resultado = estado.resultadoServidor ?? estado.resultadoLocal;
   const quantidade = estado.pontos.length;
+  if (editorOperacional) {
+    const margem = lerMargem('margin-attention');
+    elemento('attention-explain').textContent = Number.isFinite(margem) && margem > 0
+      ? `A coleira começa a avisar o animal a ${numero(margem)} m da cerca.` : 'Informe a distância de aviso.';
+  }
   // Com menos de 3 pontos, a falta de pontos (VAL-01) não conta como erro:
   // o produtor ainda está desenhando, e vermelho ali só assustaria.
   const erros = (resultado?.violations ?? []).filter((v) => v.severity === 'error'
@@ -425,7 +443,7 @@ function orientar(quantidade, erros, avisos, temNome) {
  * O produtor precisa saber o tamanho do que faz ANTES de clicar.
  */
 function montarAvisoDeImpacto() {
-  const coleiras = estado.config?.known_collars?.length ?? 0;
+  const coleiras = estado.config?.known_collar_count ?? estado.config?.known_collars?.length ?? 0;
   const plural = coleiras === 1 ? 'coleira' : 'coleiras';
   if (!estado.cercaAtiva) {
     return coleiras
@@ -439,15 +457,24 @@ function montarAvisoDeImpacto() {
 
 async function enviar() {
   if (estado.enviando) return;
+  if (editorOperacional && !window.confirm('Publicar uma nova versão e iniciar a distribuição para as coleiras?')) return;
   estado.enviando = true;
   renderizar();
   anunciar('Salvando a cerca…');
 
   try {
-    const cerca = await criarCerca(montarCorpo());
+    const body = montarCorpo();
+    const fingerprint = JSON.stringify(body);
+    const previous = JSON.parse(sessionStorage.getItem('vfence.publish') || 'null');
+    const key = previous?.fingerprint === fingerprint ? previous.key : crypto.randomUUID();
+    sessionStorage.setItem('vfence.publish', JSON.stringify({ fingerprint, key }));
+    const cerca = await criarCerca(body, key);
+    sessionStorage.removeItem('vfence.publish');
     estado.versaoEnviada = cerca.version;
-    anunciar(`Cerca nº ${cerca.version} salva. Aguardando a Base.`);
+    history.replaceState(null, '', location.pathname + '?version=' + cerca.version);
+    anunciar(`Cerca nº ${cerca.version} publicada. Aguardando a Base.`);
     mostrarAcompanhamento(cerca);
+    if (editorOperacional) window.dispatchEvent(new Event('producer:fences-changed'));
     await atualizarEntregas();
   } catch (erro) {
     anunciar(explicarErro(erro), 'error');
@@ -470,20 +497,29 @@ async function enviar() {
 function mostrarAcompanhamento(cerca) {
   elemento('sent-panel').hidden = false;
   elemento('sent-version').textContent = `nº ${cerca.version}`;
-  elemento('sent-crc').textContent = cerca.crc32;
+  elemento('sent-crc').textContent = cerca.crc32 ?? '—';
   elemento('sent-created').textContent = formatClock(cerca.created_at, { withDate: true });
   elemento('log-link').href = enderecoDoLog(cerca.version);
   elemento('editor-steps').classList.add('sent');
+  if (editorOperacional) {
+    for (const control of elemento('editor-steps').querySelectorAll('input, button')) control.disabled = true;
+    elemento('map-center-point').disabled = true;
+  }
   // Os marcadores deixam de ser arrastáveis: a cerca já foi enviada.
   redesenhar();
 }
 
 async function atualizarEntregas() {
-  if (!estado.versaoEnviada) return;
+  if (!estado.versaoEnviada || estado.fetchingDeliveries) return;
+  estado.fetchingDeliveries = true;
   try {
-    desenharEntregas(await lerEntregas(estado.versaoEnviada));
+    const entregas = await lerEntregas(estado.versaoEnviada);
+    desenharEntregas(entregas);
+    if (editorOperacional) (await producerTools).renderDeliverySummary(elemento('producer-delivery-summary'), entregas);
   } catch {
-    /* O WebSocket ou a próxima tentativa resolvem. */
+    if (editorOperacional) elemento('producer-delivery-summary').textContent = 'Acompanhamento temporariamente indisponível.';
+  } finally {
+    estado.fetchingDeliveries = false;
   }
 }
 
@@ -510,10 +546,12 @@ function desenharEntregas(entregas) {
         : entrega.detail ? ` (${escapeHtml(entrega.detail)})` : '';
     return `
       <tr>
-        <td class="mono">${escapeHtml(entrega.collar_id)}</td>
+        <td class="mono">${escapeHtml(entrega.name ?? entrega.collar_id)}</td>
         <td><span class="delivery-track">${trilha}</span></td>
         <td class="${falhou ? 'text-bad' : entrega.status === 'confirmed' ? 'text-ok' : ''}">
-          ${escapeHtml(entrega.status_label)}${detalhe}
+          ${escapeHtml(entrega.status === 'confirmed'
+            ? `Versão ${entrega.confirmed_version ?? estado.versaoEnviada} informada · origem não verificada`
+            : entrega.status_label)}${detalhe}
         </td>
       </tr>`;
   }).join('');
@@ -536,6 +574,12 @@ function ligarControles() {
   elemento('clear-points').addEventListener('click', limparTudo);
   elemento('invert-order').addEventListener('click', inverterOrdem);
   elemento('send-fence').addEventListener('click', enviar);
+  elemento('map-center-point').addEventListener('click', () => {
+    if (!estado.mapa || estado.versaoEnviada) return;
+    const { lat, lng } = estado.mapa.getCenter();
+    acrescentarPonto(lat, lng);
+  });
+  elemento('save-draft').addEventListener('click', guardarRascunho);
 
   elemento('points-body').addEventListener('click', (evento) => {
     const botao = evento.target.closest('[data-remove]');
@@ -545,7 +589,10 @@ function ligarControles() {
   ['margin-attention', 'margin-critical'].forEach((id) => {
     elemento(id).addEventListener('input', mudou);
   });
-  elemento('fence-name').addEventListener('input', renderizar);
+  elemento('fence-name').addEventListener('input', () => {
+    estado.revision += 1;
+    renderizar();
+  });
 
   elemento('accept-warnings').addEventListener('change', (evento) => {
     estado.avisosAceitos = evento.target.checked;
@@ -560,6 +607,94 @@ function ligarControles() {
       desfazerUltimo();
     }
   });
+}
+
+async function guardarRascunho() {
+  const button = elemento('save-draft');
+  button.disabled = true;
+  try {
+    estado.draftId ||= crypto.randomUUID();
+    const { accept_warnings, ...body } = montarCorpo();
+    body.name = elemento('fence-name').value.trim();
+    const savedDrawing = drawingSignature();
+    await salvarRascunho(estado.draftId, { ...body, source_version: estado.sourceVersion });
+    estado.savedDrawing = savedDrawing;
+    history.replaceState(null, '', location.pathname + '?draft=' + estado.draftId);
+    anunciar('Rascunho salvo. Nenhuma cerca foi enviada.');
+    if (editorOperacional) window.dispatchEvent(new Event('producer:fences-changed'));
+  } catch (error) {
+    anunciar(explicarErro(error), 'error');
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function drawingSignature() {
+  return JSON.stringify([estado.pontos, elemento('fence-name').value,
+    elemento('margin-attention').value, elemento('margin-critical').value]);
+}
+
+function hasUnsavedDrawing() {
+  return estado.savedDrawing !== null && !estado.versaoEnviada && estado.savedDrawing !== drawingSignature();
+}
+
+function showProducerEditorState() {
+  elemento('producer-editor-state').textContent = [
+    !estado.config.base_online && 'Base sem comunicação.',
+    !estado.tileAvailable && 'Camada cartográfica temporariamente indisponível.',
+  ].filter(Boolean).join(' ');
+}
+
+let refreshingProducerStatus = false;
+async function reconcileEditor() {
+  atualizarEntregas();
+  if (!editorOperacional || refreshingProducerStatus) return;
+  refreshingProducerStatus = true;
+  try {
+    const config = produtor ? await lerConfiguracao() : await consultar('/api/producer/settings');
+    estado.config.base_online = config.base_online;
+    estado.config.known_collar_count = config.known_collar_count;
+    showProducerEditorState();
+  } catch {
+    elemento('producer-editor-state').textContent = 'Aguardando conexão com a Central.';
+  } finally {
+    refreshingProducerStatus = false;
+  }
+}
+
+function loadDrawing(data) {
+  estado.pontos = data.points.map(({ lat, lon }) => ({ lat, lon }));
+  elemento('fence-name').value = data.name;
+  elemento('margin-attention').value = data.margin_attention_m;
+  elemento('margin-critical').value = data.margin_critical_m;
+}
+
+async function abrirTrabalho() {
+  if (query.get('version')) {
+    const cerca = await lerCerca(query.get('version'));
+    estado.versaoEnviada = cerca.version;
+    if (editorOperacional) {
+      loadDrawing(cerca);
+      estado.resultadoLocal = validarCerca(estado.pontos, lerMargem('margin-attention'), lerMargem('margin-critical'), estado.config);
+    } else {
+      estado.cercaAtiva = cerca;
+      desenharCercaAtiva();
+    }
+    enquadrar(estado.mapa, cerca.points, 17);
+    mostrarAcompanhamento(cerca);
+    elemento('save-draft').disabled = true;
+    elemento('map-center-point').disabled = true;
+    await atualizarEntregas();
+    return;
+  }
+  const id = query.get('draft');
+  if (!id && !query.get('edit')) return;
+  const data = id ? await lerRascunho(id) : await lerCerca(query.get('edit'));
+  estado.draftId = id;
+  estado.sourceVersion = id ? data.source_version : data.version;
+  loadDrawing(data);
+  enquadrar(estado.mapa, estado.pontos, 17);
+  mudou();
 }
 
 /* ---- Início ---- */
@@ -577,11 +712,15 @@ async function iniciar() {
   elemento('margin-critical').value = estado.config.margin_critical_default_m;
   elemento('attention-explain').textContent =
     `A coleira começa a avisar o animal a ${numero(estado.config.margin_attention_default_m)} m da cerca.`;
-  elemento('base-label').textContent = estado.config.base_id;
+  elemento('base-label').textContent = estado.config.base_id ?? '';
   elemento('max-radius').textContent = numero(estado.config.base_max_radius_km);
 
-  estado.mapa = criarMapa('editor-map', estado.config, 17);
+  estado.mapa = criarMapa('editor-map', estado.config, 17, editorOperacional ? available => {
+    estado.tileAvailable = available;
+    showProducerEditorState();
+  } : undefined);
   if (estado.mapa) {
+    if (editorOperacional) elemento('editor-map').querySelector('.map-fallback')?.remove();
     marcarBase(estado.mapa, estado.config);
     desenharAlcanceDoRadio(estado.mapa, estado.config);
     estado.mapa.on('click', (evento) => {
@@ -606,13 +745,33 @@ async function iniciar() {
   // Depois da cerca ativa, de propósito: quando a posição do produtor
   // chega, ela vence o enquadramento — desde que ele não tenha começado
   // a marcar pontos.
-  mostrarLocalizacao(estado.mapa, () => estado.pontos.length === 0);
+  if (!query.size) mostrarLocalizacao(estado.mapa, () => estado.pontos.length === 0);
 
   ligarControles();
+  try {
+    await abrirTrabalho();
+  } catch (error) {
+    anunciar(explicarErro(error), 'error');
+  }
   renderizar();
+  if (editorOperacional) {
+    estado.savedDrawing = drawingSignature();
+    showProducerEditorState();
+    window.addEventListener('beforeunload', event => {
+      if (!hasUnsavedDrawing()) return;
+      event.preventDefault();
+      event.returnValue = '';
+    });
+    window.addEventListener('producer:leave-editor', event => {
+      if (hasUnsavedDrawing() && !window.confirm('Descartar as alterações não salvas do desenho atual?')) event.preventDefault();
+    });
+    window.addEventListener('producer:published', () => { estado.savedDrawing = drawingSignature(); });
+  }
 
   // Tempo real: a linha do tempo da entrega se move sozinha.
   conectarTempoReal({
+    path: produtor ? '/ws/producer' : '/ws',
+    onInvalidate: editorOperacional ? reconcileEditor : atualizarEntregas,
     onDelivery(dados) {
       if (dados.fence_version === estado.versaoEnviada) atualizarEntregas();
     },
@@ -620,7 +779,7 @@ async function iniciar() {
       elemento('base-state').textContent = dados.online ? 'conectada' : 'sem contato';
     },
     // Plano B quando o WebSocket não está disponível (seção 6.2).
-    onPollingTick: atualizarEntregas,
+    onPollingTick: editorOperacional ? reconcileEditor : atualizarEntregas,
   });
 }
 

@@ -80,6 +80,24 @@ body {
 
 .mono { font-family: var(--mono); }
 
+.workspace, .workspace > *, .panel, .table-scroll { min-width: 0; }
+.table-scroll { position: relative; max-width: 100%; }
+.herd-counts, .herd-columns, .workspace > .panel + .panel { margin-block: var(--gap); }
+.herd-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--gap); }
+.herd-number { color: var(--primary); font-size: 24px; }
+.herd-list { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.herd-list li { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.herd-list button { white-space: normal; text-align: start; }
+#herd-animal-detail:not(:empty) { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 12px; }
+.herd-pin { border: 2px solid white; border-radius: 50%; background: var(--neutral); box-shadow: 0 0 0 1px var(--text); }
+.pin-inside { background: var(--success); }
+.pin-near { background: var(--warning); }
+.pin-outside { background: var(--danger); }
+.producer-area:not(.management-area) .management-only { display: none !important; }
+@media (max-width: 767px) {
+  .herd-columns { grid-template-columns: minmax(0, 1fr); }
+}
+
 /* `hidden` precisa vencer o `display` das classes (`.notice` é flex). */
 [hidden] { display: none !important; }
 
@@ -688,3 +706,51 @@ tr.is-active td { background: var(--primary-soft); }
   flex: 0 0 auto;
 }
 .logout-button:hover { color: var(--text); border-color: var(--border-strong); }
+
+.entry-body {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px 16px;
+}
+.entry-card {
+  width: min(440px, 100%);
+  padding: 28px;
+  background: var(--surface);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+.entry-card > img { display: block; width: 72px; margin-inline: auto; }
+.entry-card > h1, .entry-card > p { margin: 8px 0 0; text-align: center; }
+.entry-card > p { color: var(--muted); }
+.entry-choices { display: grid; gap: 10px; margin-top: 22px; }
+.entry-choices .button {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 10px 14px;
+  white-space: normal;
+}
+.entry-choices small { font-weight: 400; color: var(--muted); }
+.area-header { top: 0; }
+.area-header .header-inner { gap: 10px 16px; }
+.area-brand, .area-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px;
+  color: var(--primary);
+  font-weight: 600;
+  text-decoration: none;
+}
+.area-brand img { width: 30px; height: 30px; object-fit: contain; }
+.area-back { justify-self: start; }
+.area-back:hover { text-decoration: underline; }
+.area-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.area-actions [hidden] { display: none; }
+@media (max-width: 767px) {
+  .area-header .header-inner { gap: 4px 12px; }
+  .area-header .primary-nav { order: 1; width: 100%; justify-content: flex-start; }
+  .area-header .primary-nav:empty { display: none; }
+  .area-header .logout-button { margin-left: auto; }
+}

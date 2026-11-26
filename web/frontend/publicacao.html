@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Publicação para visitantes — VFence</title>
+  <link rel="icon" href="/static/VFence.png" type="image/png">
+  
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+<!-- area-header -->
+<main class="workspace">
+  <div class="page-heading"><h1>Publicação para visitantes</h1><p class="lead">Autorize os dados que podem ser mostrados sem login. Vértices de cercas selecionadas serão públicos.</p></div>
+  <form id="public-policy" class="panel"><div class="panel-body stack">
+    <fieldset><legend>Animais autorizados</legend><div id="publication-animals" class="stack"></div></fieldset>
+    <fieldset><legend>Cercas autorizadas</legend><div id="publication-fences" class="stack-sm"></div></fieldset>
+    <button class="button primary" type="submit" disabled>Salvar autorização</button>
+    <p id="publication-feedback" role="status">Consultando a configuração…</p>
+  </div></form>
+</main>
+
+<script type="module" src="/js/publication.js"></script>
+</body>
+</html>

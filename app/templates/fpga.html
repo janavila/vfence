@@ -7,7 +7,7 @@
   <title>FPGA · VFence Monitor</title>
   <link rel="stylesheet" href="/static/css/style.css?v=8">
   <link rel="stylesheet" href="/static/css/fpga.css?v=2">
-  <script src="/static/js/fpga.js?v=2" defer></script>
+  <script src="/static/js/fpga.js?v=3" defer></script>
 </head>
 <body class="fpga-page">
   <header class="app-header">
@@ -78,24 +78,24 @@
       <section class="fpga-panel" aria-labelledby="fpga-link-title">
         <h3 id="fpga-link-title">Comunicação FPGA</h3>
         <dl>
-          <div><dt>Integração</dt><dd>Sem monitoramento operacional</dd></div>
-          <div><dt>Último pacote enviado</dt><dd>Nenhum envio real registrado</dd></div>
-          <div><dt>Última resposta recebida</dt><dd>Nenhuma resposta real registrada</dd></div>
-          <div><dt>Erros e timeouts</dt><dd>Sem dados de monitoramento</dd></div>
+          <div><dt>Integração</dt><dd id="fpga-live-link">Sem monitoramento operacional</dd></div>
+          <div><dt>Último pacote enviado</dt><dd id="fpga-live-tx">Nenhum envio real registrado</dd></div>
+          <div><dt>Última resposta recebida</dt><dd id="fpga-live-rx">Nenhuma resposta real registrada</dd></div>
+          <div><dt>Erros e timeouts</dt><dd id="fpga-live-error">Sem dados de monitoramento</dd></div>
         </dl>
         <h4 class="fpga-history-title">Histórico de comunicação</h4>
-        <p class="fpga-empty">Nenhum registro operacional.</p>
+        <p class="fpga-empty" id="fpga-live-history">Nenhum registro operacional.</p>
       </section>
       <section class="fpga-panel" aria-labelledby="fpga-result-title">
         <h3 id="fpga-result-title">Resultado da votação</h3>
         <dl>
-          <div><dt>Perfil recomendado</dt><dd>Indisponível</dd></div>
-          <div><dt>Motivo da recomendação</dt><dd>Indisponível</dd></div>
-          <div><dt>Alerta crítico</dt><dd>Indisponível</dd></div>
+          <div><dt>Perfil recomendado</dt><dd id="fpga-live-profile">Indisponível</dd></div>
+          <div><dt>Motivo da recomendação</dt><dd id="fpga-live-reason">Indisponível</dd></div>
+          <div><dt>Alerta crítico</dt><dd id="fpga-live-critical">Indisponível</dd></div>
           <div><dt>Votos P0, P1, P2 e P3</dt><dd>Indisponíveis</dd></div>
-          <div><dt>Horário da resposta</dt><dd>Indisponível</dd></div>
-          <div><dt>Validação do resultado</dt><dd>Aguardando integração</dd></div>
-          <div><dt>Perfil aplicado pela votação</dt><dd>Indisponível</dd></div>
+          <div><dt>Horário da resposta</dt><dd id="fpga-live-at">Indisponível</dd></div>
+          <div><dt>Validação do resultado</dt><dd id="fpga-live-ack">Aguardando integração</dd></div>
+          <div><dt>Aplicação do perfil</dt><dd id="fpga-live-applied">Indisponível</dd></div>
         </dl>
       </section>
     </div>

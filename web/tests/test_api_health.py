@@ -55,45 +55,41 @@ def test_health_devolve_a_hora_em_utc_terminando_em_z(client):
 # ---------------------------------------------------------------------------
 
 
-def test_raiz_leva_ao_editor_com_cabecalho_e_logotipo(client):
-    """`/` leva o produtor direto ao editor de cerca, com o cabeçalho e o
-    logotipo."""
-    response = client.get("/")
+def test_raiz_publica_oferece_as_tres_areas_com_logotipo(client_anonimo):
+    response = client_anonimo.get("/")
 
     assert response.status_code == 200
-    assert response.url.path == "/editor"
+    assert response.url.path == "/"
     assert response.headers["content-type"].startswith("text/html")
     page = response.text
     assert "VFence" in page
     assert '<img src="/static/VFence.png" alt="VFence">' in page
     assert 'href="/css/style.css"' in page
-    assert 'src="/js/ui.js"' in page
+    for area in ("/visitante", "/produtor", "/gestao"):
+        assert f'href="{area}"' in page
 
 
 # As telas de cada modo do cabeçalho, na ordem em que aparecem no menu.
 MODOS = {
-    "produtor": ["/editor", "/rebanho"],
-    "gestao": ["/painel", "/historico", "/eventos"],
+    "/editor": "/gestao/historico",
+    "/rebanho": "/gestao/cercas",
+    "/painel": "/gestao/visitante",
+    "/historico": "/gestao/eventos",
+    "/eventos": "/gestao/historico",
 }
 
 
 @pytest.mark.parametrize(
-    ("pagina", "modo"), [(p, m) for m, paginas in MODOS.items() for p in paginas]
+    ("pagina", "destino"), list(MODOS.items())
 )
-def test_cada_tela_marca_o_seu_modo_e_mostra_so_os_links_dele(client, pagina, modo):
-    """O cabeçalho é repetido em cada HTML (não há templates). Este teste
-    pega a página que ficou com o modo errado marcado, ou com um link do
-    outro modo no menu."""
+def test_paginas_existentes_preservam_navegacao(client, pagina, destino):
     page = client.get(pagina).text
     menu = page.split('class="primary-nav"')[1].split("</nav>")[0]
 
-    links = [p for p in MODOS["produtor"] + MODOS["gestao"] if f'href="{p}"' in menu]
-    assert links == MODOS[modo]
-    assert f'href="{pagina}" aria-current="page"' in menu
-
-    entrada_do_modo = "/editor" if modo == "produtor" else "/painel"
-    assert f'<a href="{entrada_do_modo}" aria-current="true"' in page
-    assert page.count('aria-current="true"') == 1
+    assert f'href="{destino}"' in menu
+    assert 'aria-current="page"' in menu
+    assert 'href="/produtor' not in menu
+    assert 'data-back' in page
 
 
 def test_logotipo_e_favicon_sao_servidos(client):

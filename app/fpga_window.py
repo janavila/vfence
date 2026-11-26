@@ -13,6 +13,7 @@ from app.pdr_protocol import PdrSummary
 
 MINUTE_MS = 60_000
 WINDOW_MINUTES = 5
+MAX_GROUP_SIZE = 16
 _CLOCK_MASK = 0xFFFFFFFF
 _RESULT_STATUS = ("maintain", "recommended", "recommended", "critical_alert", "insufficient_data", "tie")
 
@@ -53,7 +54,7 @@ class FpgaWindow:
     def __post_init__(self) -> None:
         self.collar_sessions = self.collar_sessions.copy()
         if not (0 <= self.current_profile <= 3 and 0 <= self.started_at_ms <= _CLOCK_MASK
-                and 1 <= len(self.collar_sessions) <= 2
+                and 1 <= len(self.collar_sessions) <= MAX_GROUP_SIZE
                 and all(1 <= collar <= 254 and session for collar, session in self.collar_sessions.items())):
             raise ValueError("invalid FPGA evaluation window")
 
@@ -120,8 +121,11 @@ class FpgaWindow:
 
     def close_if_due(self, now: float) -> tuple[FpgaSample, ...] | None:
         if self._closed is None and now >= self.deadline:
-            self._closed = tuple(self._samples[key] for key in sorted(self._samples))
+            self._closed = self.ready_samples()
         return self._closed
+
+    def ready_samples(self) -> tuple[FpgaSample, ...]:
+        return tuple(self._samples[key] for key in sorted(self._samples))
 
     async def close_at_deadline(self) -> tuple[FpgaSample, ...]:
         while (result := self.close_if_due(time.monotonic())) is None:

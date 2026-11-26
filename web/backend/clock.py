@@ -57,3 +57,17 @@ def to_iso(moment: datetime) -> str:
 def utc_now_iso() -> str:
     """Atalho para o caso mais comum: a hora de agora, pronta para gravar."""
     return to_iso(utc_now())
+
+
+def read_instant(value: str | None) -> datetime | None:
+    if not value or "T" not in value:
+        return None
+    try:
+        moment = datetime.fromisoformat(value)
+        return moment.astimezone(timezone.utc) if moment.tzinfo else None
+    except (ValueError, OverflowError):
+        return None
+
+
+def event_stamp(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")

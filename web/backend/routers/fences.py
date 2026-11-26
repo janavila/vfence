@@ -137,15 +137,26 @@ async def create_fence_route(data: FenceIn, request: Request) -> dict:
         )
         raise WarningsNotAccepted(result.as_dict()["violations"])
 
-    return await asyncio.to_thread(
-        fence_service.create_fence,
-        db, settings,
-        name=data.name,
-        margin_attention_m=data.margin_attention_m,
-        margin_critical_m=data.margin_critical_m,
-        points=points,
-        result=result,
-    )
+    try:
+        return await asyncio.to_thread(
+            fence_service.create_fence,
+            db, settings,
+            name=data.name,
+            margin_attention_m=data.margin_attention_m,
+            margin_critical_m=data.margin_critical_m,
+            points=points,
+            result=result,
+            publication_key=publication_key(request),
+        )
+    except fence_service.PublicationConflict:
+        raise HTTPException(409, "publication_key_conflict") from None
+
+
+def publication_key(request: Request) -> str | None:
+    value = request.headers.get("Idempotency-Key")
+    if value is not None and (len(value) != 36 or any(c not in "0123456789abcdef-" for c in value)):
+        raise HTTPException(422, "invalid_publication_key")
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +210,9 @@ async def reactivate_route(version: int, request: Request) -> dict:
     """
     db, settings = _context(request)
     try:
-        return await asyncio.to_thread(fence_service.reactivate, db, settings, version)
+        return await asyncio.to_thread(fence_service.reactivate, db, settings, version, publication_key(request))
+    except fence_service.PublicationConflict:
+        raise HTTPException(409, "publication_key_conflict") from None
     except fence_service.FenceNotFound:
         raise HTTPException(status_code=404, detail="fence_not_found") from None
     except fence_service.FenceRefused as refused:

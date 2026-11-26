@@ -1,0 +1,31 @@
+.management-area .visitor-header-inner { flex-wrap: wrap; }
+.management-area .producer-nav { flex-wrap: wrap; }
+.management-area .producer-nav a { white-space: nowrap; }
+.management-area .management-filters { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; }
+.management-area .management-filters label { display: grid; gap: 4px; min-width: 0; }
+.management-area .management-filters .checkbox-row { display: flex; align-items: center; min-height: 44px; }
+.management-area :is(select, input:not([type=checkbox])) { max-width: 100%; min-width: 0; }
+.management-area .management-filters .button { width: auto; }
+.management-area .management-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin: 16px 0; }
+.management-area .management-facts > div { min-width: 0; padding: 10px; background: var(--visitor-bg); border-radius: 8px; overflow-wrap: anywhere; }
+.management-area .management-facts dt { color: var(--visitor-muted); font-size: 13px; }
+.management-area .management-facts dd { margin: 4px 0 0; font-weight: 600; }
+.management-area .management-history-counts { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.management-area .management-history-counts dd { font-size: clamp(18px, 2vw, 25px); }
+.management-area .movement-controls { margin: 10px 0; }
+.management-area .movement-key { display: inline-block; width: 18px; border-top: 3px solid #245fc3; }
+.management-area #public-policy fieldset { min-width: 0; border: 1px solid var(--visitor-border); border-radius: 8px; }
+.management-area #publication-animals { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 245px), 1fr)); }
+.management-area #publication-animals label:has(input:not([type=checkbox])) { display: flex; flex-direction: column-reverse; gap: 4px; }
+.management-area .management-event { border-top: 1px solid var(--visitor-border); padding: 12px 0; overflow-wrap: anywhere; }
+.management-area .management-event summary { cursor: pointer; }
+.management-area .management-event p { margin: 6px 0; }
+.management-area .movement-register-highlight td { background: #e6eefc; }
+.movement-pin { display: grid; place-items: center; border: 2px solid white; border-radius: 50%; background: #1e4e9f; color: white; font-weight: 700; }
+.movement-pin.end { background: #542b83; }
+@media (max-width: 650px) {
+  .management-area .producer-nav a { flex: 1 1 26%; white-space: normal; text-align: center; }
+  .management-area .management-history-counts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .management-area .management-history-counts .visitor-counter { display: flex; flex-direction: column; align-items: start; }
+  .management-area .management-filters label { flex: 1 1 125px; }
+}

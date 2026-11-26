@@ -73,7 +73,7 @@ class CentralClient:
     def __init__(self, base_url: str, token: str, timeout_seconds: float,
                  transport: httpx.AsyncBaseTransport | None = None):
         self.base_url = base_url.rstrip("/")
-        self.token = token
+        self.token = token.strip()
         self.timeout_seconds = timeout_seconds
         self.transport = transport
 
@@ -89,15 +89,17 @@ class CentralClient:
                 transport=self.transport,
             ) as client:
                 response = await client.request(method, path, headers=self.headers, **kwargs)
-        except (httpx.TimeoutException, httpx.NetworkError) as exc:
-            raise CentralClientError(str(exc)) from exc
+        except httpx.InvalidURL as exc:
+            raise CentralClientError("endereço da Central inválido", invalid_response=True) from exc
+        except httpx.RequestError as exc:
+            raise CentralClientError("falha de transporte na Central") from exc
         if response.status_code in {401, 403}:
-            raise CentralAuthenticationError(response.text, status_code=response.status_code)
+            raise CentralAuthenticationError(f"HTTP {response.status_code}", status_code=response.status_code)
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             raise CentralClientError(
-                f"Central respondeu HTTP {response.status_code}: {response.text[:200]}",
+                f"Central respondeu HTTP {response.status_code}",
                 status_code=response.status_code,
             ) from exc
         return response
@@ -110,15 +112,24 @@ class CentralClient:
             "serial": serial_status,
             "queue_size": queue_size,
         })
-        data = response.json()
-        if "desired_fence_version" not in data or "server_time" not in data:
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise CentralClientError("resposta de heartbeat inválida", invalid_response=True) from exc
+        if (not isinstance(data, dict) or "desired_fence_version" not in data
+                or not isinstance(data.get("server_time"), str)
+                or (data["desired_fence_version"] is not None
+                    and (type(data["desired_fence_version"]) is not int or data["desired_fence_version"] <= 0))):
             raise CentralClientError("resposta de heartbeat inválida", invalid_response=True)
         return data
 
     async def download_fence(self, version: int) -> dict:
         response = await self._request("GET", f"/api/edge/fences/{version}")
         try:
-            return validate_central_fence(response.json())
+            fence = validate_central_fence(response.json())
+            if fence["version"] != version:
+                raise InvalidFenceError("versão da cerca divergente da solicitada")
+            return fence
         except (ValueError, TypeError) as exc:
             raise InvalidFenceError("JSON de cerca inválido") from exc
 
