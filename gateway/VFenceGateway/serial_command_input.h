@@ -97,7 +97,7 @@ class GatewayCommandJson {
   }
 
  private:
-  static constexpr size_t FIELD_COUNT = 19;
+  static constexpr size_t FIELD_COUNT = 21;
   static constexpr unsigned MAX_DEPTH = 8;
   const char* fields[FIELD_COUNT]{};
   const bool valid;
@@ -107,7 +107,7 @@ class GatewayCommandJson {
       "schema", "requestId", "command", "collarId", "token", "veryNearM", "nearM",
       "telemetryIntervalS", "gpsTimeoutS", "lowBatteryPct", "criticalBatteryPct",
       "fenceVersion", "vertexCount", "index", "latitude", "longitude",
-      "gatewaySessionId", "operationId", "profileId"
+      "gatewaySessionId", "operationId", "profileId", "collarSessionId", "windowId"
     };
     return names;
   }

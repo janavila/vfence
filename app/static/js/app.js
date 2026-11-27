@@ -125,11 +125,16 @@ function renderCollars(){
     const open=selectedCollar===id;
     const label=!current?'Histórico':lost||sample?.zone==='GNSS_INVALIDO'?'GNSS INVÁLIDO':
       !hasFix?'GNSS desconhecido':sample.fence_version===0?'Sem cerca reportada':zoneLabels[zone]||'Zona desconhecida';
+    const fix=collar.last_fix;
+    const currentPosition=current&&hasFix;
+    const lastPosition=!currentPosition&&Number.isFinite(fix?.lat)&&Number.isFinite(fix?.lon);
+    const coordinates=currentPosition?sample:lastPosition?fix:null;
     return `<tr>
       <td class="unit-id"><button type="button" class="unit-toggle" data-unit="${esc(id)}" aria-expanded="${open}">${esc(id)} <span aria-hidden="true">${open?'−':'+'}</span></button></td>
       <td><span class="zone-badge" style="--zone:${zoneColors[current&&label===zoneLabels[zone]&&Object.hasOwn(zoneColors,zone)?zone:'GNSS_INVALIDO']}">${esc(label)}</span>
         <small class="unit-subtitle">${online?'Contato recente':collar.contact?.state==='offline'?'Offline reportado':'Sem contato recente'}</small></td>
-      <td>${number(current&&hasFix?sample.lat:null,6)}</td><td>${number(current&&hasFix?sample.lon:null,6)}</td>
+      <td>${number(coordinates?.lat,6)}${lastPosition?'<small class="unit-subtitle">Última válida</small>':''}</td>
+      <td>${number(coordinates?.lon,6)}${lastPosition?'<small class="unit-subtitle">Última válida</small>':''}</td>
       <td>${number(current&&hasFix?sample.satellites:null,0)}</td><td>${number(current&&hasFix?sample.hdop:null)}</td>
       <td>${measurement(sample?.rssi,0,'dBm')}</td><td>${measurement(sample?.snr,2,'dB')}</td>
       <td>${number(sample?.sequence,0)}</td><td class="cell-muted">${timestamp(sample?.at)}<small class="unit-subtitle">Idade: ${age(sample?.at)}</small></td>

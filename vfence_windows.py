@@ -492,8 +492,11 @@ def validate_fpga(values, runtime):
         return False
     values["VFENCE_JTAG_DLL_DIR"] = runtime["VFENCE_JTAG_DLL_DIR"] = str(directory)
     cable = usb_blaster_present()
-    print("FPGA: Quartus encontrado. " + ("USB-Blaster detectado." if cable else
-          "USB-Blaster não confirmado pelo Windows. A Base tentará abrir a JTAG."))
+    from app.terminal import terminal_block
+
+    print(terminal_block("FPGA", "INICIALIZACAO", "Quartus encontrado.",
+                         "USB-Blaster detectado." if cable else "USB-Blaster nao confirmado pelo Windows.",
+                         "Estado: AGUARDANDO ABERTURA JTAG E PONG", banner=True))
     if not all(runtime[key].strip() for key in ("METRICS_GATEWAY_ID", "METRICS_INSTALLATION_ID")):
         print("FPGA em diagnóstico: confirme os IDs de métricas para votação real.")
     return cable is not False

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import re
 import shutil
@@ -13,11 +14,11 @@ from unittest.mock import patch
 import pytest
 import serial
 
-from app.database import Database
+from app.database import Database, MetricSaveResult
 from app.serial_reader import SerialReader
 from app.terminal import ALERT_RULE, BLOCK_RULE, base_value
 from test_metric_serial_export import MetricConnection, ack, running, until
-from test_metric_summaries import RecordingHub, hdop_json, radio_json, serial_line
+from test_metric_summaries import RecordingHub, hdop_json, metric_rows, radio_json, serial_line
 from vfence_pc_serial import VFenceSerialClient
 
 
@@ -258,7 +259,7 @@ async def test_base_output_is_compact_and_distinguishes_commit_and_event(tmp_pat
     assert "[BASE][COL 001] POSICAO | SQLite: SALVA" in logs
     assert "[APP]" not in logs
     assert "SQLite: INSERTED | COMMIT CONCLUIDO" in logs
-    assert "[COL 002] HDOP | JANELA 60s" in logs and "DUPLICATE" in logs and "CONFLICT" in logs
+    assert "[COL 002] HDOP | JANELA 60s" in logs and "DUPLICATE" not in logs and "CONFLICT" in logs
     assert "[COL 254] RADIO | JANELA 60s" in logs and "RSSI medio: -93.40 dBm | SNR medio: -3.75 dB" in logs
     assert "[BASE][COL 007] ALERTA | GPS_LOST" in logs
     assert "ACK ENFILEIRADO" not in logs and "Escrita Serial: CONCLUIDA" not in logs
@@ -319,7 +320,7 @@ def base_reader(**overrides):
 
 
 async def test_slow_position_log_keeps_burst_alert_and_ack_consistent(caplog):
-    reader, db = base_reader(metrics_serial_ack_enabled=True)
+    reader, db = base_reader(metrics_serial_ack_enabled=True, terminal_detail=True)
     port = MetricConnection(serial_line(telemetry(1)))
     alert = {"schema": "vfence.gateway.serial.v1", "kind": "event", "collarId": 2, "subtype": "OUTSIDE"}
     lock_states = []
@@ -413,6 +414,9 @@ async def test_base_metric_blocks_separate_windows_and_preserve_invalidity(caplo
     assert db.list_pdr(254, 1)[0]["pdr_x100"] == 6667
 
     observations = [record.getMessage() for record in caplog.records if "DADOS RECEBIDOS" in record.getMessage()]
+    if not detail:
+        assert not observations and "PREVIA FPGA" not in caplog.text
+        return
     assert len(observations) == 6
     hdop, empty_hdop, radio, empty_radio, measured, invalid_pdr = observations
     assert "hdopMeanX100=142 | hdopMeanValid=True" in hdop
@@ -426,13 +430,13 @@ async def test_base_metric_blocks_separate_windows_and_preserve_invalidity(caplo
     for observation in observations:
         assert all(marker in observation for marker in (
             "Sessao=", "Janela=", "RX Base (UTC)=", "Duracao=60000 ms", "PREVIA FPGA",
-            "NAO ENVIADO — INTEGRACAO PENDENTE",
+            "NAO ENVIADO — AVALIACAO FPGA DESATIVADA",
         ))
         assert "ENVIADO AO FPGA" not in observation
 
 
 async def test_fpga_diagnostic_skips_duplicates_and_rejected_packets(caplog):
-    reader, db = base_reader()
+    reader, db = base_reader(terminal_detail=True)
     frame = radio_json(snrMeanX100=0, sampleCount=256)
     rejected = hdop_json(hdopMeanX100=65535)
     del rejected["windowId"]
@@ -496,6 +500,192 @@ async def test_base_detailed_raw_is_bounded_and_keeps_control_characters_off_ter
     assert len(bounded.removeprefix("[RAW TEST] ")) == 515
     assert all(char not in caplog.text for char in controls)
     assert base_value("a" + controls + "b") == "a" + " " * len(controls) + "b"
+
+
+async def test_windows_gateway_terminal_logs_complete_human_lines_without_enqueuing_them(caplog):
+    reader, db = base_reader(windows_base=True)
+    with caplog.at_level(logging.INFO):
+        await reader._process_serial_chunk(b"rst:0x1 (POWERON_RESET)\r\n===\r\n VFENCE | GATE")
+        await reader._process_serial_chunk(b"")
+        assert "INICIALIZACAO" not in caplog.text
+        await reader._process_serial_chunk(
+            b"WAY | INICIALIZACAO\r\n[INFO] USB Serial: 115200 baud\r\n[OK] \x1bGateway inicializado\r\n"
+        )
+    messages = [record.getMessage() for record in caplog.records]
+    assert len(messages) == 2
+    assert "rst:0x1 (POWERON_RESET)" in messages[0]
+    assert messages[1].startswith("\n" + "=" * 56)
+    assert "VFENCE | GATEWAY | INICIALIZACAO" in messages[1]
+    assert "[INFO] USB Serial: 115200 baud" in messages[1]
+    assert "[OK]  Gateway inicializado" in messages[1] and "\x1b" not in messages[1]
+    assert messages[1].endswith("=" * 56)
+    assert db.telemetry("COL01") == []
+
+
+@pytest.mark.parametrize("detail", [False, True])
+async def test_integrated_windows_app_presents_the_received_values_without_changing_persistence(caplog, detail):
+    reader, db = base_reader(windows_base=True, terminal_detail=detail)
+    invalid = {**telemetry(1, valid=False), "sequence": 832, "veryNear": True, "rssi": -110, "snr": -7.50,
+               "fenceVersion": 17, "battery": None, "satellites": None, "distanceBorderM": None}
+    valid = {**telemetry(1), "sequence": 836, "latitude": -31.3055048, "longitude": -54.0647825, "hdop": 5.5,
+             "distanceBorderM": 112, "battery": None, "satellites": 5, "rssi": -109, "snr": -0.75, "fenceVersion": 17}
+    state = {"schema": valid["schema"], "kind": "collar_state", "collarId": 1, "state": "ONLINE"}
+    event = {**state, "kind": "event", "subtype": "GPS_RECOVERED", "latitude": -31.3055078,
+             "longitude": -54.0647272, "recovered": True}
+    event.pop("state")
+    with caplog.at_level(logging.INFO):
+        await reader._process_serial_chunk(
+            b"--- RADIO CONFIG ---\nFrequency: 915000000 Hz\nSF: 7\nBW: 125000 Hz\n"
+            b"CR: 4/5\nPreamble: 8\nSyncWord: 0x12\nTX power: 14 dBm\nCRC: ON\n"
+        )
+        for frame in (state, invalid, event, valid, {**event, "subtype": "BACK_INSIDE", "sequence": 835, "fenceVersion": 17}):
+            assert await reader.process_line(serial_line({**frame, "authorization": "private-test-secret"}))
+        await reader._process_serial_chunk(
+            b"[EVENTO] [GATEWAY] [COL 001] GPS_RECOVERED seq=834 cerca=N/A ACK-LoRa=TX LOCAL ACEITO\n"
+            b"[AVISO] [GATEWAY] [COL 001] evento duplicado seq=834 ACK-LoRa=REENVIADO LOCAL\n"
+            b"[RETRY LoRa] [GATEWAY] [COL 001] seq=834 tentativa=2\n"
+        )
+    logs = caplog.text
+    for fragment in ("ESTADO DA COLEIRA", "GPS: INVALIDO", "Zona: N/A", "Latitude: -31.3055048",
+                     "Longitude: -54.0647825", "Bateria: N/A | Satelites: 5", "RSSI: -109 dBm | SNR: -0.75 dB",
+                     "Zona: SEGURO", "Recuperacao do GPS: SIM", "Tipo: BACK_INSIDE", "Versao da cerca: 17",
+                     "Frequency: 915000000 Hz", "ACK-LoRa=TX LOCAL ACEITO",
+                     "EVENTO DUPLICADO", "ACK-LoRa=REENVIADO LOCAL", "tentativa=2", "SQLite: SALVA"):
+        assert fragment in logs
+    assert logs.count("[APP][GATEWAY][COL 001] TELEMETRIA") == 2
+    assert ("[RAW GATEWAY] [APP]" in logs) is detail
+    assert ('"veryNear":true' in logs) is detail
+    assert ('"latitude":null' in logs) is detail
+    assert "private-test-secret" not in logs
+    persisted = db.telemetry("COL01")
+    assert len(persisted) == 2
+    assert {row["zone"] for row in persisted} == {"SEGURO", "GNSS_INVALIDO"}
+
+
+def evidence_frame(**fields):
+    return {"schema": "vfence.gateway.evidence.v1", "kind": "metric_evidence", "collarId": 1,
+            "gatewaySessionId": "000000000000000a", "collarSessionId": "000000000000000b",
+            "windowId": "0000000000000031", "startedAtMs": 2940000, "durationMs": 60000,
+            "profileId": 0, "txFirst": 1559, "txLast": 1580, "receivedCount": 21, "pdrX100": 10000,
+            "radioCount": 21, "rssiX100": -5619, "snrX100": 971, "hdopCount": 60, "hdopX100": 484, **fields}
+
+
+@pytest.mark.parametrize("detail", [False, True])
+async def test_integrated_windows_evidence_summary_and_retransmissions(caplog, detail):
+    reader, db = base_reader(windows_base=True, metrics_serial_ack_enabled=True, terminal_detail=detail)
+    port = reader._connection = MetricConnection()
+    sample = evidence_frame()
+    incomplete = evidence_frame(windowId="0000000000000033", startedAtMs=3060000,
+                                txLast=1559, receivedCount=0, pdrX100=None, radioCount=0, rssiX100=None,
+                                snrX100=None, hdopCount=0, hdopX100=None)
+    delayed = evidence_frame(windowId="0000000000000032", startedAtMs=3000000, snrX100=0)
+    reboot = evidence_frame(gatewaySessionId="000000000000000c", collarSessionId="000000000000000d")
+    other_collar = evidence_frame(collarId=2)
+    frames = [sample] * 11 + [incomplete, delayed, reboot, other_collar]
+    real_write = port.write
+
+    def write_after_commit(line):
+        command = json.loads(line[6:])
+        rows = db.proven_windows(command["collarId"], 10, gateway_session=command["gatewaySessionId"])
+        assert any(row["pdr"]["window_id"] == command["windowId"] and
+                   row["pdr"]["collar_session_id"] == command["collarSessionId"] for row in rows)
+        return real_write(line)
+
+    with patch.object(port, "write", side_effect=write_after_commit), patch("app.serial_reader.monotonic", return_value=42), \
+            caplog.at_level(logging.INFO):
+        for frame in frames:
+            assert await reader.process_line(serial_line(frame))
+
+    blocks = [record.getMessage() for record in caplog.records if "RESUMO DE METRICAS 60s" in record.getMessage()]
+    assert len(blocks) == 5
+    for fragment in ("COL 001", "Janela: 0000000000000031", "Perfil: P0", "RSSI medio: -56.19 dBm",
+                     "SNR medio: 9.71 dB", "PDR comprovado: 100.00%", "HDOP medio: 4.84", "Amostras de radio: 21",
+                     "Amostras de HDOP: 60", "Metricas validas: 4/4", "SQLite: COMMIT CONCLUIDO"):
+        assert fragment in blocks[0]
+    assert "METRICAS INCOMPLETAS" in blocks[1] and "Metricas validas: 0/4" in blocks[1]
+    assert blocks[1].count("INDISPONIVEL") == 4
+    assert "JANELA ATRASADA | CHEGADA EM RAJADA | Inicio original (Gateway): 3000000 ms" in blocks[2]
+    assert "SNR medio: 0.00 dB" in blocks[2] and "Janela: 0000000000000032" in blocks[2]
+    assert "Janela: 0000000000000031" in blocks[3] and "Recepcao:" not in blocks[3]
+    assert "COL 002" in blocks[4] and "Recepcao:" not in blocks[4]
+    assert caplog.text.count("REGISTRO IDENTICO JA PERSISTIDO") == (10 if detail else 0)
+    assert caplog.text.count("Escrita Serial: CONCLUIDA") == (15 if detail else 0)
+    assert ("PERSISTENCIA AINDA NAO CONFIRMADA" in caplog.text) is detail
+    assert ("[RAW GATEWAY] [APP]" in caplog.text) is detail
+    assert ('"rssiX100":-5619' in caplog.text) is detail
+    assert len(port.writes) == len(frames)
+    for request_id, (wire, frame) in enumerate(zip(port.writes, frames), 1):
+        assert wire == b"[CMD] " + json.dumps({"schema": "vfence.gateway.serial.v1", "requestId": request_id,
+            "command": "EVIDENCE_COMMITTED", "collarId": frame["collarId"], "gatewaySessionId": frame["gatewaySessionId"],
+            "collarSessionId": frame["collarSessionId"], "windowId": frame["windowId"]}, separators=(",", ":")).encode() + b"\n"
+    assert len(db.proven_windows(1, 10)) == 4 and len(db.proven_windows(2, 10)) == 1
+    saved = next(row for row in db.proven_windows(1, 10, gateway_session=sample["gatewaySessionId"])
+                 if row["pdr"]["window_id"] == sample["windowId"])
+    assert saved["pdr"]["pdr_x100"] == 10000 and saved["radio"]["rssi_mean_x100"] == -5619
+    assert saved["hdop"]["hdop_mean_x100"] == 484 and len(reader.hub.messages) == 5
+
+
+async def test_integrated_windows_metric_errors_stay_visible(caplog):
+    reader, db = base_reader(windows_base=True, metrics_serial_ack_enabled=True)
+    reader._connection = MetricConnection()
+    sample = evidence_frame()
+    response = {"schema": "vfence.gateway.serial.v1", "kind": "command_response", "requestId": 1,
+                "command": "EVIDENCE_COMMITTED"}
+    with caplog.at_level(logging.INFO):
+        with patch.object(reader, "_send_serial_commit_command", side_effect=OSError("simulated write failure")):
+            assert await reader.process_line(serial_line(sample))
+        assert not await reader.process_line(serial_line({**sample, "hdopX100": 485}))
+        assert not await reader.process_line(serial_line({**sample, "pdrX100": 9999}))
+        assert not await reader.process_line(b'[APP] {"kind":\n')
+        with patch.object(db, "save_metric_evidence", return_value=MetricSaveResult.FAILED):
+            assert not await reader.process_line(serial_line({**sample, "windowId": "0000000000000032"}))
+        assert await reader.process_line(serial_line({**response, "ok": False, "detail": "schema_invalid"}))
+        refused_logs = caplog.text
+        assert await reader.process_line(serial_line({**response, "ok": True}))
+    assert caplog.text == refused_logs
+    for fragment in ("confirmacao Serial pendente apos COMMIT", "SQLite=CONFLICT", "evidencia rejeitada",
+                     "invalid_json", "SQLite=FAILED", "Comando: EVIDENCE_COMMITTED | Resultado: RECUSADO",
+                     "Detalhe: schema_invalid"):
+        assert fragment in refused_logs
+    assert refused_logs.count("RESUMO DE METRICAS 60s") == 1
+    assert len(db.proven_windows(1, 10)) == 1 and not reader._connection.writes
+
+
+@pytest.mark.parametrize("detail", [False, True])
+async def test_integrated_windows_only_repeats_covered_summaries_in_detail(caplog, detail):
+    reader, db = base_reader(windows_base=True, terminal_detail=detail)
+    sample = evidence_frame()
+    identity = {key: sample[key] for key in ("gatewaySessionId", "windowId")}
+    radio = radio_json(**identity, gatewayStartedAtMs=sample["startedAtMs"], sampleCount=21,
+                       rssiMeanX100=-5619, snrMeanX100=971)
+    hdop = hdop_json(**identity, collarSessionId=sample["collarSessionId"], sampleCount=60, hdopMeanX100=484)
+    different_session = {**hdop, "collarSessionId": "000000000000000c"}
+    different_window = {**radio, "windowId": "0000000000000032"}
+    with caplog.at_level(logging.INFO):
+        for frame in (sample, radio, hdop, different_session, different_window):
+            assert await reader.process_line(serial_line(frame))
+        await reader._process_serial_chunk(
+            b"[RETRY] [GATEWAY] [COL 001] tipo=RADIO aguardando METRIC_COMMITTED\n"
+            b"[ACK SQLITE] [GATEWAY] [COL 001] tipo=HDOP identidade validada, pendencia consumida\n"
+            b"[AVISO] [GATEWAY] [COL 001] tipo=HDOP cabeca alterada, ACK nao aplicado\n"
+        )
+        await reader._process_serial_chunk(b"==== VFENCE | GATEWAY | RADIO 60s | COL 001 ====\n")
+        await reader._process_serial_chunk(
+            b" sessao=000000000000000a janela=0000000000000031 inicioGateway=2940000 ms duracao=60000 ms\n"
+            b" amostras=21 RSSI=-56.19 dBm SNR=9.71 dB validade=VALIDA | fila=RETIDA\n"
+            b"[HDOP] [COL 001] s=000000000000000b j=0000000000000031 t=0 d=60000 n=60 HDOP=4.84 V RETIDA\n"
+            b"[HDOP] [COL 001] s=000000000000000c j=0000000000000031 t=0 d=60000 n=60 HDOP=4.84 V RETIDA/SUBST\n"
+        )
+    assert len(metric_rows(db)) == 4
+    assert caplog.text.count("RADIO | JANELA 60s") == (2 if detail else 1)
+    assert caplog.text.count("HDOP | JANELA 60s") == (2 if detail else 1)
+    assert ("aguardando METRIC_COMMITTED" in caplog.text) is detail
+    assert ("pendencia consumida" in caplog.text) is detail
+    assert ("inicioGateway=2940000 ms" in caplog.text) is detail
+    assert ("fila=RETIDA" in caplog.text) is detail
+    assert ("HDOP=4.84 V RETIDA\n" in caplog.text) is detail
+    assert "RETIDA/SUBST" in caplog.text
+    assert "cabeca alterada, ACK nao aplicado" in caplog.text
 
 
 async def test_base_raw_allowlist_keeps_payloads_for_application_without_exposing_credentials(caplog):

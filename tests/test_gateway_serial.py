@@ -121,6 +121,25 @@ async def test_command_timeout_removes_pending_request():
     assert reader._pending_commands == {}
 
 
+async def test_late_profile_reply_cannot_confirm_new_request_and_diagnostics_omit_payload(caplog):
+    reader, _, _ = make_reader(terminal_detail=True)
+    reader.serial_generation = 4
+    with caplog.at_level(logging.INFO, logger="serial_reader"):
+        with pytest.raises(TimeoutError):
+            await reader.send_gateway_command("GET_PROFILE_V2", timeout_seconds=0.01, token="sensitive-test-value")
+        second = asyncio.create_task(reader.send_gateway_command("GET_PROFILE_V2"))
+        await wait_for_writes(reader, 2)
+        await reader.process_line(app_message("command_response", requestId=1, command="GET_PROFILE_V2", ok=True))
+        assert not second.done()
+        await reader.process_line(app_message("command_response", requestId=2, command="GET_PROFILE_V2",
+                                              ok=False, detail="schema_invalid"))
+        assert (await second)["requestId"] == 2
+    assert f"Bytes CMD: {len(reader._connection.writes[0]) + 1} | Geracao Serial: 4" in caplog.text
+    assert "Escrita local: CONCLUIDA" in caplog.text and "PRAZO DA RESPOSTA EXPIRADO" in caplog.text
+    assert "Request ID: 2 | Geracao Serial: 4" in caplog.text and "schema_invalid" in caplog.text
+    assert "sensitive-test-value" not in caplog.text
+
+
 async def test_structured_telemetry_is_saved_and_broadcast():
     reader, database, hub = make_reader()
     await reader.process_line(app_message(

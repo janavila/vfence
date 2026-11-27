@@ -326,8 +326,8 @@ class MetricSerialTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs("serial_reader", logging.DEBUG) as logs:
             await self.reader.process_line(serial_line(hdop_json(gatewayReceivedAtMs=2000)))
             await self.reader.process_line(serial_line(hdop_json(hdopMeanX100=123)))
-        self.assertIn("DUPLICATE | REGISTRO IDENTICO JA PERSISTIDO", logs.output[0])
-        self.assertIn("CONFLICT | IDENTIDADE COM CONTEUDO DIVERGENTE", logs.output[1])
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("CONFLICT | IDENTIDADE COM CONTEUDO DIVERGENTE", logs.output[0])
         self.assertEqual(len(metric_rows(self.database)), 1)
         self.assertEqual(metric_rows(self.database)[0]["gateway_received_at_ms"], 1250)
 

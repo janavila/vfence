@@ -19,6 +19,8 @@ from app.jtag_atlantic import IsolatedJtagAtlantic, JtagOwnerAlive, parse_result
 from app.metric_protocol import MetricSummary
 from app.pdr_protocol import PdrSummary
 from app.profile_api import ProfileReport, apply_fpga_profile
+from app.terminal import (base_value, correlated_metrics, fpga_result_block, fpga_sample_block,
+                          terminal_block, terminal_emit)
 
 
 logger = logging.getLogger("vfence.fpga")
@@ -155,13 +157,19 @@ class FpgaService:
             if record and self.link.last_sent:
                 self.status["last_tx"] = sent
                 self.history.appendleft(sent)
-                logger.info("[FPGA] TX %s", command)
+                if getattr(self.config, "terminal_detail", False):
+                    terminal_emit(logger, lambda value: "[FPGA] TX " + base_value(value), command)
         received = {"at": _utc_now(), "line": line, "direction": "RX"}
         if record:
             self.status["last_rx"] = received
             self.history.appendleft(received)
-            logger.info("[FPGA] RX %s", line)
+            if getattr(self.config, "terminal_detail", False):
+                terminal_emit(logger, lambda value: "[FPGA] RX " + base_value(value, limit=1024), line)
         if line not in expected and not (allow_result and line.startswith("VFENCE|P")):
+            if record:
+                terminal_emit(logger, terminal_block, "FPGA", "RESPOSTA INESPERADA | NIOS II",
+                              f"Comando: {command.split()[0]}", f"Resposta: {base_value(line)}",
+                              critical=True, level=logging.WARNING)
             raise ValueError(f"resposta inesperada em {command.split()[0]}")
         return line
 
@@ -171,13 +179,17 @@ class FpgaService:
         if line == "ERR|NO_RESULT":
             line = await self.command("CLOSE", {"ERR|NO_WINDOW", "ERR|NO_RESULT"}, allow_result=True)
         if line not in {"ERR|NO_RESULT", "ERR|NO_WINDOW"}:
-            # The wire reply carries no window or producer identity. Archive
-            # it, but do not use it to recommend or apply any profile.
-            if not re.fullmatch(r"VFENCE\|P[0-3]\|[0-5]\|[01]", line):
-                raise ValueError("resultado JTAG recuperado inválido")
-            await self.commit_result({"at": _utc_now(), "window_id": None, "wire": line,
-                                      "recovered": True}, recovering=True)
-            logger.info("[FPGA] Resultado anterior arquivado na reconexao")
+            await self.archive_result(line)
+            terminal_emit(logger, terminal_block, "FPGA", "RECUPERACAO",
+                          "Resultado anterior arquivado na reconexao",
+                          "Estado: SEM RECOMENDACAO PARA A JANELA ATUAL")
+
+    async def archive_result(self, line):
+        # A result on the wire has no window or producer identity.
+        if not re.fullmatch(r"VFENCE\|P[0-3]\|[0-5]\|[01]", line):
+            raise ValueError("resultado JTAG recuperado inválido")
+        await self.commit_result({"at": _utc_now(), "window_id": None, "wire": line,
+                                  "recovered": True}, recovering=True)
 
     async def gateway(self):
         if self.config.mock_serial or self.reader.state.status != "online":
@@ -291,23 +303,42 @@ class FpgaService:
                     if eligible:
                         hdop = summary
                         break
-                batch.add(gateway_id=batch.gateway_id, pdr=pdr,
-                          radio=_record(MetricSummary, radio) if radio else None,
-                          hdop=hdop, aligned_hdop_start_ms=aligned)
+                radio_summary = _record(MetricSummary, radio) if radio else None
+                if batch.add(gateway_id=batch.gateway_id, pdr=pdr, radio=radio_summary,
+                             hdop=hdop, aligned_hdop_start_ms=aligned) and getattr(self.config, "terminal_detail", False):
+                    minute = ((pdr.started_at_ms - batch.started_at_ms) & 0xFFFFFFFF) // MINUTE_MS
+                    sample = batch._samples.get((minute, pdr.collar_id))
+                    terminal_emit(logger, correlated_metrics, row, radio_summary, hdop, sample)
 
     async def finish(self, line, profile, window_id):
         result = parse_result(line, profile)
         result.update(at=_utc_now(), window_id=window_id, ack=False, wire=line)
         self.status.update(result=result, window="result")
-        logger.info("[FPGA] Resultado janela=%s %s", window_id, line)
+        terminal_emit(logger, fpga_result_block, result, profile,
+                      getattr(self.config, "fpga_auto_profile_enabled", False),
+                      level=logging.WARNING if result["critical"] else logging.INFO)
         await self.commit_result(result)
         self.status.update(result={**result, "ack": True}, window="confirmed")
 
     async def commit_result(self, result, *, recovering=False):
         result_id = None
         if getattr(self.config, "windows_base", False):
-            result_id = await asyncio.to_thread(self.database.save_windows_fpga_result, result, recovering=recovering)
-        await self.command("ACK", {"OK|ACK"})
+            try:
+                result_id = await asyncio.to_thread(self.database.save_windows_fpga_result, result, recovering=recovering)
+            except Exception:
+                terminal_emit(logger, terminal_block, "FPGA", "FALHA | SQLITE",
+                              "Resultado sem confirmacao de persistencia", critical=True, level=logging.ERROR)
+                raise
+            terminal_emit(logger, terminal_block, "FPGA", "PERSISTENCIA DO RESULTADO",
+                          "SQLite: COMMIT CONCLUIDO", f"Janela: {base_value(result.get('window_id'))}")
+        try:
+            await self.command("ACK", {"OK|ACK"})
+        except Exception:
+            terminal_emit(logger, terminal_block, "FPGA", "FALHA | ACK DO RESULTADO",
+                          "Nios II: OK|ACK NAO CONFIRMADO", critical=True, level=logging.WARNING)
+            raise
+        terminal_emit(logger, terminal_block, "FPGA", "ACK DO RESULTADO",
+                      "ACK FPGA: CONFIRMADO | Nios II: OK|ACK")
         if result_id is not None:
             await asyncio.to_thread(self.database.acknowledge_windows_fpga_result, result_id)
 
@@ -317,12 +348,41 @@ class FpgaService:
         except TimeoutError:
             pass
 
+    def gateway_divergence(self, current, original, generation):
+        if self.reader.serial_generation != generation:
+            return "Geracao da conexao Serial mudou"
+        if current is None:
+            return None
+        for field, reason in (
+            ("gatewaySessionId", "Sessao do Gateway mudou"),
+            ("activeProfileId", "Perfil ativo do Gateway mudou"),
+            ("operationId", "Operacao de perfil do Gateway mudou"),
+        ):
+            if current[field] != original[field]:
+                return reason
+        if current["state"] not in SETTLED:
+            return "Estado do Gateway incompativel com a votacao"
+        return None
+
     def same_gateway(self, current, original, generation):
-        return (current is not None and current["state"] in SETTLED
-                and self.reader.serial_generation == generation
-                and all(current[field] == original[field] for field in (
-                    "gatewaySessionId", "activeProfileId", "operationId",
-                )))
+        return current is not None and self.gateway_divergence(current, original, generation) is None
+
+    async def end_unconfirmed(self, *, line=None):
+        self.status["window"] = "discarded"
+        terminal_emit(logger, terminal_block, "FPGA", "VOTACAO ENCERRADA SEM CONFIRMACAO",
+                      "Motivo: Contexto do Gateway indisponivel no encerramento",
+                      "Estado: RESULTADO ARQUIVADO SEM RECOMENDACAO QUANDO DISPONIVEL",
+                      critical=True, level=logging.WARNING)
+        if line is None:
+            await self.reconcile()
+        else:
+            await self.archive_result(line)
+
+    async def discard_gateway_window(self, reason):
+        self.status["window"] = "discarded"
+        terminal_emit(logger, terminal_block, "FPGA", "JANELA DESCARTADA", f"Motivo: {reason}",
+                      critical=True, level=logging.WARNING)
+        await self.reconcile()
 
     def session_changed(self, reports, sessions, gateway_session, includes):
         return any(
@@ -348,12 +408,18 @@ class FpgaService:
             changed_session = False
         current = await self.gateway()
         now = _timestamp(_utc_now())
+        if (current is None and not self.stop.is_set()
+                and self.gateway_divergence(current, profile_report, generation) is None):
+            await self.end_unconfirmed(line=line)
+            return False
         if (self.stop.is_set() or not self.same_gateway(current, profile_report, generation)
                 or changed_session or clock_invalid
                 or (sessions and not network and not start <= observed <= now <= clock.valid_until)
                 or (not sessions and parse_result(line, profile_report["activeProfileId"])["reason"] != 4)):
             self.status["window"] = "discarded"
-            logger.warning("[FPGA] Resultado descartado | Sessao, perfil ou intervalo mudou")
+            terminal_emit(logger, terminal_block, "FPGA", "RESULTADO DESCARTADO",
+                          "Resultado descartado | Sessao, perfil ou intervalo mudou",
+                          critical=True, level=logging.WARNING)
             await self.command("ACK", {"OK|ACK"})
             return False
         await self.finish(line, profile_report["activeProfileId"], window_id)
@@ -382,13 +448,17 @@ class FpgaService:
             applied = await apply_fpga_profile(self.config, self.reader, self.database, origin,
                                                result["profile"], still_valid, self.pause)
         except HTTPException as exc:
-            logger.warning("[FPGA] Troca automatica interrompida | HTTP %s", exc.status_code)
+            terminal_emit(logger, terminal_block, "FPGA", "FALHA | TROCA AUTOMATICA",
+                          f"Troca automatica interrompida | HTTP {exc.status_code}", critical=True, level=logging.WARNING)
             return
         if applied:
             self.status["gateway"] = applied
-            logger.info("[FPGA] Perfil aplicado pelo Gateway: P%s", applied["activeProfileId"])
+            terminal_emit(logger, terminal_block, "FPGA", "PERFIL APLICADO",
+                          f"Perfil aplicado pelo Gateway: P{applied['activeProfileId']}")
         else:
-            logger.warning("[FPGA] Troca automatica sem confirmacao integral; aguarde nova avaliacao")
+            terminal_emit(logger, terminal_block, "FPGA", "APLICACAO NAO CONFIRMADA",
+                          "Troca automatica sem confirmacao integral; aguarde nova avaliacao",
+                          critical=True, level=logging.WARNING)
 
     async def evaluate(self, ids, clocks, profile_report, gateway_clocks=None, *, network=None,
                        require_proven=False):
@@ -409,21 +479,46 @@ class FpgaService:
         sent = set()
         used_sessions = {}
         observed = start
+        awaiting_gateway = False
         self.status.update(window="collecting", window_id=window_id)
-        while not self.stop.is_set():
+        terminal_emit(logger, terminal_block, "FPGA", "VOTACAO", f"Perfil atual: P{profile}",
+                      f"Duracao nominal: {WINDOW_MINUTES} minutos", f"Janela Base: {window_id}",
+                      "Coleiras autorizadas: " + ", ".join(f"COL {item:03d}" for item in ids),
+                      "Nios II: OK|BEGIN | Estado: AGUARDANDO METRICAS", banner=True)
+        while not self.stop.is_set() and time.monotonic() < deadline:
             report = await self.gateway()
-            if not self.same_gateway(report, profile_report, serial_generation):
-                self.status["window"] = "discarded"
-                await self.reconcile()
+            if self.stop.is_set():
+                break
+            divergence = self.gateway_divergence(report, profile_report, serial_generation)
+            if divergence:
+                await self.discard_gateway_window(divergence)
                 return
+            if report is None:
+                if not awaiting_gateway:
+                    awaiting_gateway = True
+                    terminal_emit(logger, terminal_block, "FPGA", "VOTACAO | AGUARDANDO CONFIRMACAO DO GATEWAY",
+                                  "Motivo: Consulta de perfil temporariamente indisponivel",
+                                  "Estado: NOVAS AMOSTRAS SUSPENSAS", "Janela atual: PRESERVADA",
+                                  level=logging.WARNING)
+                if time.monotonic() < deadline and not self.stop.is_set():
+                    await self.command("PING", {"PONG"}, record=False)
+                    await self.pause(min(3, max(0, deadline - time.monotonic())))
+                continue
             if time.monotonic() >= deadline:
                 break
+            if awaiting_gateway:
+                awaiting_gateway = False
+                terminal_emit(logger, terminal_block, "FPGA", "VOTACAO RETOMADA",
+                              "Sessao e perfil: CONFIRMADOS", "Estado: RECEBIMENTO DE AMOSTRAS LIBERADO")
             reports = await asyncio.to_thread(self.records, ids)
             observed = min(_timestamp(_utc_now()), start + timedelta(
                 seconds=min(EVALUATION_SECONDS, time.monotonic() - started)))
             includes = network.includes if network else lambda row: clock.source_bounds(row, start, observed) is not None
             if used_sessions and self.session_changed(reports, used_sessions, session, includes):
                 self.status["window"] = "discarded"
+                terminal_emit(logger, terminal_block, "FPGA", "JANELA DESCARTADA",
+                              "Sessao de coleira alterada durante a avaliacao",
+                              critical=True, level=logging.WARNING)
                 await self.reconcile()
                 return
 
@@ -455,6 +550,9 @@ class FpgaService:
                     expected = batch.collar_sessions.setdefault(row["collar_id"], row["collar_session_id"])
                     if expected != row["collar_session_id"]:
                         self.status["window"] = "discarded"
+                        terminal_emit(logger, terminal_block, "FPGA", "JANELA DESCARTADA",
+                                      "Identidade da sessao da coleira divergiu",
+                                      collar_id=row["collar_id"], critical=True, level=logging.WARNING)
                         await self.reconcile()
                         return
                 self.samples(batch, reports, clocks, covers, network=network)
@@ -470,7 +568,17 @@ class FpgaService:
                         minute_end = network.projected_start + (sample.minute_index + 1) * MINUTE_MS / 1000
                         if now < min(minute_end + DELIVERY_GRACE_SECONDS, deadline - JTAG_SAMPLE_BUDGET_SECONDS):
                             continue
-                    line = await self.command(sample_command(sample), {"OK|SAMPLE", "ERR|RESULT_PENDING"}, allow_result=True)
+                    divergence = self.gateway_divergence(report, profile_report, serial_generation)
+                    if divergence:
+                        await self.discard_gateway_window(divergence)
+                        return
+                    try:
+                        line = await self.command(sample_command(sample), {"OK|SAMPLE", "ERR|RESULT_PENDING"}, allow_result=True)
+                    except Exception:
+                        terminal_emit(logger, fpga_sample_block, sample, profile, None, level=logging.WARNING)
+                        raise
+                    terminal_emit(logger, fpga_sample_block, sample, profile, line,
+                                  level=logging.WARNING if line.startswith("ERR|") else logging.INFO)
                     sent.add(identity)
                     used_sessions[sample.collar_id] = batch.collar_sessions[sample.collar_id]
                     if line == "ERR|RESULT_PENDING":
@@ -482,6 +590,13 @@ class FpgaService:
             await self.command("PING", {"PONG"}, record=False)
             await self.pause(min(3, max(0, deadline - time.monotonic())))
         if self.stop.is_set():
+            return
+        divergence = self.gateway_divergence(None, profile_report, serial_generation)
+        if divergence:
+            await self.discard_gateway_window(divergence)
+            return
+        if awaiting_gateway:
+            await self.end_unconfirmed()
             return
         line = await self.command("CLOSE", set(), allow_result=True)
         await self.accept_result(line, window_id, profile_report, serial_generation,
@@ -503,7 +618,9 @@ class FpgaService:
                 raise ValueError
         except (AttributeError, KeyError, OverflowError, TypeError, ValueError):
             self.status["error"] = "Configuração FPGA inválida"
-            logger.error("[FPGA] Configuracao invalida. Confira COLLAR_IDS e os mapas de tempo da FPGA")
+            terminal_emit(logger, terminal_block, "FPGA", "FALHA | CONFIGURACAO",
+                          "Configuracao invalida. Confira COLLAR_IDS e os mapas de tempo da FPGA",
+                          critical=True, level=logging.ERROR)
             return
         if not clocks:
             logger.info("[FPGA] HDOP sincronizado usa identidade de janela do Gateway")
@@ -520,9 +637,12 @@ class FpgaService:
                 parked = None
             try:
                 self.link = await asyncio.to_thread(self.transport, self.config)
+                terminal_emit(logger, terminal_block, "FPGA", "JTAG",
+                              "Canal JTAG aberto | Estado: AGUARDANDO PONG")
                 await self.reconcile()
                 self.status.update(connection="online", error=None)
-                logger.info("[FPGA] CONECTADA | PONG CONFIRMADO")
+                terminal_emit(logger, terminal_block, "FPGA", "CONEXAO",
+                              "CONECTADA | PONG CONFIRMADO", "Estado: AGUARDANDO JANELA E PERFIL", banner=True)
                 retry_seconds = 3
                 while not self.stop.is_set():
                     report = await self.gateway()
@@ -536,13 +656,14 @@ class FpgaService:
                         await self.pause()
             except JtagOwnerAlive as error:
                 self.status.update(connection="offline", window="interrupted", error=str(error))
-                logger.error("[FPGA] %s", error)
+                terminal_emit(logger, terminal_block, "FPGA", "FALHA | JTAG", error, critical=True, level=logging.ERROR)
                 parked = error
             except Exception as error:
                 changed = self.status["error"] != str(error)
                 self.status.update(connection="offline", window="interrupted", error=str(error))
                 if changed:
-                    logger.warning("[FPGA] %s | nova tentativa após intervalo", error)
+                    terminal_emit(logger, terminal_block, "FPGA", "FALHA | JTAG / NIOS II",
+                                  f"{error} | nova tentativa após intervalo", critical=True, level=logging.WARNING)
             finally:
                 if self.link is not None:
                     link, self.link = self.link, None
@@ -550,9 +671,11 @@ class FpgaService:
                         await asyncio.to_thread(link.close)
                     except JtagOwnerAlive as error:
                         self.status.update(connection="offline", window="interrupted", error=str(error))
-                        logger.error("[FPGA] %s", error)
+                        terminal_emit(logger, terminal_block, "FPGA", "FALHA | ENCERRAMENTO JTAG",
+                                      error, critical=True, level=logging.ERROR)
                         parked = error
                     except OSError:
-                        logger.warning("[FPGA] Falha ao fechar o transporte")
+                        terminal_emit(logger, terminal_block, "FPGA", "FALHA | ENCERRAMENTO JTAG",
+                                      "Falha ao fechar o transporte", critical=True, level=logging.WARNING)
             await self.pause(retry_seconds)
             retry_seconds = min(30, retry_seconds * 2)

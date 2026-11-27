@@ -59,6 +59,19 @@ test('historical alerts do not count and offline or invalid fixes remove markers
   assert.equal(ui.node('#collar-count').textContent,'00');
 });
 
+test('monitored collars distinguish current coordinates from the last valid fix',async()=>{
+  const ui=dashboard();
+  const current=collar('COL01',0);
+  const offline={...collar('COL02',-600),last_fix:{lat:-31.25,lon:-54.125,at:iso(-600)}};
+  ui.snapshot(online,[current,offline]);
+  await settle();
+  const table=ui.node('#collars').innerHTML;
+  assert.match(table,/<td>-31\.000000<\/td>\s*<td>-54\.000000<\/td>/);
+  assert.match(table,/-31\.250000<small[^>]*>Última válida/);
+  assert.match(table,/-54\.125000<small[^>]*>Última válida/);
+  assert.deepEqual(ui.tooltips,[{textContent:'COL01'}]);
+});
+
 test('REST cannot replace a live update and reconnect reloads every resource',async()=>{
   const ui=dashboard();
   ui.push({type:'telemetry',collar:collar('COL02',0),gateway:online});

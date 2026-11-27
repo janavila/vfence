@@ -13,6 +13,7 @@ from functools import partial
 from heapq import heapify
 from itertools import count, cycle
 from io import BytesIO
+from time import monotonic
 
 from app.database import GatewayEventConflictError, MetricSaveResult
 from app.metric_evidence import EVIDENCE_KIND, EVIDENCE_SCHEMA, parse_evidence
@@ -28,8 +29,9 @@ from app.models import GatewayState
 from app.pdr_protocol import PDR_COMMIT_SCHEMA, PDR_KIND, PDR_SCHEMA, PdrSummary, parse_pdr_summary
 from app.protocol import ParsedPacket, ProtocolError, parse_message
 from app.terminal import (
-    ALERT_EVENTS, base_block, base_event, base_metric, base_pdr, base_position, base_value,
+    ALERT_EVENTS, app_level, app_message, app_raw, base_block, base_event, base_metric, base_pdr, base_position, base_value,
     collar_label, fpga_metric_diagnostic, gateway_log_field, gateway_log_snapshot, metric_identity,
+    MetricTerminalView, evidence_block, gateway_human_records, metric_window_block, terminal_emit,
 )
 
 logger = logging.getLogger("serial_reader")
@@ -135,6 +137,7 @@ class SerialReader:
     def __init__(self, config, database, hub):
         self.config = config
         self.terminal_detail = getattr(config, "terminal_detail", False)
+        self._metric_terminal = MetricTerminalView()
         self.database = database
         self.hub = hub
         self.state = GatewayState(
@@ -647,13 +650,18 @@ class SerialReader:
                 self._serial_line.clear()
                 self._discard_until_lf = True
             return
+        terminal_rows = []
         parts = chunk.split(b"\n")
-        for part in parts[:-1]:
-            await self._append_serial_part(part, terminated=True)
-        if parts[-1]:
-            await self._append_serial_part(parts[-1], terminated=False)
+        try:
+            for part in parts[:-1]:
+                await self._append_serial_part(part, terminated=True, terminal_rows=terminal_rows)
+            if parts[-1]:
+                await self._append_serial_part(parts[-1], terminated=False, terminal_rows=terminal_rows)
+        finally:
+            if terminal_rows:
+                self._log_gateway_terminal(terminal_rows)
 
-    async def _append_serial_part(self, part: bytes, *, terminated: bool) -> None:
+    async def _append_serial_part(self, part: bytes, *, terminated: bool, terminal_rows: list[str]) -> None:
         if self._discard_until_lf:
             self._discard_until_lf = not terminated
             return
@@ -668,13 +676,14 @@ class SerialReader:
             self._serial_line.append(10)
             line = bytes(self._serial_line)
             self._serial_line.clear()
-            await self.process_line(line)
+            await self._handle_line(line, at_timeout=False, terminal_rows=terminal_rows)
 
     async def process_line(self, line, *, at_timeout: bool = False) -> bool:
         """Return admission for queued work, or the handling result for inline work."""
         return await self._handle_line(line, at_timeout=at_timeout) is _LineResult.ACCEPTED
 
-    async def _handle_line(self, line, *, at_timeout: bool) -> _LineResult:
+    async def _handle_line(self, line, *, at_timeout: bool, terminal_rows: list[str] | None = None) -> _LineResult:
+        app_packet = None
         try:
             text = line.decode("utf-8").strip() if isinstance(line, bytes) else str(line).strip()
             if not text or "\x00" in text:
@@ -685,6 +694,8 @@ class SerialReader:
                 # at an idle read can still be a short write awaiting resync.
                 if at_timeout and "schema" in app_packet:
                     return _LineResult.UNRECOGNIZED
+                if self.terminal_detail and getattr(self.config, "windows_base", False):
+                    terminal_emit(logger, app_raw, text)
                 if "deliveryId" in app_packet or "deliveryVersion" in app_packet:
                     delivery_id = app_packet.get("deliveryId")
                     if (app_packet["kind"] != "event" or type(app_packet.get("deliveryVersion")) is not int or
@@ -710,7 +721,12 @@ class SerialReader:
                 # Linhas humanas são diagnóstico. Só os formatos históricos entram no parser V1.
                 if not (text.startswith("V1|") or text.lower().startswith("recebido:")):
                     if not at_timeout:
-                        if _GATEWAY_METRIC_ACK_LOG.fullmatch(text):
+                        if getattr(self.config, "windows_base", False):
+                            if terminal_rows is None:
+                                self._log_gateway_terminal([text])
+                            else:
+                                terminal_rows.append(text)
+                        elif self.terminal_detail and _GATEWAY_METRIC_ACK_LOG.fullmatch(text):
                             logger.info("%s", text)
                         else:
                             self._diagnostic("[RAW GATEWAY] Linha de diagnostico | Caracteres: %s", len(text))
@@ -733,15 +749,27 @@ class SerialReader:
             if not at_timeout:
                 reason = exc.args[0] if exc.args else None
                 label = reason if type(reason) is str and reason in _SAFE_FRAME_REJECTIONS else type(exc).__name__
+                if isinstance(exc, json.JSONDecodeError):
+                    label = "invalid_json"
+                elif app_packet is not None and app_packet["kind"] == EVIDENCE_KIND:
+                    label = f"evidencia rejeitada | {label}"
                 logger.warning("gateway application line rejected (%s)", label)
         return _LineResult.UNRECOGNIZED
+
+    def _log_gateway_terminal(self, rows: list[str]) -> None:
+        try:
+            for level, block in gateway_human_records(rows, detail=self.terminal_detail):
+                logger.log(level, "%s", block)
+        except Exception:
+            pass
 
     def _diagnostic(self, message: str, value: object) -> None:
         if self.terminal_detail:
             logger.info(message, base_value(value, limit=512))
 
     async def _save_and_broadcast(self, packet: ParsedPacket):
-        if self.terminal_detail:
+        integrated_app = packet.version == "GATEWAY_V1" and getattr(self.config, "windows_base", False)
+        if self.terminal_detail and not integrated_app:
             snapshot = gateway_log_snapshot({
                 "sequence": packet.sequence, "latitude": packet.latitude, "longitude": packet.longitude,
                 "zone": packet.zone, "satellites": packet.satellites, "hdop": packet.hdop,
@@ -765,10 +793,15 @@ class SerialReader:
         gps_valid = False if packet.zone == "GNSS_INVALIDO" else (
             True if packet.latitude is not None and packet.longitude is not None else None
         )
-        logger.info("%s", base_position(
-            packet.collar_id, packet.sequence, gps_valid, packet.hdop, packet.rssi, packet.snr,
-            packet.zone, detail=self.terminal_detail,
-        ))
+        if integrated_app:
+            terminal_emit(logger, base_block, "POSICAO | SQLite: SALVA",
+                          f"Sequencia: {base_value(packet.sequence)} | Origem: quadro APP",
+                          collar_id=packet.collar_id)
+        else:
+            logger.info("%s", base_position(
+                packet.collar_id, packet.sequence, gps_valid, packet.hdop, packet.rssi, packet.snr,
+                packet.zone, detail=self.terminal_detail,
+            ))
         if event:
             previous, current = event["old_value"], event["new_value"]
             critical = bool(previous and previous != current and current == "FORA")
@@ -918,7 +951,14 @@ class SerialReader:
 
     async def _process_gateway_app(self, data: dict, received_at: datetime | None = None) -> bool:
         kind = data["kind"]
-        if self.terminal_detail and kind != "telemetry":
+        integrated = getattr(self.config, "windows_base", False)
+        metric_response = (kind == "command_response" and data.get("ok") is True
+                           and data.get("command") in ("GET_METRIC_CLOCK_V1", "METRIC_COMMITTED",
+                                                       "PDR_COMMITTED", "EVIDENCE_COMMITTED"))
+        metric_detail = kind in METRIC_SUMMARY_KINDS or kind in {EVIDENCE_KIND, PDR_KIND} or metric_response
+        if integrated and kind != "telemetry" and (self.terminal_detail or not metric_detail):
+            terminal_emit(logger, app_message, data, level=app_level(data))
+        elif self.terminal_detail and kind != "telemetry":
             self._diagnostic("[RAW GATEWAY] %s", json.dumps(gateway_log_snapshot(data), separators=(",", ":")))
         if kind in METRIC_SUMMARY_KINDS:
             return await self._process_metric_summary(data)
@@ -933,7 +973,8 @@ class SerialReader:
                 return False
             connection = self._connection if getattr(self.config, "metrics_serial_ack_enabled", False) else None
             return await self._submit_work(
-                partial(self._persist_metric_evidence, gateway_id, installation_id, summary, connection),
+                partial(self._persist_metric_evidence, gateway_id, installation_id, summary, connection,
+                        arrival_time=monotonic()),
                 priority=_PDR_WORK_PRIORITY, description=f"[{collar_label(summary.collar_id)}] tipo=PDR_COMPROVADO",
             )
         if kind == PDR_KIND:
@@ -955,6 +996,8 @@ class SerialReader:
             packet = self._telemetry_packet(
                 data, "[APP] " + json.dumps(data, separators=(",", ":")), received_at,
             )
+            if integrated:
+                terminal_emit(logger, app_message, data, packet=packet)
             await self._save_and_broadcast(packet)
             await self._remember_windows_collar(data["collarId"], packet.timestamp)
             return True
@@ -965,6 +1008,8 @@ class SerialReader:
             matched = future is not None and not future.done()
             if matched:
                 future.set_result(data)
+                if data.get("command") == "GET_METRIC_CLOCK_V1":
+                    self._metric_terminal.observe_clock(data, monotonic())
                 profile = data.get("activeProfileId")
                 if (data.get("command") in {"GET_PROFILE", "GET_PROFILE_V2"} and data.get("ok") is True
                         and type(profile) is int and 0 <= profile <= 3
@@ -975,9 +1020,10 @@ class SerialReader:
                             "IDLE", "PREPARING", "COMMITTING", "VERIFYING", "COMPLETED", "ROLLING_BACK", "FAILED",
                         } else None,
                     }
-            routine = {"FENCE_POINT", "GET_PROFILE", "GET_PROFILE_V2", "GET_METRIC_CLOCK_V1"}
-            if (not data.get("ok") or data.get("command") not in routine or self.terminal_detail
-                    or (not getattr(self.config, "windows_base", False) and data.get("command") != "FENCE_POINT")):
+            routine = {"FENCE_POINT", "GET_PROFILE", "GET_PROFILE_V2"}
+            if self.terminal_detail or (not metric_response and (
+                    not data.get("ok") or data.get("command") not in routine
+                    or (not integrated and data.get("command") != "FENCE_POINT"))):
                 log = logger.info if data.get("ok") else logger.warning
                 response = "ACEITO" if data.get("ok") else "RECUSADO"
                 origin = "GATEWAY RESPONDEU" if matched else "RESPOSTA DO GATEWAY RECEBIDA"
@@ -988,7 +1034,8 @@ class SerialReader:
                 if detail is not None:
                     rows.append(f"Detalhe: {detail}")
                 if self.terminal_detail:
-                    rows.append(f"Request ID: {base_value(gateway_log_field('requestId', request_id))}")
+                    rows.append(f"Request ID: {base_value(gateway_log_field('requestId', request_id))} | "
+                                f"Geracao Serial: {self.serial_generation}")
                 log("%s", base_block("USB / GATEWAY | COMANDO", *rows, collar_id=data.get("collarId"),
                                      critical=not data.get("ok")))
             return True
@@ -1088,9 +1135,13 @@ class SerialReader:
     async def _persist_pdr_summary(self, gateway_id: str, summary: PdrSummary, connection=None, *,
                                    received_at: datetime | None = None) -> bool:
         result = await asyncio.to_thread(self.database.save_pdr_summary, gateway_id, summary)
-        log = logger.info if result in (MetricSaveResult.INSERTED, MetricSaveResult.DUPLICATE) else logger.warning
-        log("%s", base_pdr(summary, result.name, detail=self.terminal_detail))
         persisted = result in (MetricSaveResult.INSERTED, MetricSaveResult.DUPLICATE)
+        if not persisted or self.terminal_detail or (
+            result is MetricSaveResult.INSERTED and not self._metric_terminal.covers_pdr(
+                gateway_id, getattr(self.config, "metrics_installation_id", ""), summary)
+        ):
+            log = logger.info if persisted else logger.warning
+            log("%s", base_pdr(summary, result.name, detail=self.terminal_detail))
         if persisted and connection is not None:
             try:
                 await self._send_serial_commit_command(
@@ -1099,23 +1150,25 @@ class SerialReader:
                 )
             except OSError:
                 logger.warning("[BASE] PDR | ACK apos COMMIT nao escrito | Gateway pode reenviar")
-        if result is MetricSaveResult.INSERTED and received_at is not None:
+        if self.terminal_detail and result is MetricSaveResult.INSERTED and received_at is not None:
             logger.info("%s", fpga_metric_diagnostic(
                 summary, received_at, fpga_enabled=getattr(self.config, "fpga_enabled", False)))
         return persisted
 
-    async def _persist_metric_evidence(self, gateway_id, installation_id, summary, connection):
+    async def _persist_metric_evidence(self, gateway_id, installation_id, summary, connection, *, arrival_time):
         result = await asyncio.to_thread(self.database.save_metric_evidence, gateway_id, installation_id, summary)
         if result not in (MetricSaveResult.INSERTED, MetricSaveResult.DUPLICATE):
             logger.warning("[BASE] PDR comprovado COL %03d janela=%s SQLite=%s",
                            summary.collar_id, summary.window_id, result.name)
             return False
+        arrival = self._metric_terminal.remember_proof(
+            gateway_id, installation_id, summary, inserted=result is MetricSaveResult.INSERTED,
+            arrival_time=arrival_time,
+        )
         if result is MetricSaveResult.INSERTED:
-            logger.info("[BASE] PDR comprovado COL %03d janela=%s perfil=P%d TX=%d RX=%d PDRx100=%s "
-                        "RADIO[n=%d RSSIx100=%s SNRx100=%s] HDOP[n=%d x100=%s] SQLite=COMMIT",
-                        summary.collar_id, summary.window_id, summary.profile_id, summary.transmitted,
-                        summary.received, summary.pdr, summary.radio_count, summary.rssi, summary.snr,
-                        summary.hdop_count, summary.hdop)
+            terminal_emit(logger, metric_window_block, summary, arrival)
+        if self.terminal_detail:
+            terminal_emit(logger, evidence_block, summary, result.name)
         if connection is not None:
             try:
                 await self._send_serial_commit_command(
@@ -1126,9 +1179,10 @@ class SerialReader:
             except OSError:
                 logger.warning("[BASE] PDR comprovado | confirmacao Serial pendente apos COMMIT")
             else:
-                if self.terminal_detail or result is MetricSaveResult.INSERTED:
-                    logger.info("[BASE] EVIDENCE_COMMITTED | COL %03d sessão=%s janela=%s | ESCRITO NA SERIAL",
-                                summary.collar_id, summary.gateway_session_id, summary.window_id)
+                if self.terminal_detail:
+                    terminal_emit(logger, base_block, "ACK | EVIDENCE_COMMITTED",
+                                  f"Sessao: {summary.gateway_session_id} | Janela: {summary.window_id}",
+                                  "Escrita Serial: CONCLUIDA", collar_id=summary.collar_id)
         if result is MetricSaveResult.INSERTED:
             await self.hub.broadcast({"type": "metric_window", "data": {
                 "collar_id": summary.collar_id, "window_id": summary.window_id, "source": "proven",
@@ -1138,8 +1192,14 @@ class SerialReader:
     async def _persist_metric_summary(self, summary: MetricSummary, connection=None, *,
                                       received_at: datetime | None = None) -> bool:
         result = await asyncio.to_thread(self.database.save_metric_summary, summary)
-        log = logger.info if result in (MetricSaveResult.INSERTED, MetricSaveResult.DUPLICATE) else logger.warning
-        log("%s", base_metric(summary, result.name, detail=self.terminal_detail))
+        successful = result in (MetricSaveResult.INSERTED, MetricSaveResult.DUPLICATE)
+        if not successful or self.terminal_detail or (
+            result is MetricSaveResult.INSERTED and not self._metric_terminal.covers_summary(
+                getattr(self.config, "metrics_gateway_id", ""), getattr(self.config, "metrics_installation_id", ""), summary,
+            )
+        ):
+            log = logger.info if successful else logger.warning
+            log("%s", base_metric(summary, result.name, detail=self.terminal_detail))
         if result not in (MetricSaveResult.INSERTED, MetricSaveResult.DUPLICATE):
             return False
         queue = self._metric_acks
@@ -1160,7 +1220,7 @@ class SerialReader:
                         f"AVISO | ACK {summary.kind}", "Estado: ACK NAO ENFILEIRADO",
                         f"Motivo: FILA CHEIA | Recusados: {self._refused_metric_acks}", collar_id=summary.collar_id,
                     ))
-        if result is MetricSaveResult.INSERTED and received_at is not None:
+        if self.terminal_detail and result is MetricSaveResult.INSERTED and received_at is not None:
             logger.info("%s", fpga_metric_diagnostic(
                 summary, received_at, fpga_enabled=getattr(self.config, "fpga_enabled", False)))
         return True
@@ -1215,10 +1275,12 @@ class SerialReader:
                 raise
             if self._serial_needs_separator is connection:
                 self._serial_needs_separator = None
-        rows = ["Escrita Serial: CONCLUIDA"]
         if self.terminal_detail:
-            rows.append(f"Request ID: {message['requestId']} | Sessao: {summary.session_id} | Janela: {summary.window_id}")
-        logger.info("%s", base_block(f"ACK | {summary.kind}", *rows, collar_id=summary.collar_id))
+            logger.info("%s", base_block(
+                f"ACK | {summary.kind}", "Escrita Serial: CONCLUIDA",
+                f"Request ID: {message['requestId']} | Sessao: {summary.session_id} | Janela: {summary.window_id}",
+                collar_id=summary.collar_id,
+            ))
 
     @staticmethod
     def _write_metric_ack_line(connection, line: bytes) -> None:
@@ -1300,6 +1362,22 @@ class SerialReader:
         message = {"schema": GATEWAY_SERIAL_SCHEMA, "requestId": await self.next_request_id(),
                    "command": command, **fields}
         line = b"[CMD] " + json.dumps(message, separators=(",", ":")).encode("ascii") + b"\n"
+        generation = self.serial_generation
+        try:
+            await self._write_serial_commit(connection, line)
+        except OSError:
+            self._command_write_log(message, len(line), generation, "FALHOU")
+            raise
+        self._command_write_log(message, len(line), generation, "CONCLUIDA")
+
+    def _command_write_log(self, message, size, generation, outcome):
+        if self.terminal_detail:
+            terminal_emit(logger, base_block, "USB / GATEWAY | ENVIO CMD",
+                          f"Comando: {base_value(gateway_log_field('command', message['command']))} | "
+                          f"Request ID: {message['requestId']}",
+                          f"Bytes CMD: {size} | Geracao Serial: {generation}", f"Escrita local: {outcome}")
+
+    async def _write_serial_commit(self, connection, line: bytes) -> None:
         async with self._write_lock:
             if (connection is None or connection is not self._connection or not getattr(connection, "is_open", True)
                     or (getattr(self.config, "windows_base", False)
@@ -1413,12 +1491,25 @@ class SerialReader:
         self._pending_commands[request_id] = future
         try:
             payload = json.dumps(message, separators=(",", ":"), ensure_ascii=True)
-            if _verify:
-                await self.send_command(f"[CMD] {payload}", _verify=True)
-            else:
-                await self.send_command(f"[CMD] {payload}")
-            response = await asyncio.wait_for(future, timeout=timeout_seconds)
-            return response
+            line = f"[CMD] {payload}"
+            generation = self.serial_generation
+            try:
+                if _verify:
+                    await self.send_command(line, _verify=True)
+                else:
+                    await self.send_command(line)
+            except OSError:
+                self._command_write_log(message, len(line) + 1, generation, "FALHOU")
+                raise
+            self._command_write_log(message, len(line) + 1, self.serial_generation, "CONCLUIDA")
+            try:
+                return await asyncio.wait_for(future, timeout=timeout_seconds)
+            except TimeoutError:
+                if self.terminal_detail:
+                    terminal_emit(logger, base_block, "USB / GATEWAY | RESPOSTA AUSENTE",
+                                  f"Comando: {base_value(gateway_log_field('command', command))} | Request ID: {request_id}",
+                                  f"Geracao Serial: {generation} | Motivo: PRAZO DA RESPOSTA EXPIRADO")
+                raise
         finally:
             self._pending_commands.pop(request_id, None)
             if not future.done():

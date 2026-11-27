@@ -8,9 +8,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.database import Database
 from app.fpga_service import FpgaService, GatewayClock, NetworkWindow
 from app.fpga_window import FpgaSample
 from app.jtag_atlantic import IsolatedJtagAtlantic, JtagAtlantic, JtagOwnerAlive, parse_result, sample_command
+from app.metric_evidence import MetricEvidence
 from app.serial_reader import SerialReader
 
 
@@ -109,13 +111,36 @@ async def test_reconcile_discards_old_result_and_confirms_ack():
     assert not instance.link.steps
 
 
-async def test_ack_timeout_leaves_received_result_unconfirmed():
+async def test_ack_timeout_leaves_received_result_unconfirmed(caplog):
     instance = service([("ACK", TimeoutError("no response"))])
-    with pytest.raises(TimeoutError):
+    with caplog.at_level("INFO"), pytest.raises(TimeoutError):
         await instance.finish("VFENCE|P0|2|0", 1, "window")
     status = instance.snapshot()
     assert status["last_tx"]["line"] == "ACK"
     assert status["result"]["ack"] is False
+    assert "OK|ACK NAO CONFIRMADO" in caplog.text
+    assert "ACK FPGA: CONFIRMADO" not in caplog.text
+
+
+async def test_fpga_detailed_mode_keeps_wire_and_reports_unexpected_sample_response(caplog):
+    command = "SAMPLE 1 2 10000 969 45 0 9 7"
+    instance = service([(command, "ERR|INVALID_SAMPLE")])
+    instance.config.terminal_detail = True
+    with caplog.at_level("INFO"), pytest.raises(ValueError, match="resposta inesperada"):
+        await instance.command(command, {"OK|SAMPLE"})
+    assert f"[FPGA] TX {command}" in caplog.text
+    assert "[FPGA] RX ERR|INVALID_SAMPLE" in caplog.text
+    assert "AMOSTRA ACEITA" not in caplog.text
+    assert instance.snapshot()["last_rx"]["line"] == "ERR|INVALID_SAMPLE"
+
+
+async def test_fpga_tie_is_explained_without_claiming_profile_application(caplog):
+    instance = service([("ACK", "OK|ACK")])
+    with caplog.at_level("INFO"):
+        await instance.finish("VFENCE|P1|5|0", 1, "window")
+    assert "Motivo: EMPATE" in caplog.text and "Perfil recomendado: P1" in caplog.text
+    assert "ACK FPGA: CONFIRMADO" in caplog.text
+    assert "PERFIL APLICADO" not in caplog.text and not instance.link.steps
 
 
 async def test_windows_fpga_result_is_committed_before_ack_and_recovered_once(tmp_path):
@@ -178,8 +203,8 @@ async def test_fpga_retries_initial_open_failure_and_requires_pong(caplog):
     assert caplog.text.index("open: -5") < caplog.text.index("PONG CONFIRMADO")
 
 
-@pytest.mark.parametrize("mode", ["empty", "critical", "normal", "late", "legacy_estimate"])
-async def test_evaluation_sends_persisted_pdr_and_finishes(mode, monkeypatch):
+@pytest.mark.parametrize("mode", ["empty", "critical", "normal", "mask7", "late", "legacy_estimate"])
+async def test_evaluation_sends_persisted_pdr_and_finishes(mode, monkeypatch, caplog):
     import app.fpga_service as worker
 
     clock = time.monotonic()
@@ -188,7 +213,7 @@ async def test_evaluation_sends_persisted_pdr_and_finishes(mode, monkeypatch):
     report = {"gatewaySessionId": "gateway", "activeProfileId": 1, "operationId": 0, "state": "IDLE"}
     steps = [("BEGIN 1", "OK|BEGIN")]
     expected_result = {"critical": "VFENCE|P1|3|1", "empty": "VFENCE|P1|4|0",
-                       "normal": "VFENCE|P0|2|0", "late": "VFENCE|P1|4|0",
+                       "normal": "VFENCE|P0|2|0", "mask7": "VFENCE|P1|4|0", "late": "VFENCE|P1|4|0",
                        "legacy_estimate": "VFENCE|P1|4|0"}[mode]
     if mode == "critical":
         steps.extend([("SAMPLE 1 0 4000 0 0 0 0 4", "OK|SAMPLE"),
@@ -197,6 +222,8 @@ async def test_evaluation_sends_persisted_pdr_and_finishes(mode, monkeypatch):
         if mode == "normal":
             steps.extend((f"SAMPLE 1 {minute} 10000 -500 105 100 5 15", "OK|SAMPLE")
                          for minute in range(3))
+        if mode == "mask7":
+            steps.append(("SAMPLE 1 0 10000 -500 105 0 5 7", "OK|SAMPLE"))
         steps.extend([("PING", "PONG"), ("CLOSE", expected_result)])
     steps.append(("ACK", "OK|ACK"))
     instance = service(steps)
@@ -216,7 +243,7 @@ async def test_evaluation_sends_persisted_pdr_and_finishes(mode, monkeypatch):
                 estimated_tx_count=5 if mode == "critical" else 2,
                 estimated_lost_count=3 if mode == "critical" else 0, reason="ok",
                 persisted_at=(utc + timedelta(seconds=(minute + 1) * 60 + 1)).isoformat(),
-            ) for minute in range({"late": 1, "critical": 2, "normal": 3, "legacy_estimate": 3}[mode])]
+            ) for minute in range({"late": 1, "critical": 2, "normal": 3, "mask7": 1, "legacy_estimate": 3}[mode])]
         fields = dict(collar_id=1, duration_ms=60000, hdop_mean_x100=None, rssi_mean_x100=None,
                       snr_mean_x100=None, hdop_mean_valid=None, rssi_mean_valid=None, snr_mean_valid=None,
                       gateway_session_id=None, gateway_received_at_ms=None)
@@ -225,7 +252,7 @@ async def test_evaluation_sends_persisted_pdr_and_finishes(mode, monkeypatch):
             started_at_ms=row["started_at_ms"], sample_count=5, rssi_mean_x100=-10500, snr_mean_x100=-500,
             rssi_mean_valid=True, snr_mean_valid=True,
             persisted_at=row["persisted_at"],
-        ) for row in rows] if mode == "normal" else []
+        ) for row in rows] if mode in {"normal", "mask7"} else []
         hdop = [dict(
             fields, kind="HDOP", producer_id="site", session_id="collar", window_id=row["window_id"],
             started_at_ms=row["started_at_ms"], sample_count=10, hdop_mean_x100=100, hdop_mean_valid=True,
@@ -247,10 +274,17 @@ async def test_evaluation_sends_persisted_pdr_and_finishes(mode, monkeypatch):
     instance.records = records
     instance.pause = pause
     clocks = {"gateway": GatewayClock(0, utc, utc + timedelta(minutes=15), timedelta(0))}
-    await instance.evaluate([1], {"gateway/collar": 0}, report, clocks, require_proven=mode == "legacy_estimate")
+    with caplog.at_level("INFO"):
+        await instance.evaluate([1], {"gateway/collar": 0}, report, clocks, require_proven=mode == "legacy_estimate")
     assert instance.snapshot()["result"]["ack"] is True
     assert instance.snapshot()["result"]["critical"] is (mode == "critical")
     assert not instance.link.steps
+    assert "ACK FPGA: CONFIRMADO" in caplog.text and "[FPGA] TX" not in caplog.text
+    if mode == "normal":
+        assert "Mascara: 1111 (15)" in caplog.text and "Motivo: REDUCAO DE PERFIL" in caplog.text
+    elif mode == "mask7":
+        assert "Mascara: 0111 (7)" in caplog.text and "Motivo: HDOP INDISPONIVEL" in caplog.text
+        assert "Nios II: AMOSTRA ACEITA" in caplog.text and "Voto individual no RTL: NAO CONFIRMADO" in caplog.text
 
 
 async def test_release_closes_com_before_reporting_and_reconnects(monkeypatch):
@@ -346,6 +380,94 @@ async def test_discards_result_when_its_inputs_are_no_longer_usable(change, monk
     assert instance.snapshot()["window"] == "discarded"
     assert instance.snapshot()["result"] is None
     assert not instance.link.steps
+
+
+@pytest.mark.parametrize("scenario,minutes,recovered", [
+    ("transient", [0, 1, 2], False),
+    ("unavailable", [0, 1], True),
+    ("final_probe", [0, 1, 2], True),
+    ("late", [0, 1], False),
+    ("session", [0, 1], True),
+    ("profile", [0, 1], True),
+    ("generation", [0, 1], True),
+    ("operation", [0, 1], True),
+    ("state", [0, 1], True),
+])
+async def test_gateway_confirmation_during_evaluation(scenario, minutes, recovered, monkeypatch, caplog):
+    import app.fpga_service as worker
+
+    db = Database("sqlite:///:memory:")
+    db.initialize()
+    reader = SimpleNamespace(serial_generation=1)
+    config = SimpleNamespace(windows_base=True, metrics_gateway_id="gw", metrics_installation_id="site")
+    instance = FpgaService(config, db, reader)
+    network = NetworkWindow("gateway", 50, 0, time.monotonic(), 0)
+    original = dict(gatewaySessionId="gateway", activeProfileId=0, operationId=0, state="IDLE")
+    elapsed = 0
+    written = 0
+    samples = []
+    commands = []
+    window_ids = set()
+    changes = {"session": ("gatewaySessionId", "another"), "profile": ("activeProfileId", 1),
+               "operation": ("operationId", 1), "state": ("state", "PREPARING")}
+
+    async def gateway():
+        nonlocal written
+        arrival = (62, 122, 316 if scenario == "late" else 182)
+        while written < 3 and elapsed >= arrival[written]:
+            proof = MetricEvidence(1, "gateway", "collar", f"{50 + written:016x}", written * 60000,
+                                   0, 10, 12, 2, 10000, 2, -9400, 600, 2, 110)
+            await asyncio.to_thread(db.save_metric_evidence, "gw", "site", proof)
+            written += 1
+        if elapsed >= 182:
+            if scenario == "generation":
+                reader.serial_generation = 2
+                return None
+            if scenario in changes:
+                field, value = changes[scenario]
+                return {**original, field: value}
+            if (scenario == "unavailable" or (scenario == "transient" and elapsed < 191)
+                    or (scenario == "final_probe" and elapsed >= 315)):
+                return None
+        return original
+
+    async def pause(seconds):
+        nonlocal elapsed
+        elapsed += seconds
+
+    async def clock(_session):
+        return network
+
+    async def command(line, expected, **_):
+        commands.append(line)
+        if line.startswith("SAMPLE "):
+            assert elapsed < 315 and not (scenario == "transient" and 182 <= elapsed < 191)
+            assert line.endswith(" 2 15")
+            samples.append(int(line.split()[2]))
+            window_ids.add(instance.status["window_id"])
+            return "OK|SAMPLE"
+        if line == "ACK":
+            with db.connect() as con:
+                result, ack = con.execute("SELECT result_json, acknowledged FROM windows_fpga_results").fetchone()
+            assert ack == 0 and bool(json.loads(result).get("recovered")) is recovered
+        if line == "RESULT":
+            return "ERR|NO_RESULT"
+        return {"BEGIN 0": "OK|BEGIN", "PING": "PONG", "CLOSE": "VFENCE|P0|4|0", "ACK": "OK|ACK"}[line]
+
+    monkeypatch.setattr(worker, "time", SimpleNamespace(monotonic=lambda: network.projected_start + elapsed))
+    instance.gateway, instance.pause, instance.network_window, instance.command = gateway, pause, clock, command
+    with caplog.at_level("INFO"):
+        await instance.evaluate([1], {}, original, network=network, require_proven=True)
+    assert samples == minutes and window_ids == {instance.status["window_id"]}
+    assert commands.count("BEGIN 0") == commands.count("CLOSE") == commands.count("ACK") == 1
+    assert instance.status["window"] == ("discarded" if recovered else "confirmed")
+    if scenario in ("transient", "unavailable"):
+        assert caplog.text.count("AGUARDANDO CONFIRMACAO DO GATEWAY") == 1
+        assert ("VOTACAO RETOMADA" in caplog.text) is (scenario == "transient")
+    if scenario in changes or scenario == "generation":
+        assert "JANELA DESCARTADA" in caplog.text and "AGUARDANDO CONFIRMACAO DO GATEWAY" not in caplog.text
+    if scenario in ("unavailable", "final_probe"):
+        assert elapsed == 315 and "ENCERRADA SEM CONFIRMACAO" in caplog.text
 
 
 def test_gateway_clock_checks_wrap_and_uncertainty():

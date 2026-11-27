@@ -20,6 +20,129 @@ from test_metric_summaries import FakeByteConnection, RecordingHub
 
 
 @pytest.fixture
+def evidence_commit_host(tmp_path):
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    use_wsl = os.getenv("VFENCE_TEST_WSL") == "1"
+    if not compiler and not use_wsl:
+        pytest.skip("requires host C++ compiler or VFENCE_TEST_WSL=1 with Ubuntu and g++")
+
+    def host_path(path):
+        if use_wsl:
+            return subprocess.check_output(["wsl.exe", "-d", "Ubuntu", "--exec", "wslpath", "-a", str(path)],
+                                           text=True).strip()
+        return str(path)
+
+    root = Path(__file__).resolve().parents[1]
+    gateway = root / "gateway/VFenceGateway"
+    sketch = (gateway / "VFenceGateway.ino").read_text(encoding="utf-8")
+    schema = next(line for line in sketch.splitlines() if line.startswith("static const char* SERIAL_SCHEMA = "))
+    lookup = sketch[sketch.index("static bool metricWindowFor"):sketch.index("static bool handleEvidenceControl")]
+    dispatch = sketch[sketch.index("void processJsonCommand"):sketch.index("  if (processProfileTransition(json, command")]
+    # Keep the production checks and state updates, using std::string in place of Arduino String.
+    dispatch = (dispatch[:dispatch.index('  if (command == "METRIC_COMMITTED")')]
+                + dispatch[dispatch.index('  if (!json.stringField("schema"'):dispatch.index('  if (command == "ENABLE_EVENT_COMMIT")')]
+                + dispatch[dispatch.index('  if (command == "EVIDENCE_COMMITTED")'):]
+                + "}\n")
+    dispatch = dispatch.replace("const String", "const std::string").replace(
+        "line.substring(commandOffset, commandOffset + length)", "line.substr(commandOffset, length)")
+    (tmp_path / "evidence_dispatch.inc").write_text(schema + "\n" + lookup + dispatch, encoding="utf-8")
+    prefix = ["wsl.exe", "-d", "Ubuntu", "--exec"] if use_wsl else []
+    exe = tmp_path / ("evidence_commit" if use_wsl else "evidence_commit.exe")
+    subprocess.run([*prefix, "g++" if use_wsl else compiler, "-std=c++11", "-Wall", "-Wextra", "-Werror",
+                    "-I", host_path(gateway), "-I", host_path(tmp_path),
+                    host_path(root / "tests/cpp/test_evidence_commit_flow.cpp"),
+                    host_path(gateway / "vfence_protocol.cpp"), "-o", host_path(exe)], check=True, timeout=45)
+    with subprocess.Popen([*prefix, host_path(exe)], stdin=subprocess.PIPE, stdout=subprocess.PIPE) as process:
+        try:
+            yield process
+        finally:
+            if process.poll() is None:
+                process.kill()
+
+
+async def test_five_firmware_proofs_commit_and_advance_fpga(evidence_commit_host, tmp_path, monkeypatch):
+    import app.fpga_service as worker
+
+    process = evidence_commit_host
+    output = tmp_path / "five-proofs.db"
+    url = f"sqlite:///{output}"
+    db = Database(url)
+    db.initialize()
+    config = SimpleNamespace(mock_serial=False, serial_port="test", windows_base=True,
+                             central_sync_enabled=False, metrics_serial_ack_enabled=True,
+                             metrics_gateway_id="gw", metrics_installation_id="site")
+    reader = SerialReader(config, db, RecordingHub())
+    reader._connection = FakeByteConnection()
+    reader._connection.write_timeout = None
+    service = FpgaService(config, db, reader)
+    now = start = time.monotonic()
+    session = "0000000000001234"
+    report = dict(gatewaySessionId=session, activeProfileId=0, operationId=0, state="IDLE")
+    network = NetworkWindow(session, 9, 160000, start, 0.01)
+    count = 0
+    commands = []
+
+    async def read():
+        return await asyncio.wait_for(asyncio.to_thread(process.stdout.readline), 10)
+
+    def deliver(wire):
+        process.stdin.write(wire)
+        process.stdin.flush()
+
+    async def gateway():
+        nonlocal count
+        if count == 5 or now < start + (count + 1) * 60 + 1:
+            return report
+        frame = await read()
+        assert await reader.process_line(frame)
+        ack = reader._connection.writes[-1]
+        data = json.loads(ack[6:])
+        assert data["command"] == "EVIDENCE_COMMITTED" and len(Database(url).proven_windows(1, 10)) == count + 1
+        if not count:
+            for field, bad in {"gatewaySessionId": "0000000000000001", "collarSessionId": "0000000000000002",
+                               "windowId": "0000000000000008", "collarId": 2}.items():
+                deliver(b"[CMD] " + json.dumps({**data, field: bad}, separators=(",", ":")).encode() + b"\n")
+                assert await read() == b"REJECTED\n"
+            assert not await reader.process_line(frame.replace(b'"hdopX100":101', b'"hdopX100":102'))
+            assert reader._connection.writes == [ack]
+            repeated = await read()
+            assert repeated == frame and await reader.process_line(repeated)
+            duplicate = reader._connection.writes[-1]
+            resent = json.loads(duplicate[6:])
+            assert resent == {**data, "requestId": data["requestId"] + 1}
+            ack = duplicate
+        deliver(ack)
+        assert await read() == f"CONSUMED {9 + count}\n".encode()
+        count += 1
+        return report
+
+    async def clock_probe(_session):
+        return network
+
+    async def pause(seconds):
+        nonlocal now
+        now += seconds
+
+    async def jtag(line, expected, **_):
+        commands.append(line)
+        if line.startswith("SAMPLE "):
+            assert line.split()[2] == str(count - 1) and line.endswith(" 2 15")
+            return "OK|SAMPLE"
+        if line == "ACK":
+            with Database(url).connect() as con:
+                assert con.execute("SELECT acknowledged FROM windows_fpga_results").fetchone()[0] == 0
+        return {"BEGIN 0": "OK|BEGIN", "PING": "PONG", "CLOSE": "VFENCE|P0|0|0", "ACK": "OK|ACK"}[line]
+
+    monkeypatch.setattr(worker, "time", SimpleNamespace(monotonic=lambda: now))
+    service.gateway, service.network_window, service.pause, service.command = gateway, clock_probe, pause, jtag
+    await service.evaluate([1], {}, report, network=network, require_proven=True)
+    assert await asyncio.to_thread(process.wait, 5) == 0
+    assert count == 5 and len(reader._connection.writes) == 6
+    assert len([line for line in commands if line.startswith("SAMPLE ")]) == 5
+    assert commands[-2:] == ["CLOSE", "ACK"] and service.status["result"]["ack"]
+
+
+@pytest.fixture
 def firmware_frame(tmp_path):
     captured = os.getenv("VFENCE_WSL_EVIDENCE")
     if captured is not None:
