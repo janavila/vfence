@@ -12,6 +12,7 @@ from enum import Enum
 from functools import partial
 from heapq import heapify
 from itertools import count, cycle
+from pathlib import Path
 from io import BytesIO
 from time import monotonic
 
@@ -26,6 +27,7 @@ from app.metric_protocol import (
     parse_metric_summary,
 )
 from app.models import GatewayState
+from app.packet_journal import PacketJournal
 from app.pdr_protocol import PDR_COMMIT_SCHEMA, PDR_KIND, PDR_SCHEMA, PdrSummary, parse_pdr_summary
 from app.protocol import ParsedPacket, ProtocolError, parse_message
 from app.terminal import (
@@ -122,7 +124,7 @@ class _SerialWorkQueue(asyncio.PriorityQueue[_WorkItem]):
 
 GATEWAY_APP_KINDS = {
     "telemetry", "event", "control", "collar_state", "collar_status",
-    "gateway_state", "radio_config", "command_response", "fence_transfer",
+    "gateway_state", "radio_config", "command_response", "fence_transfer", "packet_log",
 }
 
 MOCK_MESSAGES = (
@@ -191,6 +193,7 @@ class SerialReader:
         self._metric_acks: asyncio.Queue[tuple[object, MetricSummary]] | None = None
         self._refused_metric_acks = 0
         self._serial_needs_separator = None
+        self._packet_journal: PacketJournal | None = None
 
     async def run(self):
         if self.config.mock_serial:
@@ -214,13 +217,21 @@ class SerialReader:
                 self._write_metric_acks(self._metric_acks), name="vfence-serial-metric-acks",
             )
         try:
+            if getattr(self.config, "windows_base", False):
+                try:
+                    self._packet_journal = PacketJournal(Path(__file__).resolve().parents[1] / "logs")
+                except (OSError, RuntimeError, ValueError) as exc:
+                    logger.warning("[JOURNAL] Nao foi possivel iniciar (%s). Base continua operacional.",
+                                   type(exc).__name__)
             await self._run_serial()
         finally:
+            journal, self._packet_journal = self._packet_journal, None
             self._work_queue = None
             self._metric_acks = None
             cleanup = asyncio.gather(
                 self._finish_work(queue, worker),
                 self._finish_metric_acks(ack_writer),
+                *([asyncio.to_thread(journal.close)] if journal is not None else []),
             )
             cancelled = False
             while not cleanup.done():
@@ -694,6 +705,12 @@ class SerialReader:
                 # at an idle read can still be a short write awaiting resync.
                 if at_timeout and "schema" in app_packet:
                     return _LineResult.UNRECOGNIZED
+                # Journal is observational only: never emit a terminal row,
+                # update collar state, acknowledge, or enter the FPGA/DB queues.
+                if app_packet["kind"] == "packet_log":
+                    if self._packet_journal is not None:
+                        self._packet_journal.submit(app_packet)
+                    return _LineResult.ACCEPTED
                 if self.terminal_detail and getattr(self.config, "windows_base", False):
                     terminal_emit(logger, app_raw, text)
                 if "deliveryId" in app_packet or "deliveryVersion" in app_packet:
@@ -895,6 +912,10 @@ class SerialReader:
             raise ValueError("schema [APP] não suportado")
         else:
             kind = data.get("kind")
+        if kind == "packet_log" and (schema != GATEWAY_SERIAL_SCHEMA or len(pairs) != len(data)
+                or not wire.startswith(_APP_PREFIX) or not wire.endswith(b"\n")
+                or b"\r" in wire[:-1].removesuffix(b"\r") or b"\n" in wire[:-1]):
+            raise ValueError("invalid packet journal frame")
         if kind not in GATEWAY_APP_KINDS and kind != "offline":
             raise ValueError("kind [APP] desconhecido")
         data["kind"] = kind
