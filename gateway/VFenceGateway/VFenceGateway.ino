@@ -290,6 +290,135 @@ const char* eventName(uint8_t subtype) {
   return "UNKNOWN_EVENT";
 }
 
+static const char* packetTypeName(MessageType type) {
+  switch (type) {
+    case MessageType::CONFIG: return "CONFIG";
+    case MessageType::EVENT: return "EVENT";
+    case MessageType::TELEMETRY: return "TELEMETRY";
+    case MessageType::CONTROL: return "CONTROL";
+  }
+  return "UNKNOWN";
+}
+
+static const char* profileStepLogName(ProfileStep step) {
+  switch (step) {
+    case ProfileStep::PREPARE: return "PREPARE";
+    case ProfileStep::READY: return "READY";
+    case ProfileStep::ARM: return "ARM";
+    case ProfileStep::ARMED: return "ARMED";
+    case ProfileStep::POLL: return "POLL";
+    case ProfileStep::VERIFIED: return "VERIFIED";
+    case ProfileStep::RECOVER: return "RECOVER";
+    case ProfileStep::RESTORED: return "RESTORED";
+  }
+  return "UNKNOWN";
+}
+
+static const char* packetSubtypeName(const PacketView& packet) {
+  if (!packet.payload || packet.payloadLength < 1) return "NONE";
+  const uint8_t subtype = packet.payload[0];
+  switch (packet.header.type) {
+    case MessageType::CONFIG:
+      switch (static_cast<ConfigSubtype>(subtype)) {
+        case ConfigSubtype::FENCE_BEGIN: return "FENCE_BEGIN";
+        case ConfigSubtype::FENCE_CHUNK: return "FENCE_CHUNK";
+        case ConfigSubtype::FENCE_COMMIT: return "FENCE_COMMIT";
+        case ConfigSubtype::PARAMETERS: return "PARAMETERS";
+      }
+      break;
+    case MessageType::EVENT:
+      return eventName(subtype);
+    case MessageType::TELEMETRY:
+      if (subtype == static_cast<uint8_t>(TelemetrySubtype::POSITION_STATUS)) return "POSITION_STATUS";
+      if (subtype == static_cast<uint8_t>(TelemetrySubtype::HDOP_WINDOW_SUMMARY)) return "HDOP_WINDOW_SUMMARY";
+      if (subtype == POSITION_STATUS_COUNTED) return "POSITION_STATUS_COUNTED";
+      break;
+    case MessageType::CONTROL:
+      if (subtype == static_cast<uint8_t>(ControlSubtype::ACK)) return "ACK";
+      if (subtype == static_cast<uint8_t>(ControlSubtype::NACK)) return "NACK";
+      if (subtype == static_cast<uint8_t>(ControlSubtype::PING)) return "PING";
+      if (subtype == static_cast<uint8_t>(ControlSubtype::PONG)) return "PONG";
+      if (subtype == PROFILE_CONTROL) return "PROFILE_CONTROL";
+      if (subtype == METRIC_CLOCK) return "METRIC_CLOCK";
+      if (subtype == METRIC_PROOF) return "METRIC_PROOF";
+      if (subtype == METRIC_UPLINK) return "METRIC_UPLINK";
+      break;
+  }
+  return "UNKNOWN";
+}
+
+static uint32_t packetLogDrops = 0;
+
+static void emitPacketLog(const char* direction, const uint8_t* data, size_t len,
+                          uint32_t gatewayMs, bool hasRadioMetrics = false,
+                          int rssi = 0, float snr = 0.0f, bool txOk = true,
+                          size_t txBytesWritten = 0) {
+  if (!PACKET_SERIAL_LOG_ENABLED || !data || !len) return;
+
+  PacketView packet{};
+  const bool valid = decodePacket(data, len, packet);
+  const uint32_t refusalsBefore = framedSerial.operationalRefusals();
+
+  emitAppHeader("packet_log");
+  gatewayOutput.printf(",\"gatewaySessionId\":\"%016llx\",\"gatewayMs\":%lu,"
+                       "\"direction\":\"%s\",\"profileId\":%u,\"length\":%u,\"valid\":%s",
+                       static_cast<unsigned long long>(radioSessionId),
+                       static_cast<unsigned long>(gatewayMs), direction,
+                       unsigned(radioTransition.active), unsigned(len), valid ? "true" : "false");
+
+  if (direction[0] == 'T') {
+    gatewayOutput.printf(",\"txOk\":%s,\"txBytesWritten\":%u", txOk ? "true" : "false",
+                         unsigned(txBytesWritten));
+  } else if (hasRadioMetrics) {
+    gatewayOutput.printf(",\"rssiDbm\":%d,\"snrDb\":%.2f", rssi,
+                         static_cast<double>(snr));
+  }
+
+  if (valid) {
+    const uint8_t subtype = packet.payloadLength ? packet.payload[0] : 0;
+    gatewayOutput.printf(",\"version\":%u,\"type\":\"%s\",\"typeId\":%u,"
+                         "\"subtype\":\"%s\",\"subtypeId\":%u,\"collarId\":%u,"
+                         "\"sequence\":%u,\"ackReq\":%s,\"retry\":%s,\"urgent\":%s",
+                         unsigned(packet.header.version), packetTypeName(packet.header.type),
+                         unsigned(static_cast<uint8_t>(packet.header.type)), packetSubtypeName(packet),
+                         unsigned(subtype), unsigned(packet.header.collarId), unsigned(packet.header.sequence),
+                         packet.header.ackReq ? "true" : "false", packet.header.retry ? "true" : "false",
+                         packet.header.urgent ? "true" : "false");
+
+    if (packet.header.type == MessageType::TELEMETRY && subtype == POSITION_STATUS_COUNTED) {
+      PositionDeliveryTag tag{};
+      PacketView legacy{};
+      uint8_t payload[LEGACY_POSITION_PAYLOAD_SIZE];
+      if (unpackCountedPosition(packet, tag, legacy, payload)) {
+        gatewayOutput.printf(",\"collarSessionId\":\"%016llx\",\"positionOrdinal\":%lu,"
+                             "\"packetProfileId\":%u",
+                             static_cast<unsigned long long>(tag.sessionId),
+                             static_cast<unsigned long>(tag.ordinal), unsigned(tag.profileId));
+      }
+    }
+
+    if (packet.header.type == MessageType::CONTROL && subtype == PROFILE_CONTROL) {
+      ProfileSignal signal{};
+      if (decodeProfileSignal(packet, signal)) {
+        gatewayOutput.printf(",\"profileStep\":\"%s\",\"profileSource\":%u,"
+                             "\"profileTarget\":%u,\"profileOperationId\":%lu,"
+                             "\"profileWaitMs\":%u",
+                             profileStepLogName(signal.step), unsigned(signal.source), unsigned(signal.target),
+                             static_cast<unsigned long>(signal.operation), unsigned(signal.waitMs));
+      }
+    }
+  }
+
+  gatewayOutput.print(",\"rawHex\":\"");
+  for (size_t i = 0; i < len; ++i) {
+    if (data[i] < 0x10) gatewayOutput.print('0');
+    gatewayOutput.print(data[i], HEX);
+  }
+  gatewayOutput.println("\"}");
+
+  if (framedSerial.operationalRefusals() != refusalsBefore) ++packetLogDrops;
+}
+
 const char* errorName(ErrorCode code) {
   switch (code) {
     case ErrorCode::INVALID_LENGTH: return "INVALID_LENGTH";
@@ -395,6 +524,7 @@ bool transportSend(const uint8_t* data, size_t len) {
   LoRa.idle();
   if (LoRa.beginPacket() == 0) {
     LoRa.receive();
+    emitPacketLog("TX", data, len, millis(), false, 0, 0.0f, false, 0);
     return false;
   }
 
@@ -402,7 +532,9 @@ bool transportSend(const uint8_t* data, size_t len) {
   const int result = LoRa.endPacket();
   LoRa.receive();
 
-  return written == len && result == 1;
+  const bool ok = written == len && result == 1;
+  emitPacketLog("TX", data, len, millis(), false, 0, 0.0f, ok, written);
+  return ok;
 }
 
 // ============================================================
@@ -1289,7 +1421,7 @@ static void serviceMetricSerialExport() {
 
 static void serviceTerminalSummary(uint32_t now) {
   static uint32_t attemptedAt = 0;
-  static uint64_t reported[9]{};
+  static uint64_t reported[10]{};
   if (now - attemptedAt < 60000UL || !gatewayTerminalIdle()) return;
   attemptedAt = now;
   const auto& metrics = metricSerialExporter.counts;
@@ -1301,7 +1433,7 @@ static void serviceTerminalSummary(uint32_t now) {
   const uint64_t counts[] = {gatewayTerminal.omitted(), metrics.localRefusals, metrics.expiredTurns,
                              radioTerminalSkipped, hdopDroppedPending, radioDroppedSummaries,
                              metrics.overwrittenInFlight, framedSerial.operationalRefusals(),
-                             framedSerial.shortWrites()};
+                             framedSerial.shortWrites(), packetLogDrops};
   bool changed = false;
   for (size_t i = 0; i < sizeof(counts) / sizeof(counts[0]); ++i) {
     if (counts[i] != reported[i]) changed = true;
@@ -1309,12 +1441,12 @@ static void serviceTerminalSummary(uint32_t now) {
   if (!changed) return;
   if (gatewayTerminal.tryPrint(framedSerial,
         "[AVISO] [GATEWAY] logsOmitidos=%lu recusasUART=%llu expirados=%llu radioPuladas=%lu"
-        " hdopDesc=%llu radioDesc=%llu trocas=%llu appRecusados=%lu txParciais=%lu\n",
+        " hdopDesc=%llu radioDesc=%llu trocas=%llu appRecusados=%lu txParciais=%lu packetLogDesc=%lu\n",
         static_cast<unsigned long>(counts[0]), static_cast<unsigned long long>(counts[1]),
         static_cast<unsigned long long>(counts[2]), static_cast<unsigned long>(counts[3]),
         static_cast<unsigned long long>(counts[4]), static_cast<unsigned long long>(counts[5]),
         static_cast<unsigned long long>(counts[6]), static_cast<unsigned long>(counts[7]),
-        static_cast<unsigned long>(counts[8]))) {
+        static_cast<unsigned long>(counts[8]), static_cast<unsigned long>(counts[9]))) {
     memcpy(reported, counts, sizeof(counts));
   }
 }
@@ -1934,28 +2066,29 @@ void pollLoRaReceive() {
   const int packetSize = LoRa.parsePacket();
   if (packetSize <= 0) return;
 
-  uint8_t data[EVIDENCE_PACKET_MAX];
+  // SX1276 LoRa frames are at most 255 bytes. Capture the complete physical
+  // frame for the journal even when it is larger than a valid VFENCE frame.
+  uint8_t data[255];
   size_t count = 0;
-  const size_t maxSize = PROVEN_METRICS_ENABLED ? sizeof(data) : MAX_PACKET_SIZE;
-  bool oversized = packetSize > static_cast<int>(maxSize);
+  const size_t maxProtocolSize = PROVEN_METRICS_ENABLED ? EVIDENCE_PACKET_MAX : MAX_PACKET_SIZE;
+  const bool oversized = packetSize > static_cast<int>(maxProtocolSize);
 
   while (LoRa.available()) {
     const int b = LoRa.read();
-    if (count < maxSize && b >= 0) {
-      data[count++] = static_cast<uint8_t>(b);
-    }
+    if (count < sizeof(data) && b >= 0) data[count++] = static_cast<uint8_t>(b);
   }
 
   const int rssi = LoRa.packetRssi();
   const float snr = LoRa.packetSnr();
   const uint32_t receivedAtMs = millis();
 
+  emitPacketLog("RX", data, count, receivedAtMs, true, rssi, snr);
   if (oversized) {
-    gatewayTerminal.print(framedSerial, "[RX LoRa] pacote maior que MAX_PACKET_SIZE: %d\n", packetSize);
+    gatewayTerminal.print(framedSerial, "[RX LoRa] pacote maior que o limite VFENCE: %d\n", packetSize);
     return;
   }
 
-  // Atribuir pelo instante da leitura do radio, antes dos logs e do primeiro contato.
+  // Atribuir pelo instante da leitura do radio, antes dos demais logs e do primeiro contato.
   serviceRadioWindows(receivedAtMs);
 
   // Resumos novos so tem diagnostico opt-in. Logs dos pacotes anteriores seguem iguais.
@@ -2821,6 +2954,8 @@ void setup() {
 
   printRadioConfig();
   gatewayOutput.println("[INFO] USB Serial: 115200 baud");
+  gatewayOutput.printf("[INFO] Journal de pacotes Serial: %s\n", PACKET_SERIAL_LOG_ENABLED ? "HABILITADO" : "DESATIVADO");
+  gatewayOutput.printf("[INFO] Troca coordenada de perfil: %s\n", PROFILE_SWITCH_ENABLED ? "HABILITADA" : "DESATIVADA");
   gatewayOutput.printf("[INFO] Exportacao de medias: %s\n", !METRIC_SERIAL_EXPORT_ENABLED
                     ? "DESATIVADA" : metricSerialTxReady ? "HABILITADA" : "BUFFER TX INDISPONIVEL");
   if (PDR_SERIAL_EXPORT_ENABLED)

@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import argparse
+import csv
 import json
 import threading
 import time
 import unicodedata
+from datetime import datetime, timezone
+from pathlib import Path
 
 import serial
 
@@ -12,6 +15,42 @@ from app.terminal import RULE, collar_label, event_block, metric_block, position
 
 SCHEMA = "vfence.gateway.serial.v1"
 _MAX_SERIAL_LINE_BYTES = 4096
+
+_PACKET_CSV_FIELDS = (
+    "hostTimeUtc", "gatewaySessionId", "gatewayMs", "direction", "profileId", "length", "valid",
+    "version", "type", "typeId", "subtype", "subtypeId", "collarId", "sequence",
+    "ackReq", "retry", "urgent", "rssiDbm", "snrDb", "txOk", "txBytesWritten",
+    "collarSessionId", "positionOrdinal", "packetProfileId", "profileStep",
+    "profileSource", "profileTarget", "profileOperationId", "profileWaitMs", "rawHex",
+)
+
+
+class PacketJournal:
+    """Persist packet_log frames in loss-analysis-friendly JSONL and CSV files."""
+
+    def __init__(self, directory: str):
+        root = Path(directory).expanduser().resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        self.jsonl_path = root / f"vfence_packets_{stamp}.jsonl"
+        self.csv_path = root / f"vfence_packets_{stamp}.csv"
+        self._jsonl = self.jsonl_path.open("a", encoding="utf-8", buffering=1)
+        self._csv_file = self.csv_path.open("a", encoding="utf-8", newline="", buffering=1)
+        self._csv = csv.DictWriter(self._csv_file, fieldnames=_PACKET_CSV_FIELDS, extrasaction="ignore")
+        if self.csv_path.stat().st_size == 0:
+            self._csv.writeheader()
+
+    def write(self, packet: dict):
+        record = {"hostTimeUtc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"), **packet}
+        self._jsonl.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+        self._csv.writerow({field: record.get(field) for field in _PACKET_CSV_FIELDS})
+        self._jsonl.flush()
+        self._csv_file.flush()
+
+    def close(self):
+        self._jsonl.close()
+        self._csv_file.close()
+
 _SERIAL_RESYNC = b"\x00\n"
 _NORMAL_GATEWAY_LOG_PREFIXES = (
     "[ERRO", "[FATAL]", "[AVISO]", "[NACK LoRa]", "[RETRY LoRa]", "[ACK SQLITE]",
@@ -21,9 +60,14 @@ _NORMAL_GATEWAY_LOG_PREFIXES = (
 
 
 class VFenceSerialClient:
-    def __init__(self, port: str, baudrate: int = 115200, *, terminal_detail: bool = False):
+    def __init__(self, port: str, baudrate: int = 115200, *, terminal_detail: bool = False,
+                 packet_journal: PacketJournal | None = None):
         self.ser = serial.Serial(port, baudrate=baudrate, timeout=0.2, write_timeout=1.0)
         self.terminal_detail = terminal_detail
+        self.packet_journal = packet_journal
+        self._gateway_session_id = None
+        self._gateway_session_event = threading.Event()
+        self._profile_operation = 0
 
         try:
             self.ser.dtr = False
@@ -214,12 +258,63 @@ class VFenceSerialClient:
             print("TIMEOUT:", ", ".join(str(x) for x in failed))
 
     # -------------------------------------------------------------------------
+    # Troca coordenada de perfil
+    # -------------------------------------------------------------------------
+
+    def _ensure_gateway_session(self, timeout_s: float = 2.0):
+        if self._gateway_session_id:
+            return self._gateway_session_id
+        self._gateway_session_event.clear()
+        self.send("GET_PROFILE_V2")
+        if not self._gateway_session_event.wait(timeout_s):
+            raise TimeoutError("gatewaySessionId nao recebido")
+        return self._gateway_session_id
+
+    def start_profile(self, profile_id: int, collar_ids):
+        if profile_id not in range(4):
+            raise ValueError("profileId deve estar entre 0 e 3")
+        roster = sorted(set(int(x) for x in collar_ids))
+        if not roster or any(x < 1 or x > 254 for x in roster):
+            raise ValueError("roster deve conter IDs de coleira entre 1 e 254")
+        session = self._ensure_gateway_session()
+        operation = max(self._profile_operation + 1, int(time.time()) & 0xFFFFFFFF)
+        self._profile_operation = operation
+        return self.send("START_PROFILE_V2", gatewaySessionId=session, operationId=operation,
+                         profileId=profile_id, roster=",".join(str(x) for x in roster))
+
+    def cancel_profile(self):
+        session = self._ensure_gateway_session()
+        if not self._profile_operation:
+            raise ValueError("nenhuma operacao de perfil conhecida; execute profile-status")
+        return self.send("CANCEL_PROFILE_V2", gatewaySessionId=session, operationId=self._profile_operation)
+
+    # -------------------------------------------------------------------------
     # Recepção Gateway -> PC
     # -------------------------------------------------------------------------
 
     def _handle_app_message(self, obj):
         kind = obj.get("kind", "unknown")
         collar_id = obj.get("collarId")
+
+        gateway_session = obj.get("gatewaySessionId")
+        if isinstance(gateway_session, str) and len(gateway_session) == 16:
+            self._gateway_session_id = gateway_session
+            self._gateway_session_event.set()
+        operation = obj.get("operationId")
+        if type(operation) is int and operation > self._profile_operation:
+            self._profile_operation = operation
+
+        if kind == "packet_log":
+            if self.packet_journal is not None:
+                self.packet_journal.write(obj)
+            if self.terminal_detail:
+                radio = ""
+                if obj.get("direction") == "RX":
+                    radio = f" RSSI={value_text(obj.get('rssiDbm'))} SNR={value_text(obj.get('snrDb'))}"
+                print(f"[PACOTE] [PC] {value_text(obj.get('direction'))} P{value_text(obj.get('profileId'))} "
+                      f"[{collar_label(collar_id)}] {value_text(obj.get('type'))}/"
+                      f"{value_text(obj.get('subtype'))} seq={value_text(obj.get('sequence'))}{radio}")
+            return
 
         # Qualquer mensagem válida associada a uma coleira já nos permite
         # registrá-la como conhecida.
@@ -394,6 +489,9 @@ class VFenceSerialClient:
 
         with self._write_lock:
             self.ser.close()
+        if self.packet_journal is not None:
+            self.packet_journal.close()
+            self.packet_journal = None
 
 
 # =============================================================================
@@ -406,6 +504,10 @@ def print_help():
         "  help\n"
         "  status\n"
         "  radio\n"
+        "  profiles\n"
+        "  profile-status\n"
+        "  profile-start <profileId> <id[,id...]>\n"
+        "  profile-cancel\n"
         "  ping <collarId> [token]\n"
         "  ping-all [timeoutS]\n"
         "  params <id> <veryNearM> <nearM> <telemetryS> "
@@ -459,6 +561,23 @@ def interactive(client: VFenceSerialClient):
 
             elif cmd == "radio":
                 client.send("GET_RADIO")
+
+            elif cmd == "profiles":
+                client.send("LIST_PROFILES")
+
+            elif cmd == "profile-status":
+                client.send("GET_PROFILE_V2")
+
+            elif cmd == "profile-start":
+                if len(parts) != 3:
+                    raise ValueError("uso: profile-start <profileId> <id[,id...]>")
+                roster = [int(x, 0) for x in parts[2].split(",") if x]
+                client.start_profile(int(parts[1], 0), roster)
+
+            elif cmd == "profile-cancel":
+                if len(parts) != 1:
+                    raise ValueError("uso: profile-cancel")
+                client.cancel_profile()
 
             elif cmd == "ping":
                 collar = int(parts[1], 0)
@@ -565,16 +684,28 @@ def main():
         default=115200,
     )
     parser.add_argument("--detalhado", action="store_true", help="Mostra JSON bruto e logs humanos do Gateway.")
+    parser.add_argument("--log-dir", default="logs",
+                        help="Diretorio para journal de pacotes JSONL/CSV (padrao: ./logs).")
+    parser.add_argument("--sem-log-pacotes", action="store_true",
+                        help="Nao persiste mensagens packet_log recebidas do Gateway.")
 
     args = parser.parse_args()
 
+    journal = None
     try:
-        client = VFenceSerialClient(args.port, args.baud, terminal_detail=args.detalhado)
+        if not args.sem_log_pacotes:
+            journal = PacketJournal(args.log_dir)
+        client = VFenceSerialClient(args.port, args.baud, terminal_detail=args.detalhado,
+                                    packet_journal=journal)
     except OSError as exc:
-        parser.exit(1, f"[ERRO SERIAL] [PC] abertura da porta | {exc}\n")
+        if journal is not None:
+            journal.close()
+        parser.exit(1, f"[ERRO SERIAL] [PC] abertura/log | {exc}\n")
 
+    journal_text = "DESATIVADO" if journal is None else f"{journal.csv_path} | {journal.jsonl_path}"
     print(f"{RULE}\n VFENCE | PC | USB SERIAL\n"
           f" Porta: {args.port} | Baud: {args.baud} | Terminal: {'DETALHADO' if args.detalhado else 'NORMAL'}\n"
+          f" Journal de pacotes: {journal_text}\n"
           f"[USB] Porta aberta, aguardando Gateway\n{RULE}")
 
     client.start()

@@ -9,6 +9,9 @@ constexpr uint8_t PROFILE_CONTROL = 0x05;
 constexpr uint8_t PROFILE_WIRE_VERSION = 2;
 constexpr uint8_t PROFILE_MAX_MEMBERS = 16;
 constexpr uint32_t PROFILE_LEASE_MS = 120000;
+// Small tolerance around the armed switch instant. A temporary radio busy state
+// must not make one side abandon the coordinated switch immediately.
+constexpr uint32_t PROFILE_SWITCH_GRACE_MS = 5000;
 
 enum class ProfileStep : uint8_t { PREPARE = 1, READY, ARM, ARMED, POLL, VERIFIED, RECOVER, RESTORED };
 enum class ProfilePhase : uint8_t { IDLE, PREPARING, COMMITTING, VERIFYING, COMPLETED, ROLLING_BACK, FAILED };
@@ -135,11 +138,17 @@ class CollarProfileTransition {
   template <class Apply>
   void service(uint32_t now, bool radioBusy, Apply apply) {
     if (armed_ && profileDue(now, switchAt_)) {
-      if (!radioBusy && apply(pending_.target)) {
-        active = pending_.target;
-        if (active) leaseUntil_ = now + PROFILE_LEASE_MS;
+      if (radioBusy) {
+        // Keep the arm alive for a short grace period. This lets a reliable TX
+        // or other brief radio activity finish without desynchronizing peers.
+        if (profileDue(now, switchAt_ + PROFILE_SWITCH_GRACE_MS)) armed_ = false;
+      } else {
+        if (apply(pending_.target)) {
+          active = pending_.target;
+          if (active) leaseUntil_ = now + PROFILE_LEASE_MS;
+        }
+        armed_ = false;
       }
-      armed_ = false;
     }
     if (active && !radioBusy && profileDue(now, leaseUntil_) && apply(INITIAL_LORA_PROFILE)) {
       active = INITIAL_LORA_PROFILE;
@@ -227,6 +236,9 @@ class GatewayProfileTransition {
       if (allProved()) enter(ProfilePhase::COMMITTING, now, 5000 + count * 2900);
       else if (profileDue(now, deadline)) cancel(now);
     } else if (phase == ProfilePhase::COMMITTING && profileDue(now, deadline)) {
+      // Collars are armed for the original deadline. If the Gateway radio is
+      // momentarily busy, tolerate a small delay before declaring failure.
+      if (radioBusy && !profileDue(now, deadline + PROFILE_SWITCH_GRACE_MS)) return;
       if (allProved() && !radioBusy && apply(target)) {
         active = target;
         enter(ProfilePhase::VERIFYING, now, 55000);

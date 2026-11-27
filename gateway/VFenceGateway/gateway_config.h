@@ -40,4 +40,12 @@ static const bool PROVEN_METRICS_ENABLED = true;
 static const bool PDR_SERIAL_EXPORT_ENABLED = false;
 static const bool EVENT_SERIAL_COMMIT_ENABLED = false;
 static const bool PDR_SERIAL_COMMIT_ENABLED = false;
-static const bool PROFILE_SWITCH_ENABLED = false;
+
+// Emite uma linha [APP] packet_log para cada TX LoRa tentado e cada RX LoRa
+// recebido. O PC pode persistir essas linhas em JSONL/CSV sem alterar o
+// protocolo pelo radio.
+static const bool PACKET_SERIAL_LOG_ENABLED = true;
+
+// Troca coordenada P0 <-> P1/P2/P3 via PROFILE_CONTROL v2. A maquina de
+// estados usa PREPARE/READY/ARM/ARMED/POLL/VERIFIED e recuperacao P0.
+static const bool PROFILE_SWITCH_ENABLED = true;

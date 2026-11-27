@@ -9,10 +9,14 @@
 // ============================================================
 
 static const uint8_t COLLAR_ID = 0x01;
-// Habilitar somente depois de atualizar o Gateway para o subtipo contado.
-static const bool COUNTED_POSITION_ENABLED = false;
+// POSITION_STATUS_COUNTED inclui sessionId, ordinal e profileId. O Gateway
+// atual ja suporta esse subtipo e usa as lacunas de ordinal para PDR.
+static const bool COUNTED_POSITION_ENABLED = true;
 static const bool PROVEN_METRICS_ENABLED = true;
-static const bool PROFILE_SWITCH_ENABLED = false;
+
+// Habilita a troca coordenada de perfil LoRa e o rollback autonomo para P0
+// caso o enlace deixe de ser comprovado dentro do lease.
+static const bool PROFILE_SWITCH_ENABLED = true;
 
 // GPS NEO-6M: TX do GPS -> GPIO23 da Heltec.
 static const int GPS_RX = 23;

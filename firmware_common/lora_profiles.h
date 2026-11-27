@@ -20,7 +20,9 @@ struct LoRaProfile {
   bool invertedIq;
 };
 
-// P1-P3 are candidates. Only P0 is ever applied by either sketch.
+// P0 is the rendezvous/recovery profile. P1-P3 are coordinated candidates.
+// Direct changes between non-P0 profiles are intentionally not allowed by
+// GatewayProfileTransition: converge to P0 first, then arm the next profile.
 constexpr LoRaProfile LORA_PROFILES[] = {
     {0, 915000000, 125000, 7, 5, 14, 8, 0x12, true, true, false},
     {1, 915000000, 125000, 8, 5, 14, 8, 0x12, true, true, false},
