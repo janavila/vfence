@@ -16,6 +16,7 @@ from app.config import settings
 from app.database import Database
 from app.fpga_service import FpgaService
 from app.profile_api import router as profile_router
+from app.protocol_monitor import router as protocol_monitor_router
 from app.realtime import RealtimeHub
 from app.serial_reader import SerialReader
 from app.sync_service import CentralSyncService, central_error_rows
@@ -108,6 +109,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="VFence Monitor API", version="1.0.0", lifespan=lifespan)
 app.include_router(profile_router)
+app.include_router(protocol_monitor_router)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
 

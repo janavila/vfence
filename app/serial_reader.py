@@ -711,6 +711,9 @@ class SerialReader:
                     if self._packet_journal is not None:
                         self._packet_journal.submit(app_packet)
                     return _LineResult.ACCEPTED
+                # Copy metric summaries for analysis only; existing admission/ACK path is unchanged.
+                if self._packet_journal is not None and app_packet["kind"] in (*METRIC_SUMMARY_KINDS, PDR_KIND):
+                    self._packet_journal.submit(app_packet)
                 if self.terminal_detail and getattr(self.config, "windows_base", False):
                     terminal_emit(logger, app_raw, text)
                 if "deliveryId" in app_packet or "deliveryVersion" in app_packet:
